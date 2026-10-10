@@ -1,5 +1,6 @@
 #include "aether/runtime.h"
 #include "aether/event_loop.h"
+#include "aether/module.h"
 #include "aether/lexer.h"
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
@@ -1145,6 +1146,8 @@ Agent::Agent() {
     heap_ = std::make_unique<Heap>();
     realm_ = std::make_unique<Realm>(*heap_);
     event_loop_ = std::make_unique<EventLoop>();
+    module_loader_ = std::make_unique<ModuleLoader>(*this);
+    module_loader_->InitializeModuleGlobals();
 }
 
 Agent::~Agent() = default;
@@ -1154,6 +1157,7 @@ void Agent::RunEventLoop() {
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
     EventLoop::SetCurrent(event_loop_.get());
+    ModuleLoader::SetCurrent(module_loader_.get());
     event_loop_->Run(*this);
 }
 
@@ -1162,6 +1166,7 @@ TaggedValue Agent::EvaluateScriptWithEventLoop(std::string_view source) {
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
     EventLoop::SetCurrent(event_loop_.get());
+    ModuleLoader::SetCurrent(module_loader_.get());
 
     Lexer lexer(source);
     Parser parser(lexer);
@@ -1200,6 +1205,7 @@ TaggedValue Agent::EvaluateScript(std::string_view source) {
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
     EventLoop::SetCurrent(event_loop_.get());
+    ModuleLoader::SetCurrent(module_loader_.get());
 
     Lexer lexer(source);
     Parser parser(lexer);

@@ -145,6 +145,7 @@ inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackT
       method_callback_(std::move(method_callback)) {}
 
 class EventLoop;
+class ModuleLoader;
 
 /**
  * @brief Invokes a JavaScript or native function with the given receiver and argument list.
@@ -179,6 +180,7 @@ public:
     Interpreter& GetInterpreter() noexcept { return interpreter_; }
     MicrotaskQueue& GetMicrotasks() noexcept { return microtasks_; }
     EventLoop& GetEventLoop() noexcept { return *event_loop_; }
+    ModuleLoader& GetModuleLoader() noexcept { return *module_loader_; }
 
 private:
     std::unique_ptr<Heap> heap_;
@@ -186,6 +188,7 @@ private:
     Interpreter interpreter_;
     MicrotaskQueue microtasks_;
     std::unique_ptr<EventLoop> event_loop_;
+    std::unique_ptr<ModuleLoader> module_loader_;
 };
 
 } // namespace aether
