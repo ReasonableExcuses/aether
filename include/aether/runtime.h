@@ -170,10 +170,10 @@ public:
      */
     TaggedValue EvaluateScriptWithEventLoop(std::string_view source);
 
-    /**
-     * @brief Runs the asynchronous event loop until all pending timers, intervals, and microtasks drain.
-     */
     void RunEventLoop();
+
+    static Agent* Current() noexcept;
+    static void SetCurrent(Agent* agent) noexcept;
 
     Realm& GetRealm() noexcept { return *realm_; }
     Heap& GetHeap() noexcept { return *heap_; }

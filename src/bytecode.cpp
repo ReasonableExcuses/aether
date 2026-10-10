@@ -32,6 +32,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::TestGreaterThan:    return "TestGreaterThan";
         case Opcode::TestLessThanOrEqual: return "TestLessThanOrEqual";
         case Opcode::TestGreaterThanOrEqual: return "TestGreaterThanOrEqual";
+        case Opcode::TestInstanceOf:     return "TestInstanceOf";
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
@@ -42,6 +43,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::LogicalNot:         return "LogicalNot";
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";
+        case Opcode::TypeOf:             return "TypeOf";
         case Opcode::Call:               return "Call";
         case Opcode::CallMethod:         return "CallMethod";
         case Opcode::CreateObject:       return "CreateObject";
@@ -148,7 +150,8 @@ std::string BytecodeArray::Disassemble() const {
             case Opcode::TestLessThan:
             case Opcode::TestGreaterThan:
             case Opcode::TestLessThanOrEqual:
-            case Opcode::TestGreaterThanOrEqual: {
+            case Opcode::TestGreaterThanOrEqual:
+            case Opcode::TestInstanceOf: {
                 uint8_t reg = bytes_[pc++];
                 ss << "r" << static_cast<int>(reg);
                 if (op == Opcode::Add || op == Opcode::Sub || op == Opcode::Mul || op == Opcode::Div || op == Opcode::Mod) {

@@ -13,6 +13,10 @@
 namespace aether {
 
 static thread_local MicrotaskQueue* s_current_microtasks_{nullptr};
+static thread_local Agent* s_current_agent_{nullptr};
+
+Agent* Agent::Current() noexcept { return s_current_agent_; }
+void Agent::SetCurrent(Agent* agent) noexcept { s_current_agent_ = agent; }
 
 static MicrotaskQueue& CurrentMicrotaskQueue() {
     static MicrotaskQueue s_fallback_queue;
@@ -70,20 +74,42 @@ static TaggedValue Math_sqrt(const std::vector<TaggedValue>& args) {
 
 static TaggedValue Math_max(const std::vector<TaggedValue>& args) {
     if (args.empty()) return TaggedValue::FromDouble(-std::numeric_limits<double>::infinity());
-    if (args.size() == 1) return args[0];
-    if (args[0].IsSmi() && args[1].IsSmi()) {
-        return TaggedValue::FromSmi(std::max(args[0].AsSmi(), args[1].AsSmi()));
+    bool all_smi = true;
+    for (const auto& a : args) {
+        if (!a.IsSmi()) { all_smi = false; break; }
     }
-    return TaggedValue::FromDouble(std::max(args[0].AsNumber(), args[1].AsNumber()));
+    if (all_smi) {
+        int32_t max_val = args[0].AsSmi();
+        for (size_t i = 1; i < args.size(); ++i) {
+            max_val = std::max(max_val, args[i].AsSmi());
+        }
+        return TaggedValue::FromSmi(max_val);
+    }
+    double max_val = args[0].AsNumber();
+    for (size_t i = 1; i < args.size(); ++i) {
+        max_val = std::max(max_val, args[i].AsNumber());
+    }
+    return TaggedValue::FromDouble(max_val);
 }
 
 static TaggedValue Math_min(const std::vector<TaggedValue>& args) {
     if (args.empty()) return TaggedValue::FromDouble(std::numeric_limits<double>::infinity());
-    if (args.size() == 1) return args[0];
-    if (args[0].IsSmi() && args[1].IsSmi()) {
-        return TaggedValue::FromSmi(std::min(args[0].AsSmi(), args[1].AsSmi()));
+    bool all_smi = true;
+    for (const auto& a : args) {
+        if (!a.IsSmi()) { all_smi = false; break; }
     }
-    return TaggedValue::FromDouble(std::min(args[0].AsNumber(), args[1].AsNumber()));
+    if (all_smi) {
+        int32_t min_val = args[0].AsSmi();
+        for (size_t i = 1; i < args.size(); ++i) {
+            min_val = std::min(min_val, args[i].AsSmi());
+        }
+        return TaggedValue::FromSmi(min_val);
+    }
+    double min_val = args[0].AsNumber();
+    for (size_t i = 1; i < args.size(); ++i) {
+        min_val = std::min(min_val, args[i].AsNumber());
+    }
+    return TaggedValue::FromDouble(min_val);
 }
 
 static TaggedValue Math_pow(const std::vector<TaggedValue>& args) {
@@ -1117,6 +1143,27 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     global_object_->SetNamedProperty("Set", TaggedValue::FromHeapObject(set_ctor), next_shape_id_);
     global_object_->SetNamedProperty("Promise", TaggedValue::FromHeapObject(promise_ctor), next_shape_id_);
     global_object_->SetNamedProperty("RegExp", TaggedValue::FromHeapObject(regexp_ctor), next_shape_id_);
+    // Object Constructor & Prototype
+    auto* object_ctor = new JSNativeFunction("Object", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || args[0].IsUndefined() || args[0].IsNull()) {
+            return TaggedValue::FromHeapObject(new JSObject(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr));
+        }
+        if (args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
+            return args[0];
+        }
+        return TaggedValue::FromHeapObject(new JSObject(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr));
+    });
+    auto* object_prototype = new JSObject(root_shape_.get());
+    object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype), next_shape_id_);
+    object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(new JSNativeFunction("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        auto* obj = new JSObject(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
+            obj->SetPrototype(static_cast<JSObject*>(args[0].AsHeapObject()));
+        }
+        return TaggedValue::FromHeapObject(obj);
+    })), next_shape_id_);
+    global_object_->SetNamedProperty("Object", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
+
     global_object_->SetNamedProperty("globalThis", TaggedValue::FromHeapObject(global_object_), next_shape_id_);
 
     // Event Loop, Timer & Microtask Intrinsics
@@ -1132,6 +1179,103 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     auto* perf_obj = new JSObject(root_shape_.get());
     perf_obj->SetNamedProperty("now", TaggedValue::FromHeapObject(new JSNativeFunction("now", &Performance_now)), next_shape_id_);
     global_object_->SetNamedProperty("performance", TaggedValue::FromHeapObject(perf_obj), next_shape_id_);
+
+    // Error Constructors
+    auto make_error_ctor = [this](std::string_view err_name) -> JSNativeFunction* {
+        auto* proto = new JSObject(root_shape_.get());
+        proto->SetNamedProperty("name", TaggedValue::FromHeapObject(new JSString(err_name)), next_shape_id_);
+        proto->SetNamedProperty("message", TaggedValue::FromHeapObject(new JSString("")), next_shape_id_);
+        proto->SetNamedProperty("toString", TaggedValue::FromHeapObject(new JSNativeFunction("toString", [](const std::vector<TaggedValue>&) -> TaggedValue {
+            return TaggedValue::FromHeapObject(new JSString("Error"));
+        })), next_shape_id_);
+
+        std::string name_str(err_name);
+        auto* ctor = new JSNativeFunction(err_name, [proto, name_str](const std::vector<TaggedValue>& args) -> TaggedValue {
+            auto* obj = new JSObject(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+            obj->SetPrototype(proto);
+            uint32_t sid = 2000;
+            obj->SetNamedProperty("name", TaggedValue::FromHeapObject(new JSString(name_str)), sid);
+            std::string msg = "";
+            if (!args.empty()) {
+                TaggedValue a = args[0];
+                if (a.IsHeapObject() && a.AsHeapObject()->IsString()) {
+                    msg = static_cast<JSString*>(a.AsHeapObject())->Value();
+                } else if (a.IsSmi()) {
+                    msg = std::to_string(a.AsSmi());
+                } else if (a.IsDouble()) {
+                    msg = std::to_string(a.AsDouble());
+                }
+            }
+            obj->SetNamedProperty("message", TaggedValue::FromHeapObject(new JSString(msg)), sid);
+            return TaggedValue::FromHeapObject(obj);
+        });
+        ctor->SetNamedProperty("name", TaggedValue::FromHeapObject(new JSString(name_str)), next_shape_id_);
+        ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
+        proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor), next_shape_id_);
+        return ctor;
+    };
+
+    global_object_->SetNamedProperty("Error", TaggedValue::FromHeapObject(make_error_ctor("Error")), next_shape_id_);
+    global_object_->SetNamedProperty("TypeError", TaggedValue::FromHeapObject(make_error_ctor("TypeError")), next_shape_id_);
+    global_object_->SetNamedProperty("RangeError", TaggedValue::FromHeapObject(make_error_ctor("RangeError")), next_shape_id_);
+    global_object_->SetNamedProperty("ReferenceError", TaggedValue::FromHeapObject(make_error_ctor("ReferenceError")), next_shape_id_);
+    global_object_->SetNamedProperty("SyntaxError", TaggedValue::FromHeapObject(make_error_ctor("SyntaxError")), next_shape_id_);
+    global_object_->SetNamedProperty("Test262Error", TaggedValue::FromHeapObject(make_error_ctor("Test262Error")), next_shape_id_);
+
+    // isNaN and isFinite
+    global_object_->SetNamedProperty("isNaN", TaggedValue::FromHeapObject(new JSNativeFunction("isNaN", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty()) return TaggedValue::FromBoolean(true);
+        if (args[0].IsSmi()) return TaggedValue::FromBoolean(false);
+        if (args[0].IsDouble()) return TaggedValue::FromBoolean(std::isnan(args[0].AsDouble()));
+        return TaggedValue::FromBoolean(true);
+    })), next_shape_id_);
+
+    global_object_->SetNamedProperty("isFinite", TaggedValue::FromHeapObject(new JSNativeFunction("isFinite", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty()) return TaggedValue::FromBoolean(false);
+        if (args[0].IsSmi()) return TaggedValue::FromBoolean(true);
+        if (args[0].IsDouble()) return TaggedValue::FromBoolean(std::isfinite(args[0].AsDouble()));
+        return TaggedValue::FromBoolean(false);
+    })), next_shape_id_);
+
+    // $262 host object
+    auto* host262 = new JSObject(root_shape_.get());
+    host262->SetNamedProperty("global", TaggedValue::FromHeapObject(global_object_), next_shape_id_);
+    host262->SetNamedProperty("evalScript", TaggedValue::FromHeapObject(new JSNativeFunction("evalScript", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsString()) {
+            return TaggedValue::Undefined();
+        }
+        auto* s = static_cast<JSString*>(args[0].AsHeapObject());
+        if (Agent::Current()) {
+            return Agent::Current()->EvaluateScript(s->Value());
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+    host262->SetNamedProperty("gc", TaggedValue::FromHeapObject(new JSNativeFunction("gc", [](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (Agent::Current()) {
+            Agent::Current()->GetHeap().MinorGC();
+            Agent::Current()->GetHeap().MajorGC();
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+    host262->SetNamedProperty("createRealm", TaggedValue::FromHeapObject(new JSNativeFunction("createRealm", [](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (Agent::Current()) {
+            auto* new_realm = new Realm(Agent::Current()->GetHeap());
+            return new_realm->GetGlobalProperty("$262");
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+
+    // $262.agent
+    auto* host262_agent = new JSObject(root_shape_.get());
+    host262_agent->SetNamedProperty("monotonic", TaggedValue::FromHeapObject(new JSNativeFunction("monotonic", [](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (EventLoop::Current()) {
+            return TaggedValue::FromDouble(EventLoop::Current()->PerformanceNow());
+        }
+        return TaggedValue::FromDouble(0.0);
+    })), next_shape_id_);
+    host262->SetNamedProperty("agent", TaggedValue::FromHeapObject(host262_agent), next_shape_id_);
+
+    global_object_->SetNamedProperty("$262", TaggedValue::FromHeapObject(host262), next_shape_id_);
 }
 
 TaggedValue Realm::GetGlobalProperty(std::string_view name) {
@@ -1143,6 +1287,7 @@ void Realm::SetGlobalProperty(std::string_view name, TaggedValue value) {
 }
 
 Agent::Agent() {
+    s_current_agent_ = this;
     heap_ = std::make_unique<Heap>();
     realm_ = std::make_unique<Realm>(*heap_);
     event_loop_ = std::make_unique<EventLoop>();
@@ -1150,9 +1295,14 @@ Agent::Agent() {
     module_loader_->InitializeModuleGlobals();
 }
 
-Agent::~Agent() = default;
+Agent::~Agent() {
+    if (s_current_agent_ == this) {
+        s_current_agent_ = nullptr;
+    }
+}
 
 void Agent::RunEventLoop() {
+    s_current_agent_ = this;
     s_current_microtasks_ = &microtasks_;
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
@@ -1162,6 +1312,7 @@ void Agent::RunEventLoop() {
 }
 
 TaggedValue Agent::EvaluateScriptWithEventLoop(std::string_view source) {
+    s_current_agent_ = this;
     s_current_microtasks_ = &microtasks_;
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
@@ -1201,6 +1352,7 @@ TaggedValue Agent::EvaluateScriptWithEventLoop(std::string_view source) {
 }
 
 TaggedValue Agent::EvaluateScript(std::string_view source) {
+    s_current_agent_ = this;
     s_current_microtasks_ = &microtasks_;
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);

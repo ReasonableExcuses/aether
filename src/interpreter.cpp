@@ -265,6 +265,11 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = TaggedValue::FromBoolean(acc_.AsSmi() == rhs.AsSmi());
                 } else if (acc_.IsNumber() && rhs.IsNumber()) {
                     acc_ = TaggedValue::FromBoolean(acc_.AsNumber() == rhs.AsNumber());
+                } else if (acc_.IsHeapObject() && rhs.IsHeapObject() &&
+                           acc_.AsHeapObject()->IsString() && rhs.AsHeapObject()->IsString()) {
+                    auto* s1 = static_cast<JSString*>(acc_.AsHeapObject());
+                    auto* s2 = static_cast<JSString*>(rhs.AsHeapObject());
+                    acc_ = TaggedValue::FromBoolean(s1->View() == s2->View());
                 } else {
                     acc_ = TaggedValue::FromBoolean(acc_ == rhs);
                 }
@@ -310,6 +315,42 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 }
                 break;
             }
+            case Opcode::TestInstanceOf: {
+                uint8_t reg = *pc++;
+                TaggedValue rhs = frame.GetRegister(reg);
+                if (!acc_.IsHeapObject() || !rhs.IsHeapObject()) {
+                    acc_ = TaggedValue::FromBoolean(false);
+                    break;
+                }
+                TaggedValue target_proto = TaggedValue::Undefined();
+                HeapObject* rhs_obj = rhs.AsHeapObject();
+                if (rhs_obj->IsJSObject()) {
+                    target_proto = static_cast<JSObject*>(rhs_obj)->GetNamedProperty("prototype");
+                } else if (rhs_obj->IsFunction()) {
+                    auto* fn = static_cast<JSFunction*>(rhs_obj);
+                    if (!fn->GetPrototype()) {
+                        fn->SetPrototype(new JSObject(GetRootShape()));
+                    }
+                    target_proto = TaggedValue::FromHeapObject(fn->GetPrototype());
+                } else if (rhs_obj->IsNativeFunction()) {
+                    target_proto = static_cast<JSNativeFunction*>(rhs_obj)->GetNamedProperty("prototype");
+                }
+
+                JSObject* curr = nullptr;
+                if (acc_.AsHeapObject()->IsJSObject()) {
+                    curr = static_cast<JSObject*>(acc_.AsHeapObject())->GetPrototype();
+                }
+                bool found = false;
+                while (curr) {
+                    if (TaggedValue::FromHeapObject(curr) == target_proto) {
+                        found = true;
+                        break;
+                    }
+                    curr = curr->GetPrototype();
+                }
+                acc_ = TaggedValue::FromBoolean(found);
+                break;
+            }
             case Opcode::Jump: {
                 int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
@@ -345,7 +386,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
 
-                if (obj_val.AsHeapObject()->IsFunction()) {
+                if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
                     if (prop_key == "prototype") {
                         if (!fn->GetPrototype()) {
@@ -407,7 +448,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
 
-                if (obj_val.AsHeapObject()->IsFunction()) {
+                if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
                     if (prop_key == "prototype" && acc_.IsHeapObject() && acc_.AsHeapObject()->IsJSObject()) {
                         fn->SetPrototype(static_cast<JSObject*>(acc_.AsHeapObject()));
@@ -464,6 +505,29 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
             case Opcode::BitwiseNot: {
                 int32_t val = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
                 acc_ = TaggedValue::FromSmi(~val);
+                break;
+            }
+            case Opcode::TypeOf: {
+                if (acc_.IsSmi() || acc_.IsDouble()) {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("number"));
+                } else if (acc_.IsBoolean()) {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("boolean"));
+                } else if (acc_.IsUndefined()) {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                } else if (acc_.IsNull()) {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("object"));
+                } else if (acc_.IsHeapObject()) {
+                    auto* h = acc_.AsHeapObject();
+                    if (h->IsString()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("string"));
+                    } else if (h->IsFunction() || h->IsNativeFunction()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("function"));
+                    } else {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("object"));
+                    }
+                } else {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                }
                 break;
             }
             case Opcode::CreateObject: {
@@ -638,7 +702,20 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 (void)slot_id;
 
                 TaggedValue ctor_val = frame.GetRegister(ctor_reg);
-                assert(ctor_val.IsHeapObject() && ctor_val.AsHeapObject()->IsFunction());
+                if (!ctor_val.IsHeapObject() || !ctor_val.AsHeapObject()->IsFunction()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "value is not a constructor"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
 
                 std::vector<TaggedValue> call_args;
                 call_args.reserve(arg_count);

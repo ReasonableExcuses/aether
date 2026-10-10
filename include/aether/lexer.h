@@ -40,6 +40,8 @@ enum class TokenKind {
     Class,
     Extends,
     This,
+    TypeOf,
+    InstanceOf,
 
     // Operators & Punctuators
     OpenParen,          // (

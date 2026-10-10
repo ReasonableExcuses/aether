@@ -59,6 +59,11 @@ public:
         node->Index()->Accept(this);
         node->Value()->Accept(this);
     }
+    void VisitConditional(ConditionalExpr* node) override {
+        node->Condition()->Accept(this);
+        node->ThenBranch()->Accept(this);
+        node->ElseBranch()->Accept(this);
+    }
     void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitVarDecl(VarDeclStmt* node) override {
         if (node->Initializer()) node->Initializer()->Accept(this);
@@ -416,6 +421,9 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
         case UnaryOp::Plus:
             // Unary + is a ToNumber conversion, numbers are unchanged
             break;
+        case UnaryOp::TypeOf:
+            bytecode_->EmitOpcode(Opcode::TypeOf);
+            break;
     }
 }
 
@@ -683,6 +691,18 @@ void BytecodeEmitter::VisitIndexAssign(IndexAssignExpr* node) {
     FreeRegister(obj_reg);
 }
 
+void BytecodeEmitter::VisitConditional(ConditionalExpr* node) {
+    node->Condition()->Accept(this);
+    Label else_label;
+    Label end_label;
+    EmitJump(Opcode::JumpIfFalse, else_label);
+    node->ThenBranch()->Accept(this);
+    EmitJump(Opcode::Jump, end_label);
+    Bind(else_label);
+    node->ElseBranch()->Accept(this);
+    Bind(end_label);
+}
+
 void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
     if (node->Op() == BinaryOp::LogicalAnd) {
         node->Lhs()->Accept(this);
@@ -797,6 +817,10 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             break;
         case BinaryOp::GreaterThanOrEqual:
             bytecode_->EmitOpcode(Opcode::TestGreaterThanOrEqual);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::InstanceOf:
+            bytecode_->EmitOpcode(Opcode::TestInstanceOf);
             bytecode_->EmitU8(rhs_reg);
             break;
     }

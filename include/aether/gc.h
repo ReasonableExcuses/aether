@@ -36,7 +36,7 @@ public:
 
     AETHER_ALWAYS_INLINE void MarkCard(const void* ptr) noexcept {
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        assert(addr >= heap_base_);
+        if (AETHER_UNLIKELY(addr < heap_base_)) return;
         size_t idx = (addr - heap_base_) >> kCardShift;
         if (AETHER_LIKELY(idx < card_count_)) {
             cards_[idx] = kDirtyCard;
@@ -44,11 +44,14 @@ public:
     }
 
     AETHER_ALWAYS_INLINE bool IsDirty(size_t index) const noexcept {
+        if (index >= card_count_) return false;
         return cards_[index] == kDirtyCard;
     }
 
     AETHER_ALWAYS_INLINE void ClearCard(size_t index) noexcept {
-        cards_[index] = kCleanCard;
+        if (index < card_count_) {
+            cards_[index] = kCleanCard;
+        }
     }
 
     void Clear() noexcept {
@@ -90,6 +93,8 @@ public:
 
     size_t BytesAllocated() const noexcept { return bump_ptr_ - from_space_start_; }
     size_t Capacity() const noexcept { return semi_space_size_; }
+    bool HasReservation() const noexcept { return has_reservation_; }
+    uint8_t* OldGenStart() const noexcept { return buffer_ + (semi_space_size_ * 2); }
 
     void ResetBumpPointer() noexcept {
         bump_ptr_ = from_space_start_;
@@ -98,6 +103,7 @@ public:
 private:
     size_t semi_space_size_;
     uint8_t* buffer_{nullptr};
+    bool has_reservation_{false};
 
     uintptr_t from_space_start_{0};
     uintptr_t from_space_limit_{0};
@@ -136,7 +142,12 @@ struct ImmixBlock {
 class ImmixSpace {
 public:
     ImmixSpace() = default;
-    ~ImmixSpace() = default;
+    ~ImmixSpace();
+
+    void SetReservation(uint8_t* reservation_start, size_t max_size) {
+        reservation_start_ = reservation_start;
+        max_size_ = max_size;
+    }
 
     void* Allocate(size_t bytes);
     void Sweep();
@@ -147,7 +158,12 @@ public:
     size_t BlockCount() const noexcept { return blocks_.size(); }
 
 private:
-    std::vector<std::unique_ptr<ImmixBlock>> blocks_;
+    void AllocateBlock();
+
+    uint8_t* reservation_start_{nullptr};
+    size_t max_size_{0};
+    bool using_reservation_{false};
+    std::vector<ImmixBlock*> blocks_;
     size_t active_block_index_{0};
 };
 

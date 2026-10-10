@@ -32,14 +32,16 @@ enum class BinaryOp {
     LessThanOrEqual,
     GreaterThanOrEqual,
     LogicalAnd,
-    LogicalOr
+    LogicalOr,
+    InstanceOf
 };
 
 enum class UnaryOp {
     LogicalNot,
     Negate,
     BitwiseNot,
-    Plus
+    Plus,
+    TypeOf
 };
 
 class ASTNode {
@@ -230,6 +232,22 @@ public:
 private:
     std::unique_ptr<Expr> callee_;
     std::vector<std::unique_ptr<Expr>> args_;
+};
+
+class ConditionalExpr : public Expr {
+public:
+    ConditionalExpr(std::unique_ptr<Expr> cond, std::unique_ptr<Expr> then_expr, std::unique_ptr<Expr> else_expr)
+        : condition_(std::move(cond)), then_branch_(std::move(then_expr)), else_branch_(std::move(else_expr)) {}
+
+    Expr* Condition() const noexcept { return condition_.get(); }
+    Expr* ThenBranch() const noexcept { return then_branch_.get(); }
+    Expr* ElseBranch() const noexcept { return else_branch_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> condition_;
+    std::unique_ptr<Expr> then_branch_;
+    std::unique_ptr<Expr> else_branch_;
 };
 
 // Statements
@@ -437,6 +455,7 @@ public:
     virtual void VisitArrayLiteral(ArrayLiteralExpr* node) = 0;
     virtual void VisitIndexAccess(IndexAccessExpr* node) = 0;
     virtual void VisitIndexAssign(IndexAssignExpr* node) = 0;
+    virtual void VisitConditional(ConditionalExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -466,6 +485,7 @@ inline void ObjectLiteralExpr::Accept(ASTVisitor* v) { v->VisitObjectLiteral(thi
 inline void ArrayLiteralExpr::Accept(ASTVisitor* v) { v->VisitArrayLiteral(this); }
 inline void IndexAccessExpr::Accept(ASTVisitor* v) { v->VisitIndexAccess(this); }
 inline void IndexAssignExpr::Accept(ASTVisitor* v) { v->VisitIndexAssign(this); }
+inline void ConditionalExpr::Accept(ASTVisitor* v) { v->VisitConditional(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }

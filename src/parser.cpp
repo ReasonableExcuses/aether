@@ -47,6 +47,8 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::StarEqual:
         case TokenKind::SlashEqual:
             return Precedence::Assignment;
+        case TokenKind::Question:
+            return Precedence::Conditional;
         case TokenKind::BarBar:
             return Precedence::LogicalOr;
         case TokenKind::AmpAmp:
@@ -66,6 +68,7 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::LessEqual:
         case TokenKind::Greater:
         case TokenKind::GreaterEqual:
+        case TokenKind::InstanceOf:
             return Precedence::Relational;
         case TokenKind::LessLess:
         case TokenKind::GreaterGreater:
@@ -78,6 +81,8 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::Percent:
             return Precedence::Multiplicative;
         case TokenKind::OpenParen:
+        case TokenKind::PlusPlus:
+        case TokenKind::MinusMinus:
             return Precedence::Call;
         case TokenKind::Dot:
         case TokenKind::OpenBracket:
@@ -370,6 +375,26 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<UnaryExpr>(UnaryOp::Plus, ParseExpression(Precedence::Unary));
         case TokenKind::Tilde:
             return std::make_unique<UnaryExpr>(UnaryOp::BitwiseNot, ParseExpression(Precedence::Unary));
+        case TokenKind::TypeOf:
+            return std::make_unique<UnaryExpr>(UnaryOp::TypeOf, ParseExpression(Precedence::Unary));
+        case TokenKind::PlusPlus: {
+            Token id_tok = Consume(TokenKind::Identifier, "Expected identifier after '++'");
+            auto plus_one = std::make_unique<BinaryExpr>(
+                BinaryOp::Add,
+                std::make_unique<IdentifierExpr>(id_tok.text),
+                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
+            );
+            return std::make_unique<AssignExpr>(id_tok.text, std::move(plus_one));
+        }
+        case TokenKind::MinusMinus: {
+            Token id_tok = Consume(TokenKind::Identifier, "Expected identifier after '--'");
+            auto minus_one = std::make_unique<BinaryExpr>(
+                BinaryOp::Sub,
+                std::make_unique<IdentifierExpr>(id_tok.text),
+                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
+            );
+            return std::make_unique<AssignExpr>(id_tok.text, std::move(minus_one));
+        }
         case TokenKind::This:
             return std::make_unique<IdentifierExpr>("this");
         case TokenKind::New: {
@@ -463,6 +488,39 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         return std::make_unique<CallExpr>(std::move(lhs), std::move(args));
     }
 
+    if (op_token.kind == TokenKind::PlusPlus) {
+        if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
+            std::string name = id->Name();
+            auto plus_one = std::make_unique<BinaryExpr>(
+                BinaryOp::Add,
+                std::make_unique<IdentifierExpr>(name),
+                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
+            );
+            return std::make_unique<AssignExpr>(name, std::move(plus_one));
+        }
+        throw std::runtime_error("Invalid left-hand side in postfix ++");
+    }
+
+    if (op_token.kind == TokenKind::MinusMinus) {
+        if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
+            std::string name = id->Name();
+            auto minus_one = std::make_unique<BinaryExpr>(
+                BinaryOp::Sub,
+                std::make_unique<IdentifierExpr>(name),
+                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
+            );
+            return std::make_unique<AssignExpr>(name, std::move(minus_one));
+        }
+        throw std::runtime_error("Invalid left-hand side in postfix --");
+    }
+
+    if (op_token.kind == TokenKind::Question) {
+        auto then_expr = ParseExpression();
+        Consume(TokenKind::Colon, "Expected ':' in conditional expression");
+        auto else_expr = ParseExpression(Precedence::Conditional);
+        return std::make_unique<ConditionalExpr>(std::move(lhs), std::move(then_expr), std::move(else_expr));
+    }
+
     Precedence prec = GetPrecedence(op_token.kind);
     auto rhs = ParseExpression(static_cast<Precedence>(static_cast<int>(prec) + 1));
 
@@ -488,6 +546,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         case TokenKind::GreaterEqual:   op = BinaryOp::GreaterThanOrEqual; break;
         case TokenKind::AmpAmp:         op = BinaryOp::LogicalAnd; break;
         case TokenKind::BarBar:         op = BinaryOp::LogicalOr; break;
+        case TokenKind::InstanceOf:     op = BinaryOp::InstanceOf; break;
         default:
             throw std::runtime_error("Unhandled binary operator");
     }

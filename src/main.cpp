@@ -65,9 +65,21 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            std::string canonical_path = std::filesystem::canonical(script_path).string();
-            agent.GetModuleLoader().Require(canonical_path);
-            agent.RunEventLoop();
+            std::ifstream file(script_path, std::ios::in | std::ios::binary);
+            if (!file.is_open()) {
+                std::cerr << "Error: Cannot open file '" << script_path << "'.\n";
+                return 1;
+            }
+            std::ostringstream ss;
+            ss << file.rdbuf();
+            std::string source = ss.str();
+            agent.EvaluateScriptWithEventLoop(source);
+        }
+
+        if (agent.GetInterpreter().HasPendingException()) {
+            aether::TaggedValue exc = agent.GetInterpreter().PendingException();
+            std::cerr << "Uncaught Exception: " << exc.ToString() << "\n";
+            return 1;
         }
 
         if (agent.GetModuleLoader().HasExited()) {

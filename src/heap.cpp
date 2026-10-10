@@ -6,7 +6,11 @@ namespace aether {
 IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
-      card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {}
+      card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
+    if (nursery_.HasReservation()) {
+        old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
+    }
+}
 
 IsolateHeap::~IsolateHeap() = default;
 

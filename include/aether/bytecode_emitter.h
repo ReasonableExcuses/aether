@@ -42,6 +42,7 @@ public:
     void VisitArrayLiteral(ArrayLiteralExpr* node) override;
     void VisitIndexAccess(IndexAccessExpr* node) override;
     void VisitIndexAssign(IndexAssignExpr* node) override;
+    void VisitConditional(ConditionalExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;

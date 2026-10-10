@@ -50,6 +50,7 @@ enum class Opcode : uint8_t {
     TestGreaterThan,        // [Op, reg: u8]           acc = (acc > Reg[reg])
     TestLessThanOrEqual,    // [Op, reg: u8]           acc = (acc <= Reg[reg])
     TestGreaterThanOrEqual, // [Op, reg: u8]           acc = (acc >= Reg[reg])
+    TestInstanceOf,         // [Op, reg: u8]           acc = (acc instanceof Reg[reg])
 
     // Control Flow
     Jump,               // [Op, offset: i32]           pc += offset
@@ -66,6 +67,7 @@ enum class Opcode : uint8_t {
     LogicalNot,             // [Op]                    acc = !ToBoolean(acc)
     Negate,                 // [Op]                    acc = -acc
     BitwiseNot,             // [Op]                    acc = ~acc
+    TypeOf,                 // [Op]                    acc = typeof acc
 
     // Function Calls & Object Instantiation
     Call,                   // [Op, callee: u8, args: u8, count: u8, slot: u16]

@@ -30,6 +30,7 @@ set(AETHER_SOURCES
     src/runtime.cpp
     src/event_loop.cpp
     src/module.cpp
+    src/test262.cpp
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
@@ -63,6 +64,9 @@ target_link_libraries(test_milestone9_event_loop PRIVATE aether_core)
 
 add_executable(test_milestone10_modules tests/test_milestone10_modules.cpp)
 target_link_libraries(test_milestone10_modules PRIVATE aether_core)
+
+add_executable(test_test262_harness tests/test_test262_harness.cpp)
+target_link_libraries(test_test262_harness PRIVATE aether_core)
 
 add_executable(aether src/main.cpp)
 target_link_libraries(aether PRIVATE aether_core)

@@ -1,5 +1,6 @@
 #include "aether/value.h"
 #include "aether/heap_object.h"
+#include "aether/runtime.h"
 #include <sstream>
 
 namespace aether {
@@ -58,7 +59,10 @@ std::string TaggedValue::ToString() const {
         if (obj->IsString()) {
             return static_cast<JSString*>(obj)->Value();
         }
-        if (obj->IsFunction()) {
+        if (obj->IsNativeFunction()) {
+            return "[Function " + static_cast<JSNativeFunction*>(obj)->Name() + "]";
+        }
+        if (obj->GetType() == HeapObjectType::JSFunction) {
             return "[Function " + static_cast<JSFunction*>(obj)->Name() + "]";
         }
         if (obj->IsJSObject()) {

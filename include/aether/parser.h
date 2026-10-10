@@ -12,6 +12,7 @@ namespace aether {
 enum class Precedence {
     None = 0,
     Assignment,     // = += -= *= /=
+    Conditional,    // ? :
     LogicalOr,      // ||
     LogicalAnd,     // &&
     BitwiseOr,      // |

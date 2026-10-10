@@ -13,9 +13,21 @@ NurserySpace::NurserySpace(size_t semi_space_size)
     : semi_space_size_(semi_space_size) {
     size_t total_bytes = semi_space_size * 2;
 #ifdef _WIN32
-    buffer_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    buffer_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, kHeapReservationSize, MEM_RESERVE, PAGE_NOACCESS));
+    if (buffer_) {
+        has_reservation_ = true;
+        VirtualAlloc(buffer_, total_bytes, MEM_COMMIT, PAGE_READWRITE);
+    } else {
+        buffer_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    }
 #else
-    buffer_ = static_cast<uint8_t*>(mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    buffer_ = static_cast<uint8_t*>(mmap(nullptr, kHeapReservationSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (buffer_ != MAP_FAILED) {
+        has_reservation_ = true;
+        mprotect(buffer_, total_bytes, PROT_READ | PROT_WRITE);
+    } else {
+        buffer_ = static_cast<uint8_t*>(mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    }
 #endif
     assert(buffer_ != nullptr && "Failed to map virtual memory for Nursery");
 
@@ -32,7 +44,7 @@ NurserySpace::~NurserySpace() {
 #ifdef _WIN32
         VirtualFree(buffer_, 0, MEM_RELEASE);
 #else
-        munmap(buffer_, semi_space_size_ * 2);
+        munmap(buffer_, has_reservation_ ? kHeapReservationSize : semi_space_size_ * 2);
 #endif
         buffer_ = nullptr;
     }
@@ -85,9 +97,38 @@ void ImmixBlock::Sweep() noexcept {
     current_line = 0;
 }
 
+ImmixSpace::~ImmixSpace() {
+    for (auto* block : blocks_) {
+        if (using_reservation_) {
+            block->~ImmixBlock();
+        } else {
+            delete block;
+        }
+    }
+}
+
+void ImmixSpace::AllocateBlock() {
+    if (reservation_start_) {
+        size_t offset = blocks_.size() * sizeof(ImmixBlock);
+        if (offset + sizeof(ImmixBlock) <= max_size_) {
+            uint8_t* block_addr = reservation_start_ + offset;
+#ifdef _WIN32
+            VirtualAlloc(block_addr, sizeof(ImmixBlock), MEM_COMMIT, PAGE_READWRITE);
+#else
+            mprotect(block_addr, sizeof(ImmixBlock), PROT_READ | PROT_WRITE);
+#endif
+            auto* block = new (block_addr) ImmixBlock();
+            using_reservation_ = true;
+            blocks_.push_back(block);
+            return;
+        }
+    }
+    blocks_.push_back(new ImmixBlock());
+}
+
 void* ImmixSpace::Allocate(size_t bytes) {
     if (blocks_.empty()) {
-        blocks_.push_back(std::make_unique<ImmixBlock>());
+        AllocateBlock();
         active_block_index_ = 0;
     }
 
@@ -105,7 +146,7 @@ void* ImmixSpace::Allocate(size_t bytes) {
     }
 
     // Allocate fresh block
-    blocks_.push_back(std::make_unique<ImmixBlock>());
+    AllocateBlock();
     active_block_index_ = blocks_.size() - 1;
     return blocks_[active_block_index_]->Allocate(bytes);
 }
