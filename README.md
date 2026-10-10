@@ -3,6 +3,8 @@
 A clean-slate, high-throughput, low-latency ECMAScript virtual machine and multi-tier JIT runtime engine engineered in modern ISO C++23.
 
 <p align="left">
+  <img src="https://img.shields.io/badge/Status-In%20Active%20Development-E65100?style=flat-square" alt="Status" />
+  <img src="https://img.shields.io/badge/Milestones-7%20of%2010%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
@@ -10,6 +12,11 @@ A clean-slate, high-throughput, low-latency ECMAScript virtual machine and multi
   <img src="https://img.shields.io/badge/Test_Suite-32%2F32%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
+
+> [!NOTE]
+> **Engineering Notice: Active System Development**
+> AetherVM is an open-source, high-throughput ECMAScript virtual machine and multi-tier JIT compiler currently in active system development.
+> The core execution engine is fully operational: the Accumulator-Register Bytecode Interpreter (Tier 0), Baseline Template JIT (Tier 1), Sea-of-Nodes Optimizing JIT (Tier 2), Generational Immix Garbage Collector, Hidden Class shapes, lexical closures, prototype inheritance, and ES6 classes are implemented and validated across 32 passing architectural test suites. Current development focuses on comprehensive standard library intrinsics (Promises, Arrays, Maps), asynchronous event loop scheduling, and Node.js-compatible module resolution.
 
 ---
 
@@ -59,7 +66,122 @@ AetherVM is engineered from first principles around three systems compiler found
 
 ---
 
-## 2. End-to-End Execution Pipeline
+## 2. Project Status & Implementation Roadmap
+
+```
+AetherVM Core Development Progress: [████████████████████████████████░░░░░░░░░░░░░░] 70%
+```
+
+### Implementation Progress Matrix
+
+| Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
+| :---: | :--- | :--- | :---: | :---: |
+| **01** | Value Model & ISA | NaN-boxing, Shape transitions, Accumulator Bytecode ISA | Complete | `[==========] 100%` |
+| **02** | Frontend & Parsing | SIMD-ready Lexer, Pratt Precedence Parser, AST Lowering | Complete | `[==========] 100%` |
+| **03** | Memory & Immix GC | 4GB Pinned Heap, Semi-Space Nursery, Cheney Scavenger, Immix Old Gen | Complete | `[==========] 100%` |
+| **04** | Tier 1 Baseline JIT | Single-Pass Native x86-64 Machine Code Generation, Inline Caches | Complete | `[==========] 100%` |
+| **05** | Tier 2 Sea-of-Nodes | SSA IR Graph, Global Value Numbering (GVN), Constant Folding, DCE | Complete | `[==========] 100%` |
+| **06** | ECMAScript Runtime | Agent, Realm, Intrinsics (Math, console), Microtask Queue FIFO | Complete | `[==========] 100%` |
+| **07** | Object Model & Scopes | Lexical Closures, Prototype Delegation & Shadowing, ES6 Classes, Try/Catch | Complete | `[==========] 100%` |
+| **08** | Standard Library Intrinsics | Full Array methods, String, Promise/A+, Map, Set, JSON, RegExp | In Progress | `[====......] 40%` |
+| **09** | Asynchronous Event Loop | Macrotask scheduling, Timers (setTimeout/setInterval), Host I/O bindings | Planned | `[..........] 0%` |
+| **10** | Full Ecosystem & Modules | CommonJS & ESM Loaders, Test262 Conformance Suite, npm package runtime | Planned | `[..........] 0%` |
+
+### Subsystem Capability Grid
+
+<table>
+  <thead>
+    <tr>
+      <th width="22%">Subsystem</th>
+      <th width="48%">Implemented & Verified</th>
+      <th width="30%">Targeted for Completion</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><b>Execution Pipeline</b></td>
+      <td>
+        - Direct Accumulator Bytecode Interpreter (Tier 0)<br/>
+        - Tier 1 Baseline Template JIT (x86-64 native emission)<br/>
+        - Tier 2 Sea-of-Nodes SSA Optimizing JIT<br/>
+        - Type feedback vector with Monomorphic / Polymorphic ICs
+      </td>
+      <td>
+        - On-Stack Replacement (OSR)<br/>
+        - Deoptimization bailout frame reconstruction<br/>
+        - ARM64 / Apple Silicon backend
+      </td>
+    </tr>
+    <tr>
+      <td><b>Memory & Garbage Collection</b></td>
+      <td>
+        - 4GB Pinned Isolate Heap with 32-bit pointer compression<br/>
+        - Dual semi-space Nursery bump allocator<br/>
+        - Cheney-style copying scavenger<br/>
+        - 8MB Card Table generational write barrier<br/>
+        - Immix mark-sweep line-and-block allocator
+      </td>
+      <td>
+        - Concurrent / incremental marking pass<br/>
+        - WeakRef and FinalizationRegistry<br/>
+        - SharedArrayBuffer & atomic operations
+      </td>
+    </tr>
+    <tr>
+      <td><b>Object Model & Language</b></td>
+      <td>
+        - IEEE-754 Quiet NaN-boxed TaggedValues<br/>
+        - Shape (Hidden Class) transition trees<br/>
+        - In-object and out-of-line property storage<br/>
+        - Lexical environments and multi-level closures<br/>
+        - Prototype chain delegation and dynamic property shadowing<br/>
+        - ES6 classes, constructors, and method binding<br/>
+        - Structured exception handling (try / catch / finally)
+      </td>
+      <td>
+        - Proxy and Reflect API<br/>
+        - Iterators, Generators, and Symbol keys<br/>
+        - Async functions and async generators<br/>
+        - Private class fields (<code>#field</code>)
+      </td>
+    </tr>
+    <tr>
+      <td><b>Runtime & Builtins</b></td>
+      <td>
+        - Agent & Realm specification isolation<br/>
+        - Global object and host JSNativeFunction binding<br/>
+        - ECMA-262 Microtask Queue FIFO dispatcher<br/>
+        - Math builtins (abs, sqrt, max, pow)<br/>
+        - Basic console.log host output
+      </td>
+      <td>
+        - Promise/A+ microtask execution chain<br/>
+        - Full ECMAScript Array / TypedArray methods<br/>
+        - Builtin JSON parser and serializer<br/>
+        - Map, Set, WeakMap, WeakSet<br/>
+        - ECMAScript RegExp engine
+      </td>
+    </tr>
+    <tr>
+      <td><b>Ecosystem & Host Integration</b></td>
+      <td>
+        - Native C++ embedder API<br/>
+        - Microsecond-precision execution timers<br/>
+        - 32 architectural test verification suites
+      </td>
+      <td>
+        - CommonJS (require) & ES Modules (import/export)<br/>
+        - Host Event Loop with timers (setTimeout/setInterval)<br/>
+        - Official Test262 Conformance Test Suite integration<br/>
+        - Standard Web API surface (fetch, URL, TextEncoder)
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+---
+
+## 3. End-to-End Execution Pipeline
 
 ```mermaid
 flowchart TD
@@ -112,7 +234,7 @@ flowchart TD
 
 ---
 
-## 3. Subsystem Architecture
+## 4. Subsystem Architecture
 
 ### 3.1 Object Representation & Dual-Model Tagging
 
@@ -208,9 +330,9 @@ AetherVM 4GB Pinned Memory Window (HeapBase in r14):
 
 ---
 
-## 4. Architectural Verification & Benchmarks
+## 5. Architectural Verification & Benchmarks
 
-All engine components are verified by six comprehensive architectural test suites compiled under MSVC `/std:c++latest /W4 /permissive-` and Clang/GCC `-std=c++23`:
+All engine components are verified by seven comprehensive architectural test suites compiled under MSVC `/std:c++latest /W4 /permissive-` and Clang/GCC `-std=c++23`:
 
 | Test Suite | Target Component | Verifications | Status |
 | :--- | :--- | :--- | :--- |
@@ -220,16 +342,17 @@ All engine components are verified by six comprehensive architectural test suite
 | `test_milestone4_jit` | Tier 1 Baseline JIT | Single-pass Native x86-64 Machine Code, Branching, Loops, 1M Iteration Loop | **4 / 4 Passed** |
 | `test_milestone5_son_jit` | Tier 2 Optimizing JIT | Sea-of-Nodes Graph IR, GVN, Constant Folding, DCE, Unboxed Native Loops | **5 / 5 Passed** |
 | `test_milestone6_runtime` | Runtime & Intrinsics | Agent, Realm, Math/Console Intrinsics, Microtask Queue FIFO, Script Evaluation | **4 / 4 Passed** |
-| **Total** | **Full System Stack** | **Architectural Conformance & Performance Tests** | **28 / 28 Passed** |
+| `test_milestone7_closures` | Object Model & Scopes | Lexical Scopes & Closures, Prototype Delegation & Shadowing, ES6 Classes, Exceptions | **4 / 4 Passed** |
+| **Total** | **Full System Stack** | **Architectural Conformance & Performance Tests** | **32 / 32 Passed** |
 
 ### Execution Performance Metrics
 - **Native Parameterized Call `sumN(100)`**: Completed in 300 ns.
 - **1,000,000 Iteration Loop Benchmark**: Completed in 1.8 ms in native JIT execution.
-- **Garbage Collection Under Pressure**: 10,000 objects allocated on the fly triggering 49 Minor GCs with 0 memory leaks.
+- **Garbage Collection Under Pressure**: 10,000 objects allocated on the fly triggering 53 Minor GCs with 0 memory leaks.
 
 ---
 
-## 5. Repository Structure
+## 6. Repository Structure
 
 ```
 .
@@ -283,7 +406,7 @@ All engine components are verified by six comprehensive architectural test suite
 
 ---
 
-## 6. Building and Running
+## 7. Building and Running
 
 ### Prerequisites
 - Modern C++23 compliant toolchain:
@@ -320,6 +443,6 @@ cmake --build build -j$(nproc)
 
 ---
 
-## 7. License
+## 8. License
 
 AetherVM is distributed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
