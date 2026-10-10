@@ -124,6 +124,18 @@ public:
         return IsNull() || IsUndefined();
     }
 
+    AETHER_ALWAYS_INLINE bool IsTrue() const noexcept {
+        return raw_ == (kTagBoolean | 1ULL);
+    }
+
+    AETHER_ALWAYS_INLINE bool IsFalse() const noexcept {
+        return raw_ == (kTagBoolean | 0ULL);
+    }
+
+    AETHER_ALWAYS_INLINE uint64_t Raw() const noexcept {
+        return raw_;
+    }
+
     AETHER_ALWAYS_INLINE bool IsEmpty() const noexcept {
         return raw_ == kTagEmpty;
     }

@@ -16,23 +16,40 @@
 namespace aether {
 
 using NativeCallback = TaggedValue (*)(const std::vector<TaggedValue>& args);
+using NativeMethodCallback = TaggedValue (*)(TaggedValue this_val, const std::vector<TaggedValue>& args);
 
 /**
  * @brief Managed Host Native Function callable from ECMAScript.
  */
-class JSNativeFunction : public HeapObject {
+class JSNativeFunction : public JSObject {
 public:
-    JSNativeFunction(std::string_view name, NativeCallback callback, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::JSNativeFunction, shape),
-          name_(name),
-          callback_(callback) {}
+    using CallbackType = std::function<TaggedValue(const std::vector<TaggedValue>&)>;
+    using MethodCallbackType = std::function<TaggedValue(TaggedValue, const std::vector<TaggedValue>&)>;
+
+    JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape = nullptr);
+    JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape = nullptr);
+
     JSNativeFunction(JSNativeFunction&& other) noexcept = default;
 
     const std::string& Name() const noexcept { return name_; }
-    NativeCallback Callback() const noexcept { return callback_; }
+    const CallbackType& Callback() const noexcept { return callback_; }
+    const MethodCallbackType& MethodCallback() const noexcept { return method_callback_; }
+    bool IsMethodCallback() const noexcept { return static_cast<bool>(method_callback_); }
+
+    TaggedValue Invoke(TaggedValue this_val, const std::vector<TaggedValue>& args) const {
+        if (method_callback_) {
+            return method_callback_(this_val, args);
+        }
+        if (callback_) {
+            return callback_(args);
+        }
+        return TaggedValue::Undefined();
+    }
 
     size_t ObjectSize() const override { return sizeof(JSNativeFunction); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+    }
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSNativeFunction(std::move(*this));
@@ -40,8 +57,11 @@ public:
 
 private:
     std::string name_;
-    NativeCallback callback_;
+    CallbackType callback_{nullptr};
+    MethodCallbackType method_callback_{nullptr};
 };
+
+TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
 
 /**
  * @brief ECMA-262 Microtask Queue processing asynchronous Promise reactions.
@@ -76,21 +96,53 @@ class Realm {
 public:
     explicit Realm(Heap& heap);
 
+    static Realm* Current() noexcept { return s_current_realm_; }
+    static void SetCurrent(Realm* realm) noexcept { s_current_realm_ = realm; }
+
     JSObject* GetGlobalObject() noexcept { return global_object_; }
     TaggedValue GetGlobalProperty(std::string_view name);
     void SetGlobalProperty(std::string_view name, TaggedValue value);
 
     Shape* GetRootShape() noexcept { return root_shape_.get(); }
 
+    JSObject* GetArrayPrototype() const noexcept { return array_prototype_; }
+    JSObject* GetStringPrototype() const noexcept { return string_prototype_; }
+    JSObject* GetMapPrototype() const noexcept { return map_prototype_; }
+    JSObject* GetSetPrototype() const noexcept { return set_prototype_; }
+    JSObject* GetPromisePrototype() const noexcept { return promise_prototype_; }
+    JSObject* GetRegExpPrototype() const noexcept { return regexp_prototype_; }
+    JSObject* GetJSONObject() const noexcept { return json_object_; }
+
 private:
     void InitializeIntrinsics(Heap& heap);
+
+    static inline thread_local Realm* s_current_realm_{nullptr};
 
     std::unique_ptr<Shape> root_shape_;
     uint32_t next_shape_id_{1};
     JSObject* global_object_{nullptr};
     JSObject* math_object_{nullptr};
     JSObject* console_object_{nullptr};
+    JSObject* json_object_{nullptr};
+    JSObject* array_prototype_{nullptr};
+    JSObject* string_prototype_{nullptr};
+    JSObject* map_prototype_{nullptr};
+    JSObject* set_prototype_{nullptr};
+    JSObject* promise_prototype_{nullptr};
+    JSObject* regexp_prototype_{nullptr};
 };
+
+inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape)
+    : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
+      name_(name),
+      callback_(std::move(callback)),
+      method_callback_(nullptr) {}
+
+inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape)
+    : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
+      name_(name),
+      callback_(nullptr),
+      method_callback_(std::move(method_callback)) {}
 
 /**
  * @brief ECMAScript Agent encapsulating Isolate execution context and JIT runtime.

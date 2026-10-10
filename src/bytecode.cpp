@@ -37,12 +37,15 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
         case Opcode::LdaNamed:           return "LdaNamed";
         case Opcode::StaNamed:           return "StaNamed";
+        case Opcode::LdaKeyed:           return "LdaKeyed";
+        case Opcode::StaKeyed:           return "StaKeyed";
         case Opcode::LogicalNot:         return "LogicalNot";
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";
         case Opcode::Call:               return "Call";
         case Opcode::CallMethod:         return "CallMethod";
         case Opcode::CreateObject:       return "CreateObject";
+        case Opcode::CreateArray:        return "CreateArray";
         case Opcode::Construct:          return "Construct";
         case Opcode::LdaThis:            return "LdaThis";
         case Opcode::CreateClosure:      return "CreateClosure";
@@ -172,6 +175,23 @@ std::string BytecodeArray::Disassemble() const {
                 pc += 2;
                 ss << "r" << static_cast<int>(obj) << "." << constants_[name_idx].ToString() 
                    << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::LdaKeyed:
+            case Opcode::StaKeyed: {
+                uint8_t obj = bytes_[pc++];
+                uint8_t key = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "r" << static_cast<int>(obj) << "[r" << static_cast<int>(key) << "]"
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::CreateArray: {
+                uint8_t start = bytes_[pc++];
+                uint16_t count = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "start: r" << static_cast<int>(start) << ", count: " << count;
                 break;
             }
             case Opcode::Call: {

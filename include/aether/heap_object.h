@@ -24,6 +24,10 @@ enum class HeapObjectType : uint16_t {
     JSNativeFunction  = 0x08,
     LexicalEnvironment= 0x09,
     JSError           = 0x0A,
+    JSMap             = 0x0B,
+    JSSet             = 0x0C,
+    JSPromise         = 0x0D,
+    JSRegExp          = 0x0E,
 };
 
 /**
@@ -44,13 +48,27 @@ public:
     AETHER_ALWAYS_INLINE void SetShape(Shape* shape) noexcept { shape_ = shape; }
 
     AETHER_ALWAYS_INLINE HeapObjectType GetType() const noexcept { return type_; }
-    AETHER_ALWAYS_INLINE bool IsJSObject() const noexcept { return type_ == HeapObjectType::JSObject; }
+    AETHER_ALWAYS_INLINE bool IsJSObject() const noexcept {
+        return type_ == HeapObjectType::JSObject ||
+               type_ == HeapObjectType::JSArray  ||
+               type_ == HeapObjectType::JSMap    ||
+               type_ == HeapObjectType::JSSet    ||
+               type_ == HeapObjectType::JSPromise ||
+               type_ == HeapObjectType::JSRegExp ||
+               type_ == HeapObjectType::JSError  ||
+               type_ == HeapObjectType::JSNativeFunction;
+    }
+    AETHER_ALWAYS_INLINE bool IsPlainObject() const noexcept { return type_ == HeapObjectType::JSObject; }
     AETHER_ALWAYS_INLINE bool IsString() const noexcept { return type_ == HeapObjectType::String; }
     AETHER_ALWAYS_INLINE bool IsArray() const noexcept { return type_ == HeapObjectType::JSArray; }
     AETHER_ALWAYS_INLINE bool IsFunction() const noexcept { return type_ == HeapObjectType::JSFunction || type_ == HeapObjectType::JSNativeFunction; }
     AETHER_ALWAYS_INLINE bool IsNativeFunction() const noexcept { return type_ == HeapObjectType::JSNativeFunction; }
     AETHER_ALWAYS_INLINE bool IsEnvironment() const noexcept { return type_ == HeapObjectType::LexicalEnvironment; }
     AETHER_ALWAYS_INLINE bool IsError() const noexcept { return type_ == HeapObjectType::JSError; }
+    AETHER_ALWAYS_INLINE bool IsMap() const noexcept { return type_ == HeapObjectType::JSMap; }
+    AETHER_ALWAYS_INLINE bool IsSet() const noexcept { return type_ == HeapObjectType::JSSet; }
+    AETHER_ALWAYS_INLINE bool IsPromise() const noexcept { return type_ == HeapObjectType::JSPromise; }
+    AETHER_ALWAYS_INLINE bool IsRegExp() const noexcept { return type_ == HeapObjectType::JSRegExp; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;
@@ -166,6 +184,8 @@ public:
         }
     }
 
+    virtual ~JSObject() = default;
+
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSObject(std::move(*this));
     }
@@ -214,10 +234,263 @@ public:
         }
     }
 
+protected:
+    JSObject(HeapObjectType type, Shape* shape)
+        : HeapObject(type, shape) {
+        for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
+            in_object_slots_[i] = TaggedValue::Empty();
+        }
+    }
+
 private:
     JSObject* prototype_{nullptr};
     TaggedValue in_object_slots_[Shape::kDefaultInObjectProperties];
     std::vector<TaggedValue> out_of_line_slots_;
+};
+
+/**
+ * @brief Managed JavaScript Array with contiguous elements and length property.
+ */
+class JSArray : public JSObject {
+public:
+    explicit JSArray(Shape* shape, size_t initial_capacity = 0)
+        : JSObject(HeapObjectType::JSArray, shape) {
+        if (initial_capacity > 0) {
+            elements_.resize(initial_capacity, TaggedValue::Undefined());
+        }
+    }
+
+    explicit JSArray(Shape* shape, std::vector<TaggedValue> elements)
+        : JSObject(HeapObjectType::JSArray, shape), elements_(std::move(elements)) {}
+
+    JSArray(JSArray&& other) noexcept
+        : JSObject(std::move(other)),
+          elements_(std::move(other.elements_)) {}
+
+    size_t Length() const noexcept { return elements_.size(); }
+    void SetLength(size_t len) { elements_.resize(len, TaggedValue::Undefined()); }
+
+    TaggedValue GetElement(size_t index) const {
+        if (index < elements_.size()) {
+            return elements_[index];
+        }
+        return TaggedValue::Undefined();
+    }
+
+    void SetElement(size_t index, TaggedValue val) {
+        if (index >= elements_.size()) {
+            elements_.resize(index + 1, TaggedValue::Undefined());
+        }
+        elements_[index] = val;
+    }
+
+    void Push(TaggedValue val) {
+        elements_.push_back(val);
+    }
+
+    TaggedValue Pop() {
+        if (elements_.empty()) return TaggedValue::Undefined();
+        TaggedValue last = elements_.back();
+        elements_.pop_back();
+        return last;
+    }
+
+    const std::vector<TaggedValue>& Elements() const noexcept { return elements_; }
+    std::vector<TaggedValue>& Elements() noexcept { return elements_; }
+
+    size_t ObjectSize() const override {
+        return sizeof(JSArray) + elements_.capacity() * sizeof(TaggedValue);
+    }
+
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        for (auto& el : elements_) {
+            if (!el.IsEmpty()) visitor(el);
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSArray(std::move(*this));
+    }
+
+private:
+    std::vector<TaggedValue> elements_;
+};
+
+/**
+ * @brief Managed ECMAScript Map collection preserving insertion order.
+ */
+class JSMap : public JSObject {
+public:
+    explicit JSMap(Shape* shape)
+        : JSObject(HeapObjectType::JSMap, shape) {}
+
+    JSMap(JSMap&& other) noexcept
+        : JSObject(std::move(other)),
+          entries_(std::move(other.entries_)) {}
+
+    size_t Size() const noexcept { return entries_.size(); }
+
+    void Set(TaggedValue key, TaggedValue val);
+    TaggedValue Get(TaggedValue key) const;
+    bool Has(TaggedValue key) const;
+    bool Delete(TaggedValue key);
+    void Clear() { entries_.clear(); }
+
+    const std::vector<std::pair<TaggedValue, TaggedValue>>& Entries() const noexcept { return entries_; }
+
+    size_t ObjectSize() const override {
+        return sizeof(JSMap) + entries_.capacity() * sizeof(std::pair<TaggedValue, TaggedValue>);
+    }
+
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        for (auto& [k, v] : entries_) {
+            if (!k.IsEmpty()) visitor(k);
+            if (!v.IsEmpty()) visitor(v);
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSMap(std::move(*this));
+    }
+
+private:
+    std::vector<std::pair<TaggedValue, TaggedValue>> entries_;
+};
+
+/**
+ * @brief Managed ECMAScript Set collection preserving insertion order.
+ */
+class JSSet : public JSObject {
+public:
+    explicit JSSet(Shape* shape)
+        : JSObject(HeapObjectType::JSSet, shape) {}
+
+    JSSet(JSSet&& other) noexcept
+        : JSObject(std::move(other)),
+          values_(std::move(other.values_)) {}
+
+    size_t Size() const noexcept { return values_.size(); }
+
+    void Add(TaggedValue val);
+    bool Has(TaggedValue val) const;
+    bool Delete(TaggedValue val);
+    void Clear() { values_.clear(); }
+
+    const std::vector<TaggedValue>& Values() const noexcept { return values_; }
+
+    size_t ObjectSize() const override {
+        return sizeof(JSSet) + values_.capacity() * sizeof(TaggedValue);
+    }
+
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        for (auto& v : values_) {
+            if (!v.IsEmpty()) visitor(v);
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSSet(std::move(*this));
+    }
+
+private:
+    std::vector<TaggedValue> values_;
+};
+
+enum class PromiseState : uint8_t {
+    Pending   = 0,
+    Fulfilled = 1,
+    Rejected  = 2
+};
+
+class MicrotaskQueue;
+
+struct PromiseReaction {
+    TaggedValue on_fulfilled;
+    TaggedValue on_rejected;
+    class JSPromise* downstream_promise{nullptr};
+};
+
+/**
+ * @brief Managed ECMAScript Promise conforming to Promise/A+.
+ */
+class JSPromise : public JSObject {
+public:
+    explicit JSPromise(Shape* shape)
+        : JSObject(HeapObjectType::JSPromise, shape),
+          state_(PromiseState::Pending),
+          result_(TaggedValue::Undefined()) {}
+
+    JSPromise(JSPromise&& other) noexcept
+        : JSObject(std::move(other)),
+          state_(other.state_),
+          result_(other.result_),
+          reactions_(std::move(other.reactions_)) {}
+
+    PromiseState State() const noexcept { return state_; }
+    TaggedValue Result() const noexcept { return result_; }
+
+    void Fulfill(TaggedValue val, MicrotaskQueue& queue);
+    void Reject(TaggedValue reason, MicrotaskQueue& queue);
+    void AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, JSPromise* downstream, MicrotaskQueue& queue);
+
+    size_t ObjectSize() const override {
+        return sizeof(JSPromise) + reactions_.capacity() * sizeof(PromiseReaction);
+    }
+
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        if (!result_.IsEmpty()) visitor(result_);
+        for (auto& r : reactions_) {
+            if (!r.on_fulfilled.IsEmpty()) visitor(r.on_fulfilled);
+            if (!r.on_rejected.IsEmpty()) visitor(r.on_rejected);
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSPromise(std::move(*this));
+    }
+
+private:
+    PromiseState state_;
+    TaggedValue result_;
+    std::vector<PromiseReaction> reactions_;
+};
+
+/**
+ * @brief Managed ECMAScript RegExp object.
+ */
+class JSRegExp : public JSObject {
+public:
+    JSRegExp(std::string_view pattern, std::string_view flags, Shape* shape = nullptr)
+        : JSObject(HeapObjectType::JSRegExp, shape),
+          pattern_(pattern),
+          flags_(flags) {}
+
+    JSRegExp(JSRegExp&& other) noexcept
+        : JSObject(std::move(other)),
+          pattern_(std::move(other.pattern_)),
+          flags_(std::move(other.flags_)) {}
+
+    const std::string& Pattern() const noexcept { return pattern_; }
+    const std::string& Flags() const noexcept { return flags_; }
+
+    bool Test(std::string_view str) const;
+
+    size_t ObjectSize() const override { return sizeof(JSRegExp); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSRegExp(std::move(*this));
+    }
+
+private:
+    std::string pattern_;
+    std::string flags_;
 };
 
 /**

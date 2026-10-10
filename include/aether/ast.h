@@ -30,7 +30,9 @@ enum class BinaryOp {
     LessThan,
     GreaterThan,
     LessThanOrEqual,
-    GreaterThanOrEqual
+    GreaterThanOrEqual,
+    LogicalAnd,
+    LogicalOr
 };
 
 enum class UnaryOp {
@@ -170,6 +172,50 @@ public:
 
 private:
     std::vector<std::pair<std::string, std::unique_ptr<Expr>>> properties_;
+};
+
+class ArrayLiteralExpr : public Expr {
+public:
+    explicit ArrayLiteralExpr(std::vector<std::unique_ptr<Expr>> elements)
+        : elements_(std::move(elements)) {}
+
+    const std::vector<std::unique_ptr<Expr>>& Elements() const noexcept { return elements_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::vector<std::unique_ptr<Expr>> elements_;
+};
+
+class IndexAccessExpr : public Expr {
+public:
+    IndexAccessExpr(std::unique_ptr<Expr> object, std::unique_ptr<Expr> index)
+        : object_(std::move(object)), index_(std::move(index)) {}
+
+    Expr* Object() const noexcept { return object_.get(); }
+    Expr* Index() const noexcept { return index_.get(); }
+    std::unique_ptr<Expr> ReleaseObject() noexcept { return std::move(object_); }
+    std::unique_ptr<Expr> ReleaseIndex() noexcept { return std::move(index_); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> object_;
+    std::unique_ptr<Expr> index_;
+};
+
+class IndexAssignExpr : public Expr {
+public:
+    IndexAssignExpr(std::unique_ptr<Expr> object, std::unique_ptr<Expr> index, std::unique_ptr<Expr> value)
+        : object_(std::move(object)), index_(std::move(index)), value_(std::move(value)) {}
+
+    Expr* Object() const noexcept { return object_.get(); }
+    Expr* Index() const noexcept { return index_.get(); }
+    Expr* Value() const noexcept { return value_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> object_;
+    std::unique_ptr<Expr> index_;
+    std::unique_ptr<Expr> value_;
 };
 
 class NewExpr : public Expr {
@@ -388,6 +434,9 @@ public:
     virtual void VisitNew(NewExpr* node) = 0;
     virtual void VisitFunctionExpr(FunctionExpr* node) = 0;
     virtual void VisitObjectLiteral(ObjectLiteralExpr* node) = 0;
+    virtual void VisitArrayLiteral(ArrayLiteralExpr* node) = 0;
+    virtual void VisitIndexAccess(IndexAccessExpr* node) = 0;
+    virtual void VisitIndexAssign(IndexAssignExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -414,6 +463,9 @@ inline void CallExpr::Accept(ASTVisitor* v) { v->VisitCall(this); }
 inline void NewExpr::Accept(ASTVisitor* v) { v->VisitNew(this); }
 inline void FunctionExpr::Accept(ASTVisitor* v) { v->VisitFunctionExpr(this); }
 inline void ObjectLiteralExpr::Accept(ASTVisitor* v) { v->VisitObjectLiteral(this); }
+inline void ArrayLiteralExpr::Accept(ASTVisitor* v) { v->VisitArrayLiteral(this); }
+inline void IndexAccessExpr::Accept(ASTVisitor* v) { v->VisitIndexAccess(this); }
+inline void IndexAssignExpr::Accept(ASTVisitor* v) { v->VisitIndexAssign(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }

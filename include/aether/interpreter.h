@@ -100,13 +100,20 @@ public:
         pending_exception_ = TaggedValue::Undefined();
     }
 
+    static Interpreter* Current() noexcept { return s_current_interpreter_; }
+    static void SetCurrent(Interpreter* interp) noexcept { s_current_interpreter_ = interp; }
+    LexicalEnvironment* GetLastEnvironment() const noexcept { return last_environment_; }
+
 private:
+    static inline thread_local Interpreter* s_current_interpreter_{nullptr};
+    friend struct InterpreterScope;
     TaggedValue acc_{TaggedValue::Undefined()};
     TypeFeedbackVector feedback_;
     uint32_t next_shape_id_{1};
     std::unique_ptr<Shape> root_shape_;
     bool has_pending_exception_{false};
     TaggedValue pending_exception_{TaggedValue::Undefined()};
+    LexicalEnvironment* last_environment_{nullptr};
 };
 
 } // namespace aether

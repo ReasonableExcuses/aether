@@ -6,6 +6,17 @@
 namespace aether {
 
 TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env) {
+    struct InterpreterScope {
+        Interpreter* prev;
+        InterpreterScope(Interpreter* cur) : prev(Interpreter::s_current_interpreter_) {
+            Interpreter::s_current_interpreter_ = cur;
+        }
+        ~InterpreterScope() {
+            Interpreter::s_current_interpreter_ = prev;
+        }
+    };
+    InterpreterScope current_scope(this);
+
     // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
     if (const ExecutableMemory* t2 = bytecode.GetTier2Code()) {
         return BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
@@ -338,6 +349,20 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     }
                 }
 
+                if (obj_val.AsHeapObject()->IsString()) {
+                    auto* str_obj = static_cast<JSString*>(obj_val.AsHeapObject());
+                    if (prop_key == "length") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(str_obj->Length()));
+                        break;
+                    }
+                    if (Realm::Current() && Realm::Current()->GetStringPrototype()) {
+                        acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
+                    acc_ = TaggedValue::Undefined();
+                    break;
+                }
+
                 assert(obj_val.AsHeapObject()->IsJSObject());
                 JSObject* js_obj = static_cast<JSObject*>(obj_val.AsHeapObject());
 
@@ -381,6 +406,11 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                         fn->SetPrototype(static_cast<JSObject*>(acc_.AsHeapObject()));
                         break;
                     }
+                }
+
+                if (obj_val.AsHeapObject()->IsString()) {
+                    // String primitives are immutable in ECMAScript
+                    break;
                 }
 
                 assert(obj_val.AsHeapObject()->IsJSObject());
@@ -434,6 +464,121 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 acc_ = TaggedValue::FromHeapObject(obj);
                 break;
             }
+            case Opcode::CreateArray: {
+                uint8_t start_reg = *pc++;
+                uint16_t count = pc[0] | (pc[1] << 8);
+                pc += 2;
+                auto* arr = new JSArray(GetRootShape(), static_cast<size_t>(count));
+                if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                    arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+                }
+                for (uint16_t i = 0; i < count; ++i) {
+                    arr->SetElement(i, frame.GetRegister(static_cast<uint8_t>(start_reg + i)));
+                }
+                acc_ = TaggedValue::FromHeapObject(arr);
+                break;
+            }
+            case Opcode::LdaKeyed: {
+                uint8_t obj_reg = *pc++;
+                uint8_t key_reg = *pc++;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+
+                TaggedValue obj_val = frame.GetRegister(obj_reg);
+                TaggedValue key_val = frame.GetRegister(key_reg);
+
+                if (!obj_val.IsHeapObject()) {
+                    acc_ = TaggedValue::Undefined();
+                    break;
+                }
+
+                HeapObject* h_obj = obj_val.AsHeapObject();
+                if (h_obj->IsArray()) {
+                    auto* arr = static_cast<JSArray*>(h_obj);
+                    if (key_val.IsSmi()) {
+                        int32_t idx = key_val.AsSmi();
+                        acc_ = idx >= 0 ? arr->GetElement(static_cast<size_t>(idx)) : TaggedValue::Undefined();
+                    } else if (key_val.IsNumber()) {
+                        double d = key_val.AsNumber();
+                        acc_ = (d >= 0.0 && std::floor(d) == d) ? arr->GetElement(static_cast<size_t>(d)) : TaggedValue::Undefined();
+                    } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        acc_ = arr->GetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                    } else {
+                        acc_ = TaggedValue::Undefined();
+                    }
+                } else if (h_obj->IsString()) {
+                    auto* str_obj = static_cast<JSString*>(h_obj);
+                    int32_t idx = -1;
+                    if (key_val.IsSmi()) idx = key_val.AsSmi();
+                    else if (key_val.IsNumber()) {
+                        double d = key_val.AsNumber();
+                        if (d >= 0.0 && std::floor(d) == d) idx = static_cast<int32_t>(d);
+                    }
+                    if (idx >= 0 && static_cast<size_t>(idx) < str_obj->Length()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString(str_obj->View().substr(idx, 1)));
+                    } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        std::string_view k = static_cast<JSString*>(key_val.AsHeapObject())->View();
+                        if (k == "length") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(str_obj->Length()));
+                        } else if (Realm::Current() && Realm::Current()->GetStringPrototype()) {
+                            acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(k);
+                        } else {
+                            acc_ = TaggedValue::Undefined();
+                        }
+                    } else {
+                        acc_ = TaggedValue::Undefined();
+                    }
+                } else if (h_obj->IsJSObject()) {
+                    auto* js_obj = static_cast<JSObject*>(h_obj);
+                    if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        acc_ = js_obj->GetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                    } else if (key_val.IsSmi()) {
+                        acc_ = js_obj->GetNamedProperty(std::to_string(key_val.AsSmi()));
+                    } else {
+                        acc_ = js_obj->GetNamedProperty(key_val.ToString());
+                    }
+                } else {
+                    acc_ = TaggedValue::Undefined();
+                }
+                break;
+            }
+            case Opcode::StaKeyed: {
+                uint8_t obj_reg = *pc++;
+                uint8_t key_reg = *pc++;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+
+                TaggedValue obj_val = frame.GetRegister(obj_reg);
+                TaggedValue key_val = frame.GetRegister(key_reg);
+
+                if (obj_val.IsHeapObject()) {
+                    HeapObject* h_obj = obj_val.AsHeapObject();
+                    if (h_obj->IsArray()) {
+                        auto* arr = static_cast<JSArray*>(h_obj);
+                        if (key_val.IsSmi()) {
+                            int32_t idx = key_val.AsSmi();
+                            if (idx >= 0) arr->SetElement(static_cast<size_t>(idx), acc_);
+                        } else if (key_val.IsNumber()) {
+                            double d = key_val.AsNumber();
+                            if (d >= 0.0 && std::floor(d) == d) arr->SetElement(static_cast<size_t>(d), acc_);
+                        } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                            arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                        }
+                    } else if (h_obj->IsJSObject()) {
+                        auto* js_obj = static_cast<JSObject*>(h_obj);
+                        if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                            js_obj->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                        } else if (key_val.IsSmi()) {
+                            js_obj->SetNamedProperty(std::to_string(key_val.AsSmi()), acc_, next_shape_id_);
+                        } else {
+                            js_obj->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
+                        }
+                    }
+                }
+                break;
+            }
             case Opcode::LdaThis: {
                 acc_ = frame.GetThis();
                 break;
@@ -456,6 +601,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 pc += 2;
                 auto* new_env = new LexicalEnvironment(frame.GetEnvironment(), slot_count);
                 frame.SetEnvironment(new_env);
+                last_environment_ = new_env;
                 break;
             }
             case Opcode::LdaContextSlot: {
@@ -486,6 +632,19 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 TaggedValue ctor_val = frame.GetRegister(ctor_reg);
                 assert(ctor_val.IsHeapObject() && ctor_val.AsHeapObject()->IsFunction());
+
+                std::vector<TaggedValue> call_args;
+                call_args.reserve(arg_count);
+                for (uint8_t i = 0; i < arg_count; ++i) {
+                    call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
+                }
+
+                if (ctor_val.AsHeapObject()->IsNativeFunction()) {
+                    auto* native_fn = static_cast<JSNativeFunction*>(ctor_val.AsHeapObject());
+                    acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
+                    break;
+                }
+
                 auto* ctor_fn = static_cast<JSFunction*>(ctor_val.AsHeapObject());
                 if (!ctor_fn->GetPrototype()) {
                     ctor_fn->SetPrototype(new JSObject(GetRootShape()));
@@ -493,12 +652,6 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 auto* instance = new JSObject(GetRootShape());
                 instance->SetPrototype(ctor_fn->GetPrototype());
                 TaggedValue instance_val = TaggedValue::FromHeapObject(instance);
-
-                std::vector<TaggedValue> call_args;
-                call_args.reserve(arg_count);
-                for (uint8_t i = 0; i < arg_count; ++i) {
-                    call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
-                }
 
                 TaggedValue ret = Execute(*ctor_fn->GetBytecode(), call_args, instance_val, ctor_fn->GetEnvironment());
                 if (has_pending_exception_) {
@@ -541,7 +694,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
-                    acc_ = native_fn->Callback()(call_args);
+                    acc_ = native_fn->Invoke(rec_this, call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
                     acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
@@ -579,7 +732,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
-                    acc_ = native_fn->Callback()(call_args);
+                    acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
                     acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());

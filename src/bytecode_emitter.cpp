@@ -1,4 +1,5 @@
 #include "aether/bytecode_emitter.h"
+#include "aether/runtime.h"
 
 namespace aether {
 
@@ -45,6 +46,18 @@ public:
     }
     void VisitObjectLiteral(ObjectLiteralExpr* node) override {
         for (const auto& p : node->Properties()) p.second->Accept(this);
+    }
+    void VisitArrayLiteral(ArrayLiteralExpr* node) override {
+        for (const auto& el : node->Elements()) el->Accept(this);
+    }
+    void VisitIndexAccess(IndexAccessExpr* node) override {
+        node->Object()->Accept(this);
+        node->Index()->Accept(this);
+    }
+    void VisitIndexAssign(IndexAssignExpr* node) override {
+        node->Object()->Accept(this);
+        node->Index()->Accept(this);
+        node->Value()->Accept(this);
     }
     void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitVarDecl(VarDeclStmt* node) override {
@@ -119,6 +132,17 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
                 }
             }
         }
+    } else if (auto* prog = dynamic_cast<Program*>(body)) {
+        for (const auto& stmt : prog->Statements()) {
+            if (auto* v = dynamic_cast<VarDeclStmt*>(stmt.get())) {
+                if (scanner.identifiers_in_nested_functions.count(v->Name())) {
+                    if (!context_slots_.count(v->Name())) {
+                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                        context_slots_[v->Name()] = slot;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -148,9 +172,15 @@ BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view
     }
     JSFunction* fn = LookupFunction(name);
     if (fn != nullptr) {
-        return VarResolution{VarResolution::GlobalOrFunction, 0, 0, 0, fn};
+        return VarResolution{VarResolution::GlobalOrFunction, 0, 0, 0, fn, TaggedValue::Undefined()};
     }
-    return VarResolution{VarResolution::NotFound, 0, 0, 0, nullptr};
+    if (Realm::Current()) {
+        TaggedValue g_val = Realm::Current()->GetGlobalProperty(name);
+        if (!g_val.IsUndefined()) {
+            return VarResolution{VarResolution::GlobalValue, 0, 0, 0, nullptr, g_val};
+        }
+    }
+    return VarResolution{VarResolution::NotFound, 0, 0, 0, nullptr, TaggedValue::Undefined()};
 }
 
 std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
@@ -160,6 +190,13 @@ std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
     register_in_use_.clear();
     max_registers_ = 0;
     next_feedback_slot_ = 0;
+
+    ScanAndSetupContextSlots({}, root);
+
+    if (!context_slots_.empty()) {
+        bytecode_->EmitOpcode(Opcode::CreateFunctionContext);
+        bytecode_->EmitU16(static_cast<uint16_t>(context_slots_.size()));
+    }
 
     root->Accept(this);
 
@@ -354,6 +391,12 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         bytecode_->EmitU16(const_idx);
         return;
     }
+    if (res.kind == VarResolution::GlobalValue) {
+        uint16_t const_idx = bytecode_->AddConstant(res.global_val);
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(const_idx);
+        return;
+    }
 
     assert(false && "Undeclared identifier in scope");
 }
@@ -479,6 +522,55 @@ void BytecodeEmitter::VisitCall(CallExpr* node) {
         return;
     }
 
+    if (auto* idx = dynamic_cast<IndexAccessExpr*>(node->Callee())) {
+        // 1. Evaluate receiver object
+        idx->Object()->Accept(this);
+        uint8_t this_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(this_reg);
+
+        // 2. Evaluate key
+        idx->Index()->Accept(this);
+        uint8_t key_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(key_reg);
+
+        // 3. Load keyed property
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaKeyed);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU8(key_reg);
+        bytecode_->EmitU16(slot);
+
+        uint8_t callee_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(callee_reg);
+
+        // 4. Evaluate arguments
+        uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+        uint8_t args_start = AllocateRegisterRange(arg_count);
+        for (uint8_t i = 0; i < arg_count; ++i) {
+            node->Args()[i]->Accept(this);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+        }
+
+        // 5. Emit CallMethod
+        uint16_t call_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::CallMethod);
+        bytecode_->EmitU8(callee_reg);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU8(args_start);
+        bytecode_->EmitU8(arg_count);
+        bytecode_->EmitU16(call_slot);
+
+        FreeRegisterRange(args_start, arg_count);
+        FreeRegister(callee_reg);
+        FreeRegister(key_reg);
+        FreeRegister(this_reg);
+        return;
+    }
+
     // 1. Evaluate callee
     node->Callee()->Accept(this);
     uint8_t callee_reg = AllocateRegister();
@@ -530,7 +622,85 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
     FreeRegister(obj_reg);
 }
 
+void BytecodeEmitter::VisitArrayLiteral(ArrayLiteralExpr* node) {
+    uint8_t count = static_cast<uint8_t>(node->Elements().size());
+    uint8_t args_start = AllocateRegisterRange(count);
+
+    for (uint8_t i = 0; i < count; ++i) {
+        node->Elements()[i]->Accept(this);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+    }
+
+    bytecode_->EmitOpcode(Opcode::CreateArray);
+    bytecode_->EmitU8(args_start);
+    bytecode_->EmitU16(count);
+
+    FreeRegisterRange(args_start, count);
+}
+
+void BytecodeEmitter::VisitIndexAccess(IndexAccessExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    node->Index()->Accept(this);
+    uint8_t key_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(key_reg);
+
+    uint16_t slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(key_reg);
+    bytecode_->EmitU16(slot);
+
+    FreeRegister(key_reg);
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitIndexAssign(IndexAssignExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    node->Index()->Accept(this);
+    uint8_t key_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(key_reg);
+
+    node->Value()->Accept(this);
+
+    uint16_t slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::StaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(key_reg);
+    bytecode_->EmitU16(slot);
+
+    FreeRegister(key_reg);
+    FreeRegister(obj_reg);
+}
+
 void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
+    if (node->Op() == BinaryOp::LogicalAnd) {
+        node->Lhs()->Accept(this);
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfFalse, short_circuit);
+        node->Rhs()->Accept(this);
+        Bind(short_circuit);
+        return;
+    }
+    if (node->Op() == BinaryOp::LogicalOr) {
+        node->Lhs()->Accept(this);
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        Bind(short_circuit);
+        return;
+    }
+
     // 1. Evaluate LHS
     node->Lhs()->Accept(this);
     uint8_t lhs_reg = AllocateRegister();

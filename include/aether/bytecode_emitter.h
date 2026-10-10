@@ -39,6 +39,9 @@ public:
     void VisitNew(NewExpr* node) override;
     void VisitFunctionExpr(FunctionExpr* node) override;
     void VisitObjectLiteral(ObjectLiteralExpr* node) override;
+    void VisitArrayLiteral(ArrayLiteralExpr* node) override;
+    void VisitIndexAccess(IndexAccessExpr* node) override;
+    void VisitIndexAssign(IndexAssignExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;
@@ -64,11 +67,12 @@ public:
     void FreeRegisterRange(uint8_t start, uint8_t count);
 
     struct VarResolution {
-        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, ThisVar, NotFound } kind{NotFound};
+        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, GlobalValue, ThisVar, NotFound } kind{NotFound};
         uint8_t reg{0};
         uint8_t depth{0};
         uint16_t slot{0};
         JSFunction* fn{nullptr};
+        TaggedValue global_val{TaggedValue::Undefined()};
     };
 
     VarResolution ResolveVariable(std::string_view name);

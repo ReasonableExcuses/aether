@@ -4,19 +4,19 @@ A clean-slate, high-throughput, low-latency ECMAScript virtual machine and multi
 
 <p align="left">
   <img src="https://img.shields.io/badge/Status-In%20Active%20Development-E65100?style=flat-square" alt="Status" />
-  <img src="https://img.shields.io/badge/Milestones-7%20of%2010%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Milestones-8%20of%2010%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Pointer%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-32%2F32%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-38%2F38%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
 > [!NOTE]
 > **Engineering Notice: Active System Development**
 > AetherVM is an open-source, high-throughput ECMAScript virtual machine and multi-tier JIT compiler currently in active system development.
-> The core execution engine is fully operational: the Accumulator-Register Bytecode Interpreter (Tier 0), Baseline Template JIT (Tier 1), Sea-of-Nodes Optimizing JIT (Tier 2), Generational Immix Garbage Collector, Hidden Class shapes, lexical closures, prototype inheritance, and ES6 classes are implemented and validated across 32 passing architectural test suites. Current development focuses on comprehensive standard library intrinsics (Promises, Arrays, Maps), asynchronous event loop scheduling, and Node.js-compatible module resolution.
+> The core execution engine and standard library intrinsics are operational: the Accumulator-Register Bytecode Interpreter (Tier 0), Baseline Template JIT (Tier 1), Sea-of-Nodes Optimizing JIT (Tier 2), Generational Immix Garbage Collector, Hidden Class shapes, lexical closures, prototype inheritance, ES6 classes, full Array methods, String prototypes, JSON parser/serializer, Map/Set collections, and Promise/A+ microtask chains are implemented and validated across 38 passing architectural test suites. Current development focuses on the asynchronous Event Loop, host timers (`setTimeout`/`setInterval`), and Node.js-compatible module loaders.
 
 ---
 
@@ -69,7 +69,7 @@ AetherVM is engineered from first principles around three systems compiler found
 ## 2. Project Status & Implementation Roadmap
 
 ```
-AetherVM Core Development Progress: [████████████████████████████████░░░░░░░░░░░░░░] 70%
+AetherVM Core Development Progress: [████████████████████████████████████████░░░░░░░░░░] 80%
 ```
 
 ### Implementation Progress Matrix
@@ -83,8 +83,8 @@ AetherVM Core Development Progress: [██████████████�
 | **05** | Tier 2 Sea-of-Nodes | SSA IR Graph, Global Value Numbering (GVN), Constant Folding, DCE | Complete | `[==========] 100%` |
 | **06** | ECMAScript Runtime | Agent, Realm, Intrinsics (Math, console), Microtask Queue FIFO | Complete | `[==========] 100%` |
 | **07** | Object Model & Scopes | Lexical Closures, Prototype Delegation & Shadowing, ES6 Classes, Try/Catch | Complete | `[==========] 100%` |
-| **08** | Standard Library Intrinsics | Full Array methods, String, Promise/A+, Map, Set, JSON, RegExp | In Progress | `[====......] 40%` |
-| **09** | Asynchronous Event Loop | Macrotask scheduling, Timers (setTimeout/setInterval), Host I/O bindings | Planned | `[..........] 0%` |
+| **08** | Standard Library Intrinsics | Full Array methods, String, Promise/A+, Map, Set, JSON, RegExp | Complete | `[==========] 100%` |
+| **09** | Asynchronous Event Loop | Macrotask scheduling, Timers (setTimeout/setInterval), Host I/O bindings | In Progress | `[====......] 40%` |
 | **10** | Full Ecosystem & Modules | CommonJS & ESM Loaders, Test262 Conformance Suite, npm package runtime | Planned | `[..........] 0%` |
 
 ### Subsystem Capability Grid
@@ -152,14 +152,18 @@ AetherVM Core Development Progress: [██████████████�
         - Global object and host JSNativeFunction binding<br/>
         - ECMA-262 Microtask Queue FIFO dispatcher<br/>
         - Math builtins (abs, sqrt, max, pow)<br/>
-        - Basic console.log host output
+        - Standard console.log host output<br/>
+        - Full Array methods (push, pop, slice, map, filter, etc.)<br/>
+        - String prototypes (indexOf, slice, split, trim, etc.)<br/>
+        - JSON parser & serializer (parse, stringify)<br/>
+        - Map and Set collections (get, set, has, delete, size)<br/>
+        - Promise/A+ microtask execution chain and RegExp
       </td>
       <td>
-        - Promise/A+ microtask execution chain<br/>
-        - Full ECMAScript Array / TypedArray methods<br/>
-        - Builtin JSON parser and serializer<br/>
-        - Map, Set, WeakMap, WeakSet<br/>
-        - ECMAScript RegExp engine
+        - TypedArray & DataView buffers<br/>
+        - WeakMap & WeakSet<br/>
+        - Intl internationalization API<br/>
+        - Full RegExp unicode property escapes
       </td>
     </tr>
     <tr>
@@ -167,7 +171,7 @@ AetherVM Core Development Progress: [██████████████�
       <td>
         - Native C++ embedder API<br/>
         - Microsecond-precision execution timers<br/>
-        - 32 architectural test verification suites
+        - 38 architectural test verification suites
       </td>
       <td>
         - CommonJS (require) & ES Modules (import/export)<br/>
@@ -401,7 +405,8 @@ All engine components are verified by seven comprehensive architectural test sui
     ├── test_milestone4_jit.cpp  # Tier 1 Baseline JIT tests
     ├── test_milestone5_son_jit.cpp # Tier 2 Sea-of-Nodes JIT tests
     ├── test_milestone6_runtime.cpp # ECMAScript Runtime & Intrinsics tests
-    └── test_milestone7_closures.cpp # Object Model, Closures, Classes & Exceptions tests
+    ├── test_milestone7_closures.cpp # Object Model, Closures, Classes & Exceptions tests
+    └── test_milestone8_intrinsics.cpp # Standard Library Intrinsics tests (Array, String, JSON, Map, Set, Promise)
 ```
 
 ---
@@ -439,6 +444,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone5_son_jit.exe
 .\build\Release\test_milestone6_runtime.exe
 .\build\Release\test_milestone7_closures.exe
+.\build\Release\test_milestone8_intrinsics.exe
 ```
 
 ---

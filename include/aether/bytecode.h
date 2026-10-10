@@ -59,6 +59,8 @@ enum class Opcode : uint8_t {
     // Object & Property Access (Inline Cache enabled)
     LdaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  acc = obj.name
     StaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  obj.name = acc
+    LdaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        acc = obj[key]
+    StaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        obj[key] = acc
 
     // Unary Operations
     LogicalNot,             // [Op]                    acc = !ToBoolean(acc)
@@ -69,6 +71,7 @@ enum class Opcode : uint8_t {
     Call,                   // [Op, callee: u8, args: u8, count: u8, slot: u16]
     CallMethod,             // [Op, callee: u8, this: u8, args: u8, count: u8, slot: u16]
     CreateObject,           // [Op]                    acc = new JSObject()
+    CreateArray,            // [Op, start_reg: u8, count: u16] acc = new JSArray(...)
     Construct,              // [Op, ctor: u8, args: u8, count: u8, slot: u16]
     LdaThis,                // [Op]                    acc = this
 

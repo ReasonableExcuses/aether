@@ -80,6 +80,7 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::OpenParen:
             return Precedence::Call;
         case TokenKind::Dot:
+        case TokenKind::OpenBracket:
             return Precedence::Member;
         default:
             return Precedence::None;
@@ -348,6 +349,19 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             Consume(TokenKind::CloseBrace, "Expected '}' after object literal");
             return std::make_unique<ObjectLiteralExpr>(std::move(props));
         }
+        case TokenKind::OpenBracket: {
+            // Array literal: [ elem1, elem2, ... ]
+            std::vector<std::unique_ptr<Expr>> elements;
+            if (!Check(TokenKind::CloseBracket)) {
+                elements.push_back(ParseExpression());
+                while (Match(TokenKind::Comma)) {
+                    if (Check(TokenKind::CloseBracket)) break;
+                    elements.push_back(ParseExpression());
+                }
+            }
+            Consume(TokenKind::CloseBracket, "Expected ']' after array elements");
+            return std::make_unique<ArrayLiteralExpr>(std::move(elements));
+        }
         case TokenKind::Exclamation:
             return std::make_unique<UnaryExpr>(UnaryOp::LogicalNot, ParseExpression(Precedence::Unary));
         case TokenKind::Minus:
@@ -415,12 +429,26 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
             auto obj = prop->ReleaseObject();
             return std::make_unique<PropertyAssignExpr>(std::move(obj), prop_name, std::move(rhs));
         }
+        if (auto* idx = dynamic_cast<IndexAccessExpr*>(lhs.get())) {
+            auto obj = idx->ReleaseObject();
+            auto index = idx->ReleaseIndex();
+            return std::make_unique<IndexAssignExpr>(std::move(obj), std::move(index), std::move(rhs));
+        }
         throw std::runtime_error("Invalid assignment target");
     }
 
     if (op_token.kind == TokenKind::Dot) {
-        Token prop_tok = Consume(TokenKind::Identifier, "Expected property identifier after '.'");
+        if (current_token_.text.empty() || (!std::isalpha(static_cast<unsigned char>(current_token_.text[0])) && current_token_.text[0] != '_' && current_token_.text[0] != '$')) {
+            throw std::runtime_error("Expected property identifier after '.'");
+        }
+        Token prop_tok = Advance();
         return std::make_unique<PropertyAccessExpr>(std::move(lhs), prop_tok.text);
+    }
+
+    if (op_token.kind == TokenKind::OpenBracket) {
+        auto index = ParseExpression();
+        Consume(TokenKind::CloseBracket, "Expected ']' after index");
+        return std::make_unique<IndexAccessExpr>(std::move(lhs), std::move(index));
     }
 
     if (op_token.kind == TokenKind::OpenParen) {
@@ -458,6 +486,8 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         case TokenKind::LessEqual:      op = BinaryOp::LessThanOrEqual; break;
         case TokenKind::Greater:        op = BinaryOp::GreaterThan; break;
         case TokenKind::GreaterEqual:   op = BinaryOp::GreaterThanOrEqual; break;
+        case TokenKind::AmpAmp:         op = BinaryOp::LogicalAnd; break;
+        case TokenKind::BarBar:         op = BinaryOp::LogicalOr; break;
         default:
             throw std::runtime_error("Unhandled binary operator");
     }

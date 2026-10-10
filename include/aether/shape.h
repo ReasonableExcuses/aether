@@ -74,6 +74,10 @@ public:
         return nullptr;
     }
 
+    const std::unordered_map<std::string, PropertyDescriptor>& GetPropertyMap() const noexcept {
+        return property_map_;
+    }
+
     Shape* FindOrCreateTransition(std::string_view key, uint32_t next_id, TaggedValue proto) {
         std::string k(key);
         auto it = transitions_.find(k);
