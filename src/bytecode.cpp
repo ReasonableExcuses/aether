@@ -1,0 +1,199 @@
+#include "aether/bytecode.h"
+#include <iomanip>
+#include <sstream>
+
+namespace aether {
+
+const char* OpcodeToString(Opcode op) {
+    switch (op) {
+        case Opcode::LdaConstant:        return "LdaConstant";
+        case Opcode::LdaZero:            return "LdaZero";
+        case Opcode::LdaSmi:             return "LdaSmi";
+        case Opcode::LdaUndefined:       return "LdaUndefined";
+        case Opcode::LdaNull:            return "LdaNull";
+        case Opcode::LdaTrue:            return "LdaTrue";
+        case Opcode::LdaFalse:           return "LdaFalse";
+        case Opcode::Ldar:               return "Ldar";
+        case Opcode::Star:               return "Star";
+        case Opcode::Mov:                return "Mov";
+        case Opcode::Add:                return "Add";
+        case Opcode::Sub:                return "Sub";
+        case Opcode::Mul:                return "Mul";
+        case Opcode::Div:                return "Div";
+        case Opcode::Mod:                return "Mod";
+        case Opcode::BitwiseAnd:         return "BitwiseAnd";
+        case Opcode::BitwiseOr:          return "BitwiseOr";
+        case Opcode::BitwiseXor:         return "BitwiseXor";
+        case Opcode::ShiftLeft:          return "ShiftLeft";
+        case Opcode::ShiftRight:         return "ShiftRight";
+        case Opcode::TestEqual:          return "TestEqual";
+        case Opcode::TestStrictEqual:    return "TestStrictEqual";
+        case Opcode::TestLessThan:       return "TestLessThan";
+        case Opcode::TestGreaterThan:    return "TestGreaterThan";
+        case Opcode::TestLessThanOrEqual: return "TestLessThanOrEqual";
+        case Opcode::TestGreaterThanOrEqual: return "TestGreaterThanOrEqual";
+        case Opcode::Jump:               return "Jump";
+        case Opcode::JumpIfTrue:         return "JumpIfTrue";
+        case Opcode::JumpIfFalse:        return "JumpIfFalse";
+        case Opcode::LdaNamed:           return "LdaNamed";
+        case Opcode::StaNamed:           return "StaNamed";
+        case Opcode::LogicalNot:         return "LogicalNot";
+        case Opcode::Negate:             return "Negate";
+        case Opcode::BitwiseNot:         return "BitwiseNot";
+        case Opcode::Call:               return "Call";
+        case Opcode::CreateObject:       return "CreateObject";
+        case Opcode::Return:             return "Return";
+        case Opcode::Halt:               return "Halt";
+        default:                         return "<UnknownOpcode>";
+    }
+}
+
+void BytecodeArray::EmitU16(uint16_t u16) {
+    bytes_.push_back(static_cast<uint8_t>(u16 & 0xFF));
+    bytes_.push_back(static_cast<uint8_t>((u16 >> 8) & 0xFF));
+}
+
+void BytecodeArray::EmitI32(int32_t i32) {
+    uint32_t u32 = static_cast<uint32_t>(i32);
+    bytes_.push_back(static_cast<uint8_t>(u32 & 0xFF));
+    bytes_.push_back(static_cast<uint8_t>((u32 >> 8) & 0xFF));
+    bytes_.push_back(static_cast<uint8_t>((u32 >> 16) & 0xFF));
+    bytes_.push_back(static_cast<uint8_t>((u32 >> 24) & 0xFF));
+}
+
+void BytecodeArray::PatchI32(size_t offset, int32_t val) {
+    assert(offset + 4 <= bytes_.size());
+    uint32_t u32 = static_cast<uint32_t>(val);
+    bytes_[offset]     = static_cast<uint8_t>(u32 & 0xFF);
+    bytes_[offset + 1] = static_cast<uint8_t>((u32 >> 8) & 0xFF);
+    bytes_[offset + 2] = static_cast<uint8_t>((u32 >> 16) & 0xFF);
+    bytes_[offset + 3] = static_cast<uint8_t>((u32 >> 24) & 0xFF);
+}
+
+uint16_t BytecodeArray::AddConstant(TaggedValue val) {
+    for (size_t i = 0; i < constants_.size(); ++i) {
+        if (constants_[i] == val) {
+            return static_cast<uint16_t>(i);
+        }
+    }
+    size_t idx = constants_.size();
+    assert(idx <= UINT16_MAX && "Constant pool overflow");
+    constants_.push_back(val);
+    return static_cast<uint16_t>(idx);
+}
+
+std::string BytecodeArray::Disassemble() const {
+    std::ostringstream ss;
+    ss << "=== BytecodeArray (Registers: " << register_count_ 
+       << ", Parameters: " << parameter_count_ << ", Size: " << bytes_.size() << " bytes) ===\n";
+
+    size_t pc = 0;
+    while (pc < bytes_.size()) {
+        size_t current_pc = pc;
+        Opcode op = static_cast<Opcode>(bytes_[pc++]);
+
+        ss << "  [0x" << std::hex << std::setw(4) << std::setfill('0') << current_pc << std::dec << "] "
+           << std::setfill(' ') << std::left << std::setw(18) << OpcodeToString(op) << " ";
+
+        switch (op) {
+            case Opcode::LdaConstant: {
+                uint16_t idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "const[" << idx << "] (" << constants_[idx].ToString() << ")";
+                break;
+            }
+            case Opcode::LdaSmi: {
+                int32_t imm = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
+                pc += 4;
+                ss << imm;
+                break;
+            }
+            case Opcode::Ldar:
+            case Opcode::Star: {
+                uint8_t reg = bytes_[pc++];
+                ss << "r" << static_cast<int>(reg);
+                break;
+            }
+            case Opcode::Mov: {
+                uint8_t src = bytes_[pc++];
+                uint8_t dst = bytes_[pc++];
+                ss << "r" << static_cast<int>(src) << " -> r" << static_cast<int>(dst);
+                break;
+            }
+            case Opcode::Add:
+            case Opcode::Sub:
+            case Opcode::Mul:
+            case Opcode::Div:
+            case Opcode::Mod:
+            case Opcode::BitwiseAnd:
+            case Opcode::BitwiseOr:
+            case Opcode::BitwiseXor:
+            case Opcode::ShiftLeft:
+            case Opcode::ShiftRight:
+            case Opcode::TestEqual:
+            case Opcode::TestStrictEqual:
+            case Opcode::TestLessThan:
+            case Opcode::TestGreaterThan:
+            case Opcode::TestLessThanOrEqual:
+            case Opcode::TestGreaterThanOrEqual: {
+                uint8_t reg = bytes_[pc++];
+                ss << "r" << static_cast<int>(reg);
+                if (op == Opcode::Add || op == Opcode::Sub || op == Opcode::Mul || op == Opcode::Div || op == Opcode::Mod) {
+                    uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                    pc += 2;
+                    ss << " [feedback_slot: " << slot << "]";
+                }
+                break;
+            }
+            case Opcode::Jump:
+            case Opcode::JumpIfTrue:
+            case Opcode::JumpIfFalse: {
+                int32_t offset = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
+                pc += 4;
+                ss << "offset: " << offset << " -> [0x" << std::hex << (pc + offset) << std::dec << "]";
+                break;
+            }
+            case Opcode::LdaNamed:
+            case Opcode::StaNamed: {
+                uint8_t obj = bytes_[pc++];
+                uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "r" << static_cast<int>(obj) << "." << constants_[name_idx].ToString() 
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::Call: {
+                uint8_t callee = bytes_[pc++];
+                uint8_t args = bytes_[pc++];
+                uint8_t count = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "callee: r" << static_cast<int>(callee)
+                   << ", args: r" << static_cast<int>(args) << ".." << static_cast<int>(args + count - 1)
+                   << " (count: " << static_cast<int>(count) << ")"
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::CreateObject:
+            case Opcode::LogicalNot:
+            case Opcode::Negate:
+            case Opcode::BitwiseNot:
+            case Opcode::LdaZero:
+            case Opcode::LdaUndefined:
+            case Opcode::LdaNull:
+            case Opcode::LdaTrue:
+            case Opcode::LdaFalse:
+            case Opcode::Return:
+            case Opcode::Halt:
+                break;
+            default:
+                break;
+        }
+        ss << "\n";
+    }
+    return ss.str();
+}
+
+} // namespace aether

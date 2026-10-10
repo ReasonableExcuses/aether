@@ -1,0 +1,51 @@
+cmake_minimum_required(VERSION 3.20)
+project(AetherVM LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(MSVC)
+    add_compile_options(/std:c++latest /W4 /permissive- /Zc:preprocessor)
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -fno-exceptions -fno-rtti)
+endif()
+
+include_directories(include)
+
+set(AETHER_SOURCES
+    src/value.cpp
+    src/heap_object.cpp
+    src/bytecode.cpp
+    src/interpreter.cpp
+    src/bytecode_emitter.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/gc.cpp
+    src/heap.cpp
+    src/assembler.cpp
+    src/baseline_jit.cpp
+    src/sea_of_nodes.cpp
+    src/optimizing_jit.cpp
+    src/runtime.cpp
+)
+
+add_library(aether_core STATIC ${AETHER_SOURCES})
+
+add_executable(test_milestone1 tests/test_milestone1.cpp)
+target_link_libraries(test_milestone1 PRIVATE aether_core)
+
+add_executable(test_milestone2 tests/test_milestone2.cpp)
+target_link_libraries(test_milestone2 PRIVATE aether_core)
+
+add_executable(test_milestone3 tests/test_milestone3.cpp)
+target_link_libraries(test_milestone3 PRIVATE aether_core)
+
+add_executable(test_milestone4_jit tests/test_milestone4_jit.cpp)
+target_link_libraries(test_milestone4_jit PRIVATE aether_core)
+
+add_executable(test_milestone5_son_jit tests/test_milestone5_son_jit.cpp)
+target_link_libraries(test_milestone5_son_jit PRIVATE aether_core)
+
+add_executable(test_milestone6_runtime tests/test_milestone6_runtime.cpp)
+target_link_libraries(test_milestone6_runtime PRIVATE aether_core)
