@@ -39,6 +39,14 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     }
 
     ExecutionFrame frame(bytecode, args, this_val, env);
+    struct EnvGuard {
+        Interpreter& interp;
+        ExecutionFrame& frame;
+        ~EnvGuard() {
+            interp.last_environment_ = frame.GetEnvironment();
+        }
+    } env_guard{*this, frame};
+
     const uint8_t* code_start = bytecode.Code().data();
     const uint8_t* pc = code_start;
     const uint8_t* code_end = code_start + bytecode.Code().size();
@@ -120,11 +128,10 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 } else if (acc_.IsNumber() && rhs.IsNumber()) {
                     acc_ = TaggedValue::FromDouble(acc_.AsNumber() + rhs.AsNumber());
                 } else {
-                    // String concatenation fallback
+                    // String concatenation
                     std::string s1 = acc_.ToString();
                     std::string s2 = rhs.ToString();
-                    // Heap string allocation in future GC milestone
-                    acc_ = TaggedValue::Undefined();
+                    acc_ = TaggedValue::FromHeapObject(new JSString(s1 + s2));
                 }
                 break;
             }

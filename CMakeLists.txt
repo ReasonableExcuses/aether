@@ -28,6 +28,7 @@ set(AETHER_SOURCES
     src/sea_of_nodes.cpp
     src/optimizing_jit.cpp
     src/runtime.cpp
+    src/event_loop.cpp
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
@@ -55,4 +56,8 @@ target_link_libraries(test_milestone7_closures PRIVATE aether_core)
 
 add_executable(test_milestone8_intrinsics tests/test_milestone8_intrinsics.cpp)
 target_link_libraries(test_milestone8_intrinsics PRIVATE aether_core)
+
+add_executable(test_milestone9_event_loop tests/test_milestone9_event_loop.cpp)
+target_link_libraries(test_milestone9_event_loop PRIVATE aether_core)
+
 

@@ -1,4 +1,5 @@
 #include "aether/runtime.h"
+#include "aether/event_loop.h"
 #include "aether/lexer.h"
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
@@ -911,6 +912,89 @@ static TaggedValue RegExp_test(TaggedValue this_val, const std::vector<TaggedVal
     return TaggedValue::FromBoolean(re->Test(str));
 }
 
+// Event Loop, Timer & Microtask Callbacks
+static TaggedValue Global_setTimeout(const std::vector<TaggedValue>& args) {
+    if (args.empty() || !EventLoop::Current()) return TaggedValue::FromSmi(0);
+    TaggedValue callback = args[0];
+    int64_t delay = 0;
+    if (args.size() > 1) {
+        delay = static_cast<int64_t>(args[1].AsNumber());
+    }
+    std::vector<TaggedValue> cb_args;
+    for (size_t i = 2; i < args.size(); ++i) {
+        cb_args.push_back(args[i]);
+    }
+    uint32_t id = EventLoop::Current()->SetTimeout(callback, delay, std::move(cb_args));
+    return TaggedValue::FromSmi(static_cast<int32_t>(id));
+}
+
+static TaggedValue Global_clearTimeout(const std::vector<TaggedValue>& args) {
+    if (!args.empty() && EventLoop::Current()) {
+        uint32_t id = static_cast<uint32_t>(args[0].AsNumber());
+        EventLoop::Current()->ClearTimeout(id);
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue Global_setInterval(const std::vector<TaggedValue>& args) {
+    if (args.empty() || !EventLoop::Current()) return TaggedValue::FromSmi(0);
+    TaggedValue callback = args[0];
+    int64_t interval = 1;
+    if (args.size() > 1) {
+        interval = static_cast<int64_t>(args[1].AsNumber());
+    }
+    std::vector<TaggedValue> cb_args;
+    for (size_t i = 2; i < args.size(); ++i) {
+        cb_args.push_back(args[i]);
+    }
+    uint32_t id = EventLoop::Current()->SetInterval(callback, interval, std::move(cb_args));
+    return TaggedValue::FromSmi(static_cast<int32_t>(id));
+}
+
+static TaggedValue Global_clearInterval(const std::vector<TaggedValue>& args) {
+    if (!args.empty() && EventLoop::Current()) {
+        uint32_t id = static_cast<uint32_t>(args[0].AsNumber());
+        EventLoop::Current()->ClearInterval(id);
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue Global_setImmediate(const std::vector<TaggedValue>& args) {
+    if (args.empty() || !EventLoop::Current()) return TaggedValue::FromSmi(0);
+    TaggedValue callback = args[0];
+    std::vector<TaggedValue> cb_args;
+    for (size_t i = 1; i < args.size(); ++i) {
+        cb_args.push_back(args[i]);
+    }
+    uint32_t id = EventLoop::Current()->SetImmediate(callback, std::move(cb_args));
+    return TaggedValue::FromSmi(static_cast<int32_t>(id));
+}
+
+static TaggedValue Global_clearImmediate(const std::vector<TaggedValue>& args) {
+    if (!args.empty() && EventLoop::Current()) {
+        uint32_t id = static_cast<uint32_t>(args[0].AsNumber());
+        EventLoop::Current()->ClearImmediate(id);
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue Global_queueMicrotask(const std::vector<TaggedValue>& args) {
+    if (!args.empty()) {
+        TaggedValue cb = args[0];
+        CurrentMicrotaskQueue().Enqueue([cb]() {
+            CallFunction(cb, TaggedValue::Undefined(), {});
+        });
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue Performance_now(const std::vector<TaggedValue>&) {
+    if (EventLoop::Current()) {
+        return TaggedValue::FromDouble(EventLoop::Current()->PerformanceNow());
+    }
+    return TaggedValue::FromDouble(0.0);
+}
+
 Realm::Realm(Heap& heap) {
     s_current_realm_ = this;
     root_shape_ = std::make_unique<Shape>(0, nullptr, "", TaggedValue::Null());
@@ -1033,6 +1117,20 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     global_object_->SetNamedProperty("Promise", TaggedValue::FromHeapObject(promise_ctor), next_shape_id_);
     global_object_->SetNamedProperty("RegExp", TaggedValue::FromHeapObject(regexp_ctor), next_shape_id_);
     global_object_->SetNamedProperty("globalThis", TaggedValue::FromHeapObject(global_object_), next_shape_id_);
+
+    // Event Loop, Timer & Microtask Intrinsics
+    global_object_->SetNamedProperty("setTimeout", TaggedValue::FromHeapObject(new JSNativeFunction("setTimeout", &Global_setTimeout)), next_shape_id_);
+    global_object_->SetNamedProperty("clearTimeout", TaggedValue::FromHeapObject(new JSNativeFunction("clearTimeout", &Global_clearTimeout)), next_shape_id_);
+    global_object_->SetNamedProperty("setInterval", TaggedValue::FromHeapObject(new JSNativeFunction("setInterval", &Global_setInterval)), next_shape_id_);
+    global_object_->SetNamedProperty("clearInterval", TaggedValue::FromHeapObject(new JSNativeFunction("clearInterval", &Global_clearInterval)), next_shape_id_);
+    global_object_->SetNamedProperty("setImmediate", TaggedValue::FromHeapObject(new JSNativeFunction("setImmediate", &Global_setImmediate)), next_shape_id_);
+    global_object_->SetNamedProperty("clearImmediate", TaggedValue::FromHeapObject(new JSNativeFunction("clearImmediate", &Global_clearImmediate)), next_shape_id_);
+    global_object_->SetNamedProperty("queueMicrotask", TaggedValue::FromHeapObject(new JSNativeFunction("queueMicrotask", &Global_queueMicrotask)), next_shape_id_);
+
+    // performance object
+    auto* perf_obj = new JSObject(root_shape_.get());
+    perf_obj->SetNamedProperty("now", TaggedValue::FromHeapObject(new JSNativeFunction("now", &Performance_now)), next_shape_id_);
+    global_object_->SetNamedProperty("performance", TaggedValue::FromHeapObject(perf_obj), next_shape_id_);
 }
 
 TaggedValue Realm::GetGlobalProperty(std::string_view name) {
@@ -1046,12 +1144,24 @@ void Realm::SetGlobalProperty(std::string_view name, TaggedValue value) {
 Agent::Agent() {
     heap_ = std::make_unique<Heap>();
     realm_ = std::make_unique<Realm>(*heap_);
+    event_loop_ = std::make_unique<EventLoop>();
 }
 
-TaggedValue Agent::EvaluateScript(std::string_view source) {
+Agent::~Agent() = default;
+
+void Agent::RunEventLoop() {
     s_current_microtasks_ = &microtasks_;
     Realm::SetCurrent(realm_.get());
     Interpreter::SetCurrent(&interpreter_);
+    EventLoop::SetCurrent(event_loop_.get());
+    event_loop_->Run(*this);
+}
+
+TaggedValue Agent::EvaluateScriptWithEventLoop(std::string_view source) {
+    s_current_microtasks_ = &microtasks_;
+    Realm::SetCurrent(realm_.get());
+    Interpreter::SetCurrent(&interpreter_);
+    EventLoop::SetCurrent(event_loop_.get());
 
     Lexer lexer(source);
     Parser parser(lexer);
@@ -1061,6 +1171,45 @@ TaggedValue Agent::EvaluateScript(std::string_view source) {
     auto bc = emitter.Emit(ast.get());
 
     TaggedValue result = interpreter_.Execute(*bc);
+    LexicalEnvironment* script_env = interpreter_.GetLastEnvironment();
+
+    // Initial microtask checkpoint
+    microtasks_.PerformMicrotaskCheckpoint();
+
+    // Run the event loop to completion
+    event_loop_->Run(*this);
+
+    // Final check for trailing context slot expression
+    if (ast && !ast->Statements().empty()) {
+        auto* last_stmt = ast->Statements().back().get();
+        if (auto* expr_stmt = dynamic_cast<ExprStmt*>(last_stmt)) {
+            if (auto* id_expr = dynamic_cast<IdentifierExpr*>(expr_stmt->GetExpr())) {
+                auto res = emitter.ResolveVariable(id_expr->Name());
+                if (res.kind == BytecodeEmitter::VarResolution::ContextSlot && script_env) {
+                    result = script_env->Get(res.depth, res.slot);
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+TaggedValue Agent::EvaluateScript(std::string_view source) {
+    s_current_microtasks_ = &microtasks_;
+    Realm::SetCurrent(realm_.get());
+    Interpreter::SetCurrent(&interpreter_);
+    EventLoop::SetCurrent(event_loop_.get());
+
+    Lexer lexer(source);
+    Parser parser(lexer);
+    auto ast = parser.ParseProgram();
+
+    BytecodeEmitter emitter;
+    auto bc = emitter.Emit(ast.get());
+
+    TaggedValue result = interpreter_.Execute(*bc);
+    LexicalEnvironment* script_env = interpreter_.GetLastEnvironment();
 
     // Drain microtasks at script execution checkpoint
     bool had_microtasks = !microtasks_.Empty();
@@ -1072,8 +1221,8 @@ TaggedValue Agent::EvaluateScript(std::string_view source) {
         if (auto* expr_stmt = dynamic_cast<ExprStmt*>(last_stmt)) {
             if (auto* id_expr = dynamic_cast<IdentifierExpr*>(expr_stmt->GetExpr())) {
                 auto res = emitter.ResolveVariable(id_expr->Name());
-                if (res.kind == BytecodeEmitter::VarResolution::ContextSlot && interpreter_.GetLastEnvironment()) {
-                    result = interpreter_.GetLastEnvironment()->Get(res.depth, res.slot);
+                if (res.kind == BytecodeEmitter::VarResolution::ContextSlot && script_env) {
+                    result = script_env->Get(res.depth, res.slot);
                 }
             }
         }

@@ -144,29 +144,48 @@ inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackT
       callback_(nullptr),
       method_callback_(std::move(method_callback)) {}
 
+class EventLoop;
+
+/**
+ * @brief Invokes a JavaScript or native function with the given receiver and argument list.
+ */
+TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
+
 /**
  * @brief ECMAScript Agent encapsulating Isolate execution context and JIT runtime.
  */
 class Agent {
 public:
     Agent();
-    ~Agent() = default;
+    ~Agent();
 
     /**
      * @brief Evaluates an ECMAScript script string end-to-end through the AetherVM engine.
      */
     TaggedValue EvaluateScript(std::string_view source);
 
+    /**
+     * @brief Evaluates a script and runs the event loop until all tasks, timers, and microtasks complete.
+     */
+    TaggedValue EvaluateScriptWithEventLoop(std::string_view source);
+
+    /**
+     * @brief Runs the asynchronous event loop until all pending timers, intervals, and microtasks drain.
+     */
+    void RunEventLoop();
+
     Realm& GetRealm() noexcept { return *realm_; }
     Heap& GetHeap() noexcept { return *heap_; }
     Interpreter& GetInterpreter() noexcept { return interpreter_; }
     MicrotaskQueue& GetMicrotasks() noexcept { return microtasks_; }
+    EventLoop& GetEventLoop() noexcept { return *event_loop_; }
 
 private:
     std::unique_ptr<Heap> heap_;
     std::unique_ptr<Realm> realm_;
     Interpreter interpreter_;
     MicrotaskQueue microtasks_;
+    std::unique_ptr<EventLoop> event_loop_;
 };
 
 } // namespace aether
