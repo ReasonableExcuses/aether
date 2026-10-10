@@ -113,6 +113,15 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
     if (Match(TokenKind::Return)) {
         return ParseReturn();
     }
+    if (Match(TokenKind::Throw)) {
+        return ParseThrow();
+    }
+    if (Match(TokenKind::Try)) {
+        return ParseTryCatch();
+    }
+    if (Match(TokenKind::Class)) {
+        return ParseClassDecl();
+    }
     if (Check(TokenKind::OpenBrace)) {
         return ParseBlock();
     }
@@ -213,6 +222,60 @@ std::unique_ptr<Stmt> Parser::ParseReturn() {
     return std::make_unique<ReturnStmt>(std::move(val));
 }
 
+std::unique_ptr<Stmt> Parser::ParseThrow() {
+    auto expr = ParseExpression();
+    Match(TokenKind::Semicolon);
+    return std::make_unique<ThrowStmt>(std::move(expr));
+}
+
+std::unique_ptr<Stmt> Parser::ParseTryCatch() {
+    auto try_block = ParseBlock();
+    std::string catch_param = "";
+    std::unique_ptr<Stmt> catch_block = nullptr;
+    if (Match(TokenKind::Catch)) {
+        if (Match(TokenKind::OpenParen)) {
+            Token param = Consume(TokenKind::Identifier, "Expected catch parameter identifier");
+            catch_param = param.text;
+            Consume(TokenKind::CloseParen, "Expected ')' after catch parameter");
+        }
+        catch_block = ParseBlock();
+    }
+    std::unique_ptr<Stmt> finally_block = nullptr;
+    if (Match(TokenKind::Finally)) {
+        finally_block = ParseBlock();
+    }
+    return std::make_unique<TryCatchStmt>(std::move(try_block), catch_param, std::move(catch_block), std::move(finally_block));
+}
+
+std::unique_ptr<Stmt> Parser::ParseClassDecl() {
+    Token name_tok = Consume(TokenKind::Identifier, "Expected class name");
+    std::string super_name = "";
+    if (Match(TokenKind::Extends)) {
+        Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
+        super_name = super_tok.text;
+    }
+    Consume(TokenKind::OpenBrace, "Expected '{' in class declaration");
+    std::vector<std::unique_ptr<FunctionDeclStmt>> methods;
+    while (!Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
+        Token method_name = Consume(TokenKind::Identifier, "Expected method name");
+        Consume(TokenKind::OpenParen, "Expected '(' after method name");
+        std::vector<std::string> params;
+        if (!Check(TokenKind::CloseParen)) {
+            Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+            params.push_back(p.text);
+            while (Match(TokenKind::Comma)) {
+                Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                params.push_back(np.text);
+            }
+        }
+        Consume(TokenKind::CloseParen, "Expected ')' after method parameters");
+        auto body = ParseBlock();
+        methods.push_back(std::make_unique<FunctionDeclStmt>(method_name.text, std::move(params), std::move(body)));
+    }
+    Consume(TokenKind::CloseBrace, "Expected '}' after class body");
+    return std::make_unique<ClassDeclStmt>(name_tok.text, super_name, std::move(methods));
+}
+
 std::unique_ptr<BlockStmt> Parser::ParseBlock() {
     Consume(TokenKind::OpenBrace, "Expected '{'");
     auto block = std::make_unique<BlockStmt>();
@@ -293,6 +356,46 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<UnaryExpr>(UnaryOp::Plus, ParseExpression(Precedence::Unary));
         case TokenKind::Tilde:
             return std::make_unique<UnaryExpr>(UnaryOp::BitwiseNot, ParseExpression(Precedence::Unary));
+        case TokenKind::This:
+            return std::make_unique<IdentifierExpr>("this");
+        case TokenKind::New: {
+            Token callee_tok = Consume(TokenKind::Identifier, "Expected constructor identifier after 'new'");
+            std::unique_ptr<Expr> callee = std::make_unique<IdentifierExpr>(callee_tok.text);
+            while (Match(TokenKind::Dot)) {
+                Token prop = Consume(TokenKind::Identifier, "Expected property identifier after '.'");
+                callee = std::make_unique<PropertyAccessExpr>(std::move(callee), prop.text);
+            }
+            std::vector<std::unique_ptr<Expr>> args;
+            if (Match(TokenKind::OpenParen)) {
+                if (!Check(TokenKind::CloseParen)) {
+                    args.push_back(ParseExpression());
+                    while (Match(TokenKind::Comma)) {
+                        args.push_back(ParseExpression());
+                    }
+                }
+                Consume(TokenKind::CloseParen, "Expected ')' after constructor argument list");
+            }
+            return std::make_unique<NewExpr>(std::move(callee), std::move(args));
+        }
+        case TokenKind::Function: {
+            std::string name = "";
+            if (Check(TokenKind::Identifier)) {
+                name = Advance().text;
+            }
+            Consume(TokenKind::OpenParen, "Expected '(' after 'function'");
+            std::vector<std::string> params;
+            if (!Check(TokenKind::CloseParen)) {
+                Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                params.push_back(p.text);
+                while (Match(TokenKind::Comma)) {
+                    Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                    params.push_back(np.text);
+                }
+            }
+            Consume(TokenKind::CloseParen, "Expected ')' after parameters");
+            auto body = ParseBlock();
+            return std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+        }
         default:
             throw std::runtime_error(std::string("SyntaxError: Unexpected token '") + tok.text + 
                                      "' at line " + std::to_string(tok.location.line) + 

@@ -52,6 +52,9 @@ private:
     std::unique_ptr<Stmt> ParseWhile();
     std::unique_ptr<Stmt> ParseFor();
     std::unique_ptr<Stmt> ParseReturn();
+    std::unique_ptr<Stmt> ParseThrow();
+    std::unique_ptr<Stmt> ParseTryCatch();
+    std::unique_ptr<Stmt> ParseClassDecl();
     std::unique_ptr<BlockStmt> ParseBlock();
     std::unique_ptr<Stmt> ParseExprStmt();
 

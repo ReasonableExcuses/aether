@@ -20,6 +20,8 @@ enum class HeapObjectType : uint16_t {
     JSFunction        = 0x06,
     FixedArray        = 0x07,
     JSNativeFunction  = 0x08,
+    LexicalEnvironment= 0x09,
+    JSError           = 0x0A,
 };
 
 /**
@@ -45,6 +47,8 @@ public:
     AETHER_ALWAYS_INLINE bool IsArray() const noexcept { return type_ == HeapObjectType::JSArray; }
     AETHER_ALWAYS_INLINE bool IsFunction() const noexcept { return type_ == HeapObjectType::JSFunction || type_ == HeapObjectType::JSNativeFunction; }
     AETHER_ALWAYS_INLINE bool IsNativeFunction() const noexcept { return type_ == HeapObjectType::JSNativeFunction; }
+    AETHER_ALWAYS_INLINE bool IsEnvironment() const noexcept { return type_ == HeapObjectType::LexicalEnvironment; }
+    AETHER_ALWAYS_INLINE bool IsError() const noexcept { return type_ == HeapObjectType::JSError; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;
@@ -167,6 +171,9 @@ public:
     TaggedValue GetNamedProperty(std::string_view key) const;
     void SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id);
 
+    JSObject* GetPrototype() const noexcept { return prototype_; }
+    void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
+
     size_t ObjectSize() const override { return sizeof(JSObject); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
@@ -182,30 +189,129 @@ public:
     }
 
 private:
+    JSObject* prototype_{nullptr};
     TaggedValue in_object_slots_[Shape::kDefaultInObjectProperties];
     std::vector<TaggedValue> out_of_line_slots_;
 };
 
 /**
- * @brief Managed JavaScript Function object holding compiled bytecode.
+ * @brief Heap-allocated Lexical Scope Environment for closures and captured variables.
+ */
+class LexicalEnvironment : public HeapObject {
+public:
+    LexicalEnvironment(LexicalEnvironment* outer, size_t slot_count)
+        : HeapObject(HeapObjectType::LexicalEnvironment, nullptr),
+          outer_(outer),
+          slots_(slot_count, TaggedValue::Undefined()) {}
+
+    LexicalEnvironment* Outer() const noexcept { return outer_; }
+    size_t SlotCount() const noexcept { return slots_.size(); }
+
+    TaggedValue GetSlot(size_t index) const {
+        assert(index < slots_.size());
+        return slots_[index];
+    }
+
+    void SetSlot(size_t index, TaggedValue val) {
+        assert(index < slots_.size());
+        slots_[index] = val;
+    }
+
+    TaggedValue Get(uint8_t depth, uint16_t index) const {
+        const LexicalEnvironment* curr = this;
+        for (uint8_t d = 0; d < depth && curr; ++d) {
+            curr = curr->outer_;
+        }
+        if (curr && index < curr->slots_.size()) return curr->slots_[index];
+        return TaggedValue::Undefined();
+    }
+
+    void Set(uint8_t depth, uint16_t index, TaggedValue val) {
+        LexicalEnvironment* curr = this;
+        for (uint8_t d = 0; d < depth && curr; ++d) {
+            curr = curr->outer_;
+        }
+        if (curr && index < curr->slots_.size()) curr->slots_[index] = val;
+    }
+
+    size_t ObjectSize() const override { return sizeof(LexicalEnvironment) + slots_.size() * sizeof(TaggedValue); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        for (auto& s : slots_) {
+            if (!s.IsEmpty()) visitor(s);
+        }
+    }
+
+private:
+    LexicalEnvironment* outer_{nullptr};
+    std::vector<TaggedValue> slots_;
+};
+
+/**
+ * @brief Managed JavaScript Function object holding compiled bytecode and lexical closure scope.
  */
 class JSFunction : public HeapObject {
 public:
-    JSFunction(std::string_view name, const BytecodeArray* bytecode, Shape* shape = nullptr)
+    JSFunction(std::string_view name, std::shared_ptr<const BytecodeArray> bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr)
         : HeapObject(HeapObjectType::JSFunction, shape),
           name_(name),
-          bytecode_(bytecode) {}
+          bytecode_shared_(std::move(bytecode)),
+          bytecode_(bytecode_shared_.get()),
+          environment_(env) {}
+
+    JSFunction(std::string_view name, const BytecodeArray* bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr)
+        : HeapObject(HeapObjectType::JSFunction, shape),
+          name_(name),
+          bytecode_(bytecode),
+          environment_(env) {}
 
     const std::string& Name() const noexcept { return name_; }
     const BytecodeArray* GetBytecode() const noexcept { return bytecode_; }
-    void SetBytecode(const BytecodeArray* bytecode) noexcept { bytecode_ = bytecode; }
+    void SetBytecode(const BytecodeArray* bytecode) noexcept { 
+        bytecode_ = bytecode; 
+        bytecode_shared_.reset();
+    }
+    void SetBytecode(std::shared_ptr<const BytecodeArray> bytecode) noexcept {
+        bytecode_shared_ = std::move(bytecode);
+        bytecode_ = bytecode_shared_.get();
+    }
+    std::shared_ptr<const BytecodeArray> GetSharedBytecode() const noexcept { return bytecode_shared_; }
+
+    LexicalEnvironment* GetEnvironment() const noexcept { return environment_; }
+    void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
+
+    JSObject* GetPrototype() const noexcept { return prototype_; }
+    void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
 
 private:
     std::string name_;
+    std::shared_ptr<const BytecodeArray> bytecode_shared_{nullptr};
     const BytecodeArray* bytecode_{nullptr};
+    LexicalEnvironment* environment_{nullptr};
+    JSObject* prototype_{nullptr};
+};
+
+/**
+ * @brief Standard ECMAScript Error Object.
+ */
+class JSError : public HeapObject {
+public:
+    JSError(std::string_view name, std::string_view message, Shape* shape = nullptr)
+        : HeapObject(HeapObjectType::JSError, shape),
+          name_(name),
+          message_(message) {}
+
+    const std::string& Name() const noexcept { return name_; }
+    const std::string& Message() const noexcept { return message_; }
+
+    size_t ObjectSize() const override { return sizeof(JSError); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+
+private:
+    std::string name_;
+    std::string message_;
 };
 
 } // namespace aether

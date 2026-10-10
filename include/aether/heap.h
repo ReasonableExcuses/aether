@@ -160,6 +160,7 @@ private:
 
     size_t minor_gc_count_{0};
     size_t major_gc_count_{0};
+    uintptr_t to_space_bump_{0};
 };
 
 inline HandleScope::HandleScope(IsolateHeap& heap)

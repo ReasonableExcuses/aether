@@ -172,6 +172,20 @@ private:
     std::vector<std::pair<std::string, std::unique_ptr<Expr>>> properties_;
 };
 
+class NewExpr : public Expr {
+public:
+    NewExpr(std::unique_ptr<Expr> callee, std::vector<std::unique_ptr<Expr>> args)
+        : callee_(std::move(callee)), args_(std::move(args)) {}
+
+    Expr* Callee() const noexcept { return callee_.get(); }
+    const std::vector<std::unique_ptr<Expr>>& Args() const noexcept { return args_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> callee_;
+    std::vector<std::unique_ptr<Expr>> args_;
+};
+
 // Statements
 class Stmt : public ASTNode {};
 
@@ -276,6 +290,22 @@ private:
     std::unique_ptr<BlockStmt> body_;
 };
 
+class FunctionExpr : public Expr {
+public:
+    FunctionExpr(std::string_view name, std::vector<std::string> params, std::unique_ptr<BlockStmt> body)
+        : name_(name), params_(std::move(params)), body_(std::move(body)) {}
+
+    const std::string& Name() const noexcept { return name_; }
+    const std::vector<std::string>& Params() const noexcept { return params_; }
+    BlockStmt* Body() const noexcept { return body_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string name_;
+    std::vector<std::string> params_;
+    std::unique_ptr<BlockStmt> body_;
+};
+
 class ReturnStmt : public Stmt {
 public:
     explicit ReturnStmt(std::unique_ptr<Expr> value) : value_(std::move(value)) {}
@@ -284,6 +314,50 @@ public:
 
 private:
     std::unique_ptr<Expr> value_;
+};
+
+class ThrowStmt : public Stmt {
+public:
+    explicit ThrowStmt(std::unique_ptr<Expr> expr) : expr_(std::move(expr)) {}
+    Expr* GetExpr() const noexcept { return expr_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> expr_;
+};
+
+class TryCatchStmt : public Stmt {
+public:
+    TryCatchStmt(std::unique_ptr<Stmt> try_block, std::string_view catch_param, std::unique_ptr<Stmt> catch_block, std::unique_ptr<Stmt> finally_block = nullptr)
+        : try_block_(std::move(try_block)), catch_param_(catch_param), catch_block_(std::move(catch_block)), finally_block_(std::move(finally_block)) {}
+
+    Stmt* TryBlock() const noexcept { return try_block_.get(); }
+    const std::string& CatchParam() const noexcept { return catch_param_; }
+    Stmt* CatchBlock() const noexcept { return catch_block_.get(); }
+    Stmt* FinallyBlock() const noexcept { return finally_block_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Stmt> try_block_;
+    std::string catch_param_;
+    std::unique_ptr<Stmt> catch_block_;
+    std::unique_ptr<Stmt> finally_block_;
+};
+
+class ClassDeclStmt : public Stmt {
+public:
+    ClassDeclStmt(std::string_view name, std::string_view super_name, std::vector<std::unique_ptr<FunctionDeclStmt>> methods)
+        : name_(name), super_name_(super_name), methods_(std::move(methods)) {}
+
+    const std::string& Name() const noexcept { return name_; }
+    const std::string& SuperName() const noexcept { return super_name_; }
+    const std::vector<std::unique_ptr<FunctionDeclStmt>>& Methods() const noexcept { return methods_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string name_;
+    std::string super_name_;
+    std::vector<std::unique_ptr<FunctionDeclStmt>> methods_;
 };
 
 class Program : public ASTNode {
@@ -311,6 +385,8 @@ public:
     virtual void VisitPropertyAccess(PropertyAccessExpr* node) = 0;
     virtual void VisitPropertyAssign(PropertyAssignExpr* node) = 0;
     virtual void VisitCall(CallExpr* node) = 0;
+    virtual void VisitNew(NewExpr* node) = 0;
+    virtual void VisitFunctionExpr(FunctionExpr* node) = 0;
     virtual void VisitObjectLiteral(ObjectLiteralExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
@@ -320,6 +396,9 @@ public:
     virtual void VisitWhile(WhileStmt* node) = 0;
     virtual void VisitFor(ForStmt* node) = 0;
     virtual void VisitFunctionDecl(FunctionDeclStmt* node) = 0;
+    virtual void VisitClassDecl(ClassDeclStmt* node) = 0;
+    virtual void VisitThrow(ThrowStmt* node) = 0;
+    virtual void VisitTryCatch(TryCatchStmt* node) = 0;
     virtual void VisitReturn(ReturnStmt* node) = 0;
     virtual void VisitProgram(Program* node) = 0;
 };
@@ -332,6 +411,8 @@ inline void AssignExpr::Accept(ASTVisitor* v) { v->VisitAssign(this); }
 inline void PropertyAccessExpr::Accept(ASTVisitor* v) { v->VisitPropertyAccess(this); }
 inline void PropertyAssignExpr::Accept(ASTVisitor* v) { v->VisitPropertyAssign(this); }
 inline void CallExpr::Accept(ASTVisitor* v) { v->VisitCall(this); }
+inline void NewExpr::Accept(ASTVisitor* v) { v->VisitNew(this); }
+inline void FunctionExpr::Accept(ASTVisitor* v) { v->VisitFunctionExpr(this); }
 inline void ObjectLiteralExpr::Accept(ASTVisitor* v) { v->VisitObjectLiteral(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
@@ -340,6 +421,9 @@ inline void IfStmt::Accept(ASTVisitor* v) { v->VisitIf(this); }
 inline void WhileStmt::Accept(ASTVisitor* v) { v->VisitWhile(this); }
 inline void ForStmt::Accept(ASTVisitor* v) { v->VisitFor(this); }
 inline void FunctionDeclStmt::Accept(ASTVisitor* v) { v->VisitFunctionDecl(this); }
+inline void ClassDeclStmt::Accept(ASTVisitor* v) { v->VisitClassDecl(this); }
+inline void ThrowStmt::Accept(ASTVisitor* v) { v->VisitThrow(this); }
+inline void TryCatchStmt::Accept(ASTVisitor* v) { v->VisitTryCatch(this); }
 inline void ReturnStmt::Accept(ASTVisitor* v) { v->VisitReturn(this); }
 inline void Program::Accept(ASTVisitor* v) { v->VisitProgram(this); }
 

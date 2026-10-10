@@ -32,6 +32,14 @@ enum class TokenKind {
     For,
     Break,
     Continue,
+    New,
+    Try,
+    Catch,
+    Finally,
+    Throw,
+    Class,
+    Extends,
+    This,
 
     // Operators & Punctuators
     OpenParen,          // (

@@ -7,7 +7,7 @@ A clean-slate, high-throughput, low-latency ECMAScript virtual machine and multi
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Pointer%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-28%2F28%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-32%2F32%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -277,7 +277,8 @@ All engine components are verified by six comprehensive architectural test suite
     ├── test_milestone3.cpp      # Garbage collector and allocator tests
     ├── test_milestone4_jit.cpp  # Tier 1 Baseline JIT tests
     ├── test_milestone5_son_jit.cpp # Tier 2 Sea-of-Nodes JIT tests
-    └── test_milestone6_runtime.cpp # ECMAScript Runtime & Intrinsics tests
+    ├── test_milestone6_runtime.cpp # ECMAScript Runtime & Intrinsics tests
+    └── test_milestone7_closures.cpp # Object Model, Closures, Classes & Exceptions tests
 ```
 
 ---
@@ -314,6 +315,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone4_jit.exe
 .\build\Release\test_milestone5_son_jit.exe
 .\build\Release\test_milestone6_runtime.exe
+.\build\Release\test_milestone7_closures.exe
 ```
 
 ---

@@ -67,7 +67,21 @@ enum class Opcode : uint8_t {
 
     // Function Calls & Object Instantiation
     Call,                   // [Op, callee: u8, args: u8, count: u8, slot: u16]
+    CallMethod,             // [Op, callee: u8, this: u8, args: u8, count: u8, slot: u16]
     CreateObject,           // [Op]                    acc = new JSObject()
+    Construct,              // [Op, ctor: u8, args: u8, count: u8, slot: u16]
+    LdaThis,                // [Op]                    acc = this
+
+    // Closures & Lexical Scopes
+    CreateClosure,          // [Op, const_idx: u16]    acc = new JSFunction(const[idx], env)
+    CreateFunctionContext,  // [Op, slot_count: u16]   env = new LexicalEnvironment(env, slot_count)
+    LdaContextSlot,         // [Op, depth: u8, slot: u16] acc = env.Get(depth, slot)
+    StaContextSlot,         // [Op, depth: u8, slot: u16] env.Set(depth, slot, acc)
+
+    // Exception Handling
+    PushExceptionHandler,   // [Op, offset: i32]       push catch handler
+    PopExceptionHandler,    // [Op]                    pop catch handler
+    Throw,                  // [Op]                    throw acc
 
     // Execution & Control
     Return,             // [Op]                        return acc
@@ -76,6 +90,75 @@ enum class Opcode : uint8_t {
 };
 
 const char* OpcodeToString(Opcode op);
+
+class Shape;
+
+/**
+ * @brief Feedback slot record for Inline Caching (IC) and Type Profiling.
+ */
+struct FeedbackSlot {
+    enum class State : uint8_t {
+        Uninitialized = 0,
+        Monomorphic   = 1,
+        Polymorphic   = 2,
+        Megamorphic   = 3
+    };
+
+    enum class ObservedType : uint8_t {
+        None   = 0,
+        Smi    = 1 << 0,
+        Number = 1 << 1,
+        String = 1 << 2,
+        Object = 1 << 3,
+        Any    = 0xFF
+    };
+
+    State state{State::Uninitialized};
+    uint8_t observed_type{static_cast<uint8_t>(ObservedType::None)};
+    Shape* cached_shape{nullptr};
+    uint32_t cached_slot{0};
+    bool cached_in_object{true};
+
+    void RecordType(const TaggedValue& val) {
+        if (val.IsSmi()) {
+            observed_type |= static_cast<uint8_t>(ObservedType::Smi);
+        } else if (val.IsDouble()) {
+            observed_type |= static_cast<uint8_t>(ObservedType::Number);
+        } else if (val.IsHeapObject()) {
+            observed_type |= static_cast<uint8_t>(ObservedType::Object);
+        }
+    }
+
+    bool IsMonomorphicSmi() const noexcept {
+        return observed_type == static_cast<uint8_t>(ObservedType::Smi);
+    }
+};
+
+/**
+ * @brief Vector of Type and Shape feedback slots for Tier 0 profiling and ICs.
+ */
+class TypeFeedbackVector {
+public:
+    explicit TypeFeedbackVector(size_t slot_count = 64)
+        : slots_(slot_count) {}
+
+    FeedbackSlot& GetSlot(size_t idx) {
+        if (idx >= slots_.size()) {
+            slots_.resize(idx + 1);
+        }
+        return slots_[idx];
+    }
+
+    const FeedbackSlot& GetSlot(size_t idx) const {
+        assert(idx < slots_.size());
+        return slots_[idx];
+    }
+
+    size_t Size() const noexcept { return slots_.size(); }
+
+private:
+    std::vector<FeedbackSlot> slots_;
+};
 
 /**
  * @brief Represents a compiled bytecode routine along with constant pool and metadata.
@@ -120,6 +203,8 @@ public:
     const ExecutableMemory* GetTier2Code() const noexcept { return tier2_code_.get(); }
     void SetTier2Code(std::shared_ptr<ExecutableMemory> code) const noexcept { tier2_code_ = std::move(code); }
 
+    TypeFeedbackVector& GetFeedbackVector() const noexcept { return feedback_; }
+
 private:
     std::vector<uint8_t> bytes_;
     std::vector<TaggedValue> constants_;
@@ -128,6 +213,7 @@ private:
     mutable uint32_t invocation_count_{0};
     mutable std::shared_ptr<ExecutableMemory> tier1_code_{nullptr};
     mutable std::shared_ptr<ExecutableMemory> tier2_code_{nullptr};
+    mutable TypeFeedbackVector feedback_;
 };
 
 } // namespace aether

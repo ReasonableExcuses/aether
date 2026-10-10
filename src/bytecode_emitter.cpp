@@ -2,9 +2,159 @@
 
 namespace aether {
 
+class CaptureScanner : public ASTVisitor {
+public:
+    std::unordered_set<std::string> identifiers_in_nested_functions;
+    bool inside_nested_function{false};
+
+    void VisitLiteral(LiteralExpr*) override {}
+    void VisitIdentifier(IdentifierExpr* node) override {
+        if (inside_nested_function) {
+            identifiers_in_nested_functions.insert(node->Name());
+        }
+    }
+    void VisitUnary(UnaryExpr* node) override { node->GetExpr()->Accept(this); }
+    void VisitBinary(BinaryExpr* node) override {
+        node->Lhs()->Accept(this);
+        node->Rhs()->Accept(this);
+    }
+    void VisitAssign(AssignExpr* node) override {
+        if (inside_nested_function) {
+            identifiers_in_nested_functions.insert(node->Target());
+        }
+        node->Value()->Accept(this);
+    }
+    void VisitPropertyAccess(PropertyAccessExpr* node) override { node->Object()->Accept(this); }
+    void VisitPropertyAssign(PropertyAssignExpr* node) override {
+        node->Object()->Accept(this);
+        node->Value()->Accept(this);
+    }
+    void VisitCall(CallExpr* node) override {
+        node->Callee()->Accept(this);
+        for (const auto& a : node->Args()) a->Accept(this);
+    }
+    void VisitNew(NewExpr* node) override {
+        node->Callee()->Accept(this);
+        for (const auto& a : node->Args()) a->Accept(this);
+    }
+    void VisitFunctionExpr(FunctionExpr* node) override {
+        bool prev = inside_nested_function;
+        inside_nested_function = true;
+        node->Body()->Accept(this);
+        inside_nested_function = prev;
+    }
+    void VisitObjectLiteral(ObjectLiteralExpr* node) override {
+        for (const auto& p : node->Properties()) p.second->Accept(this);
+    }
+    void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
+    void VisitVarDecl(VarDeclStmt* node) override {
+        if (node->Initializer()) node->Initializer()->Accept(this);
+    }
+    void VisitBlock(BlockStmt* node) override {
+        for (const auto& s : node->Statements()) s->Accept(this);
+    }
+    void VisitIf(IfStmt* node) override {
+        node->Condition()->Accept(this);
+        node->ThenBranch()->Accept(this);
+        if (node->ElseBranch()) node->ElseBranch()->Accept(this);
+    }
+    void VisitWhile(WhileStmt* node) override {
+        node->Condition()->Accept(this);
+        node->Body()->Accept(this);
+    }
+    void VisitFor(ForStmt* node) override {
+        if (node->Init()) node->Init()->Accept(this);
+        if (node->Cond()) node->Cond()->Accept(this);
+        if (node->Update()) node->Update()->Accept(this);
+        node->Body()->Accept(this);
+    }
+    void VisitFunctionDecl(FunctionDeclStmt* node) override {
+        bool prev = inside_nested_function;
+        inside_nested_function = true;
+        node->Body()->Accept(this);
+        inside_nested_function = prev;
+    }
+    void VisitClassDecl(ClassDeclStmt* node) override {
+        for (const auto& m : node->Methods()) {
+            m->Accept(this);
+        }
+    }
+    void VisitThrow(ThrowStmt* node) override { node->GetExpr()->Accept(this); }
+    void VisitTryCatch(TryCatchStmt* node) override {
+        node->TryBlock()->Accept(this);
+        if (node->CatchBlock()) node->CatchBlock()->Accept(this);
+        if (node->FinallyBlock()) node->FinallyBlock()->Accept(this);
+    }
+    void VisitReturn(ReturnStmt* node) override {
+        if (node->Value()) node->Value()->Accept(this);
+    }
+    void VisitProgram(Program* node) override {
+        for (const auto& s : node->Statements()) s->Accept(this);
+    }
+};
+
+void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body) {
+    context_slots_.clear();
+    if (!body) return;
+    CaptureScanner scanner;
+    body->Accept(&scanner);
+
+    for (const auto& p : params) {
+        if (scanner.identifiers_in_nested_functions.count(p)) {
+            if (!context_slots_.count(p)) {
+                uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                context_slots_[p] = slot;
+            }
+        }
+    }
+
+    if (auto* block = dynamic_cast<BlockStmt*>(body)) {
+        for (const auto& stmt : block->Statements()) {
+            if (auto* v = dynamic_cast<VarDeclStmt*>(stmt.get())) {
+                if (scanner.identifiers_in_nested_functions.count(v->Name())) {
+                    if (!context_slots_.count(v->Name())) {
+                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                        context_slots_[v->Name()] = slot;
+                    }
+                }
+            }
+        }
+    }
+}
+
+BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view name) {
+    if (name == "this") {
+        return VarResolution{VarResolution::ThisVar, 0, 0, 0, nullptr};
+    }
+    auto cs_it = context_slots_.find(std::string(name));
+    if (cs_it != context_slots_.end()) {
+        return VarResolution{VarResolution::ContextSlot, 0, 0, cs_it->second, nullptr};
+    }
+    auto reg_it = scope_.find(std::string(name));
+    if (reg_it != scope_.end()) {
+        return VarResolution{VarResolution::LocalReg, reg_it->second, 0, 0, nullptr};
+    }
+    uint8_t depth = 1;
+    BytecodeEmitter* parent = parent_emitter_;
+    while (parent != nullptr) {
+        auto p_cs = parent->context_slots_.find(std::string(name));
+        if (p_cs != parent->context_slots_.end()) {
+            return VarResolution{VarResolution::ContextSlot, 0, depth, p_cs->second, nullptr};
+        }
+        depth++;
+        parent = parent->parent_emitter_;
+    }
+    JSFunction* fn = LookupFunction(name);
+    if (fn != nullptr) {
+        return VarResolution{VarResolution::GlobalOrFunction, 0, 0, 0, fn};
+    }
+    return VarResolution{VarResolution::NotFound, 0, 0, 0, nullptr};
+}
+
 std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
     bytecode_ = std::make_unique<BytecodeArray>();
     scope_.clear();
+    context_slots_.clear();
     register_in_use_.clear();
     max_registers_ = 0;
     next_feedback_slot_ = 0;
@@ -25,6 +175,7 @@ std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
 std::unique_ptr<BytecodeArray> BytecodeEmitter::EmitFunction(FunctionDeclStmt* func) {
     bytecode_ = std::make_unique<BytecodeArray>();
     scope_.clear();
+    context_slots_.clear();
     register_in_use_.clear();
     max_registers_ = 0;
     next_feedback_slot_ = 0;
@@ -32,10 +183,29 @@ std::unique_ptr<BytecodeArray> BytecodeEmitter::EmitFunction(FunctionDeclStmt* f
     uint32_t param_count = static_cast<uint32_t>(func->Params().size());
     bytecode_->SetParameterCount(param_count);
 
+    ScanAndSetupContextSlots(func->Params(), func->Body());
+
     // Bind parameters to registers r0..r(param_count-1)
     for (uint32_t i = 0; i < param_count; ++i) {
         uint8_t reg = AllocateRegister();
         scope_[func->Params()[i]] = reg;
+    }
+
+    if (!context_slots_.empty()) {
+        bytecode_->EmitOpcode(Opcode::CreateFunctionContext);
+        bytecode_->EmitU16(static_cast<uint16_t>(context_slots_.size()));
+
+        for (uint32_t i = 0; i < param_count; ++i) {
+            const auto& pname = func->Params()[i];
+            auto cs_it = context_slots_.find(pname);
+            if (cs_it != context_slots_.end()) {
+                bytecode_->EmitOpcode(Opcode::Ldar);
+                bytecode_->EmitU8(scope_[pname]);
+                bytecode_->EmitOpcode(Opcode::StaContextSlot);
+                bytecode_->EmitU8(0);
+                bytecode_->EmitU16(cs_it->second);
+            }
+        }
     }
 
     func->Body()->Accept(this);
@@ -160,16 +330,24 @@ JSFunction* BytecodeEmitter::LookupFunction(std::string_view name) {
 }
 
 void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
-    auto it = scope_.find(node->Name());
-    if (it != scope_.end()) {
-        bytecode_->EmitOpcode(Opcode::Ldar);
-        bytecode_->EmitU8(it->second);
+    auto res = ResolveVariable(node->Name());
+    if (res.kind == VarResolution::ThisVar) {
+        bytecode_->EmitOpcode(Opcode::LdaThis);
         return;
     }
-
-    JSFunction* fn = LookupFunction(node->Name());
-    if (fn != nullptr) {
-        uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(fn));
+    if (res.kind == VarResolution::LocalReg) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res.reg);
+        return;
+    }
+    if (res.kind == VarResolution::ContextSlot) {
+        bytecode_->EmitOpcode(Opcode::LdaContextSlot);
+        bytecode_->EmitU8(res.depth);
+        bytecode_->EmitU16(res.slot);
+        return;
+    }
+    if (res.kind == VarResolution::GlobalOrFunction) {
+        uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.fn));
         bytecode_->EmitOpcode(Opcode::LdaConstant);
         bytecode_->EmitU16(const_idx);
         return;
@@ -198,10 +376,19 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
 
 void BytecodeEmitter::VisitAssign(AssignExpr* node) {
     node->Value()->Accept(this);
-    auto it = scope_.find(node->Target());
-    assert(it != scope_.end() && "Assignment to undeclared variable");
-    bytecode_->EmitOpcode(Opcode::Star);
-    bytecode_->EmitU8(it->second);
+    auto res = ResolveVariable(node->Target());
+    if (res.kind == VarResolution::LocalReg) {
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(res.reg);
+        return;
+    }
+    if (res.kind == VarResolution::ContextSlot) {
+        bytecode_->EmitOpcode(Opcode::StaContextSlot);
+        bytecode_->EmitU8(res.depth);
+        bytecode_->EmitU16(res.slot);
+        return;
+    }
+    assert(false && "Assignment to undeclared variable");
 }
 
 void BytecodeEmitter::VisitPropertyAccess(PropertyAccessExpr* node) {
@@ -246,6 +433,50 @@ void BytecodeEmitter::VisitPropertyAssign(PropertyAssignExpr* node) {
 }
 
 void BytecodeEmitter::VisitCall(CallExpr* node) {
+    if (auto* prop = dynamic_cast<PropertyAccessExpr*>(node->Callee())) {
+        // 1. Evaluate receiver object
+        prop->Object()->Accept(this);
+        uint8_t this_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(this_reg);
+
+        // 2. Load property from this_reg into callee_reg
+        auto* s = new JSString(prop->Property());
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaNamed);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+
+        uint8_t callee_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(callee_reg);
+
+        // 3. Evaluate arguments into contiguous registers
+        uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+        uint8_t args_start = AllocateRegisterRange(arg_count);
+        for (uint8_t i = 0; i < arg_count; ++i) {
+            node->Args()[i]->Accept(this);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+        }
+
+        // 4. Emit CallMethod
+        uint16_t call_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::CallMethod);
+        bytecode_->EmitU8(callee_reg);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU8(args_start);
+        bytecode_->EmitU8(arg_count);
+        bytecode_->EmitU16(call_slot);
+
+        FreeRegisterRange(args_start, arg_count);
+        FreeRegister(callee_reg);
+        FreeRegister(this_reg);
+        return;
+    }
+
     // 1. Evaluate callee
     node->Callee()->Accept(this);
     uint8_t callee_reg = AllocateRegister();
@@ -407,17 +638,29 @@ void BytecodeEmitter::VisitExprStmt(ExprStmt* node) {
 }
 
 void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
-    uint8_t reg = AllocateRegister();
-    scope_[node->Name()] = reg;
-
-    if (node->Initializer()) {
-        node->Initializer()->Accept(this);
+    auto cs_it = context_slots_.find(node->Name());
+    if (cs_it != context_slots_.end()) {
+        if (node->Initializer()) {
+            node->Initializer()->Accept(this);
+        } else {
+            bytecode_->EmitOpcode(Opcode::LdaUndefined);
+        }
+        bytecode_->EmitOpcode(Opcode::StaContextSlot);
+        bytecode_->EmitU8(0);
+        bytecode_->EmitU16(cs_it->second);
     } else {
-        bytecode_->EmitOpcode(Opcode::LdaUndefined);
-    }
+        uint8_t reg = AllocateRegister();
+        scope_[node->Name()] = reg;
 
-    bytecode_->EmitOpcode(Opcode::Star);
-    bytecode_->EmitU8(reg);
+        if (node->Initializer()) {
+            node->Initializer()->Accept(this);
+        } else {
+            bytecode_->EmitOpcode(Opcode::LdaUndefined);
+        }
+
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(reg);
+    }
 }
 
 void BytecodeEmitter::VisitBlock(BlockStmt* node) {
@@ -493,12 +736,166 @@ void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
     auto fn_bc = sub_emitter.EmitFunction(node);
 
     // 3. Attach compiled bytecode
-    BytecodeArray* raw_bc = fn_bc.get();
-    fn_obj->SetBytecode(raw_bc);
-    compiled_routines_.push_back(std::move(fn_bc));
+    std::shared_ptr<BytecodeArray> shared_bc = std::move(fn_bc);
+    fn_obj->SetBytecode(shared_bc);
+    for (auto& routine : sub_emitter.compiled_routines_) {
+        compiled_routines_.push_back(std::move(routine));
+    }
 
-    // 4. Register in current scope and emit constant load
+    // 4. Register in current scope and emit constant load / closure creation
     uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(fn_obj));
+    uint8_t fn_reg = AllocateRegister();
+    scope_[node->Name()] = fn_reg;
+
+    if (parent_emitter_ != nullptr) {
+        bytecode_->EmitOpcode(Opcode::CreateClosure);
+        bytecode_->EmitU16(const_idx);
+    } else {
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(const_idx);
+    }
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(fn_reg);
+}
+
+void BytecodeEmitter::VisitNew(NewExpr* node) {
+    // 1. Evaluate callee constructor
+    node->Callee()->Accept(this);
+    uint8_t ctor_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(ctor_reg);
+
+    // 2. Evaluate arguments into contiguous registers
+    uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+    uint8_t args_start = AllocateRegisterRange(arg_count);
+    for (uint8_t i = 0; i < arg_count; ++i) {
+        node->Args()[i]->Accept(this);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+    }
+
+    // 3. Emit Construct
+    uint16_t slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::Construct);
+    bytecode_->EmitU8(ctor_reg);
+    bytecode_->EmitU8(args_start);
+    bytecode_->EmitU8(arg_count);
+    bytecode_->EmitU16(slot);
+
+    FreeRegisterRange(args_start, arg_count);
+    FreeRegister(ctor_reg);
+}
+
+void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
+    auto* fn_obj = new JSFunction(node->Name(), nullptr);
+
+    BytecodeEmitter sub_emitter;
+    sub_emitter.parent_emitter_ = this;
+    auto fn_bc = std::make_unique<BytecodeArray>();
+    uint32_t param_count = static_cast<uint32_t>(node->Params().size());
+    fn_bc->SetParameterCount(param_count);
+
+    sub_emitter.ScanAndSetupContextSlots(node->Params(), node->Body());
+
+    for (uint32_t i = 0; i < param_count; ++i) {
+        uint8_t reg = sub_emitter.AllocateRegister();
+        sub_emitter.scope_[node->Params()[i]] = reg;
+    }
+
+    sub_emitter.bytecode_ = std::move(fn_bc);
+
+    if (!sub_emitter.context_slots_.empty()) {
+        sub_emitter.bytecode_->EmitOpcode(Opcode::CreateFunctionContext);
+        sub_emitter.bytecode_->EmitU16(static_cast<uint16_t>(sub_emitter.context_slots_.size()));
+
+        for (uint32_t i = 0; i < param_count; ++i) {
+            const auto& pname = node->Params()[i];
+            auto cs_it = sub_emitter.context_slots_.find(pname);
+            if (cs_it != sub_emitter.context_slots_.end()) {
+                sub_emitter.bytecode_->EmitOpcode(Opcode::Ldar);
+                sub_emitter.bytecode_->EmitU8(sub_emitter.scope_[pname]);
+                sub_emitter.bytecode_->EmitOpcode(Opcode::StaContextSlot);
+                sub_emitter.bytecode_->EmitU8(0);
+                sub_emitter.bytecode_->EmitU16(cs_it->second);
+            }
+        }
+    }
+
+    node->Body()->Accept(&sub_emitter);
+
+    if (sub_emitter.bytecode_->Code().empty() || 
+        (sub_emitter.bytecode_->Code().back() != static_cast<uint8_t>(Opcode::Return) && 
+         sub_emitter.bytecode_->Code().back() != static_cast<uint8_t>(Opcode::Halt))) {
+        sub_emitter.bytecode_->EmitOpcode(Opcode::LdaUndefined);
+        sub_emitter.bytecode_->EmitOpcode(Opcode::Return);
+    }
+    sub_emitter.bytecode_->SetRegisterCount(sub_emitter.max_registers_);
+
+    std::shared_ptr<BytecodeArray> shared_bc = std::move(sub_emitter.bytecode_);
+    fn_obj->SetBytecode(shared_bc);
+    for (auto& routine : sub_emitter.compiled_routines_) {
+        compiled_routines_.push_back(std::move(routine));
+    }
+
+    uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(fn_obj));
+    bytecode_->EmitOpcode(Opcode::CreateClosure);
+    bytecode_->EmitU16(const_idx);
+}
+
+void BytecodeEmitter::VisitClassDecl(ClassDeclStmt* node) {
+    FunctionDeclStmt* ctor_stmt = nullptr;
+    for (const auto& m : node->Methods()) {
+        if (m->Name() == "constructor") {
+            ctor_stmt = m.get();
+            break;
+        }
+    }
+
+    std::unique_ptr<FunctionDeclStmt> default_ctor;
+    if (!ctor_stmt) {
+        default_ctor = std::make_unique<FunctionDeclStmt>(node->Name(), std::vector<std::string>{}, std::make_unique<BlockStmt>());
+        ctor_stmt = default_ctor.get();
+    }
+
+    auto* ctor_fn = new JSFunction(node->Name(), nullptr);
+    functions_[node->Name()] = ctor_fn;
+
+    BytecodeEmitter sub_emitter;
+    sub_emitter.parent_emitter_ = this;
+    auto ctor_bc = sub_emitter.EmitFunction(ctor_stmt);
+    std::shared_ptr<BytecodeArray> shared_ctor_bc = std::move(ctor_bc);
+    ctor_fn->SetBytecode(shared_ctor_bc);
+    for (auto& routine : sub_emitter.compiled_routines_) {
+        compiled_routines_.push_back(std::move(routine));
+    }
+
+    auto* proto_shape = new Shape(0, nullptr, "", TaggedValue::Null());
+    auto* proto_obj = new JSObject(proto_shape);
+    if (!node->SuperName().empty()) {
+        JSFunction* super_fn = LookupFunction(node->SuperName());
+        if (super_fn && super_fn->GetPrototype()) {
+            proto_obj->SetPrototype(super_fn->GetPrototype());
+        }
+    }
+    ctor_fn->SetPrototype(proto_obj);
+
+    uint32_t dummy_id = 1;
+    for (const auto& m : node->Methods()) {
+        if (m->Name() == "constructor") continue;
+        auto* method_fn = new JSFunction(m->Name(), nullptr);
+        BytecodeEmitter m_emitter;
+        m_emitter.parent_emitter_ = this;
+        auto m_bc = m_emitter.EmitFunction(m.get());
+        std::shared_ptr<BytecodeArray> shared_m_bc = std::move(m_bc);
+        method_fn->SetBytecode(shared_m_bc);
+        for (auto& routine : m_emitter.compiled_routines_) {
+            compiled_routines_.push_back(std::move(routine));
+        }
+
+        proto_obj->SetNamedProperty(m->Name(), TaggedValue::FromHeapObject(method_fn), dummy_id);
+    }
+
+    uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(ctor_fn));
     uint8_t fn_reg = AllocateRegister();
     scope_[node->Name()] = fn_reg;
 
@@ -506,6 +903,45 @@ void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
     bytecode_->EmitU16(const_idx);
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(fn_reg);
+}
+
+void BytecodeEmitter::VisitThrow(ThrowStmt* node) {
+    node->GetExpr()->Accept(this);
+    bytecode_->EmitOpcode(Opcode::Throw);
+}
+
+void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
+    Label catch_label;
+    Label end_label;
+
+    bytecode_->EmitOpcode(Opcode::PushExceptionHandler);
+    size_t handler_patch_offset = bytecode_->CurrentOffset();
+    catch_label.forward_jumps.push_back(handler_patch_offset);
+    bytecode_->EmitI32(0);
+
+    node->TryBlock()->Accept(this);
+    bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
+
+    if (node->FinallyBlock()) {
+        node->FinallyBlock()->Accept(this);
+    }
+    EmitJump(Opcode::Jump, end_label);
+
+    Bind(catch_label);
+    if (node->CatchBlock()) {
+        if (!node->CatchParam().empty()) {
+            uint8_t err_reg = AllocateRegister();
+            scope_[node->CatchParam()] = err_reg;
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(err_reg);
+        }
+        node->CatchBlock()->Accept(this);
+    }
+    if (node->FinallyBlock()) {
+        node->FinallyBlock()->Accept(this);
+    }
+
+    Bind(end_label);
 }
 
 void BytecodeEmitter::VisitReturn(ReturnStmt* node) {

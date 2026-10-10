@@ -10,7 +10,15 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
             return GetFastSlot(desc->slot_index, desc->is_in_object);
         }
 
-        // Walk prototype chain
+        // Check instance prototype if explicitly assigned
+        if (prototype_ != nullptr) {
+            TaggedValue val = prototype_->GetNamedProperty(key);
+            if (!val.IsUndefined()) {
+                return val;
+            }
+        }
+
+        // Walk shape prototype chain
         TaggedValue proto = shape->Prototype();
         while (proto.IsHeapObject()) {
             HeapObject* p_obj = proto.AsHeapObject();

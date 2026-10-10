@@ -37,13 +37,11 @@ void IsolateHeap::EvacuateObject(TaggedValue& slot) {
         slot = TaggedValue::FromHeapObject(tenured);
     } else {
         // Evacuate object into Nursery To-space
-        uintptr_t to_start = nursery_.ToSpaceStart();
         uintptr_t to_limit = nursery_.ToSpaceLimit();
-        static uintptr_t s_to_bump = to_start;
 
-        if (s_to_bump + obj_size <= to_limit) {
-            void* to_mem = reinterpret_cast<void*>(s_to_bump);
-            s_to_bump += obj_size;
+        if (to_space_bump_ + obj_size <= to_limit) {
+            void* to_mem = reinterpret_cast<void*>(to_space_bump_);
+            to_space_bump_ += obj_size;
             std::memcpy(to_mem, obj, obj_size);
 
             HeapObject* evacuated = reinterpret_cast<HeapObject*>(to_mem);
@@ -63,9 +61,8 @@ void IsolateHeap::EvacuateObject(TaggedValue& slot) {
 }
 
 void IsolateHeap::MinorGC() {
-    uintptr_t scan_ptr = nursery_.ToSpaceStart();
-    uintptr_t to_limit = nursery_.ToSpaceLimit();
-    (void)to_limit;
+    to_space_bump_ = nursery_.ToSpaceStart();
+    uintptr_t scan_ptr = to_space_bump_;
 
     // 1. Evacuate roots from all active HandleScopes
     HandleScope* scope = top_scope_;
@@ -84,13 +81,8 @@ void IsolateHeap::MinorGC() {
     }
 
     // 3. Cheney-style breadth-first traversal in To-space
-    // Scan objects evacuated to To-space and evacuate their children
-    while (scan_ptr < nursery_.ToSpaceLimit()) {
+    while (scan_ptr < to_space_bump_) {
         HeapObject* obj = reinterpret_cast<HeapObject*>(scan_ptr);
-        if (obj->GetShape() == nullptr && obj->GetType() == static_cast<HeapObjectType>(0)) {
-            break; // Reached unallocated frontier
-        }
-
         size_t size = obj->ObjectSize();
         if (size == 0) break;
         size = (size + kObjectAlignment - 1) & ~(kObjectAlignment - 1);

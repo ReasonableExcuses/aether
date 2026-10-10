@@ -49,3 +49,6 @@ target_link_libraries(test_milestone5_son_jit PRIVATE aether_core)
 
 add_executable(test_milestone6_runtime tests/test_milestone6_runtime.cpp)
 target_link_libraries(test_milestone6_runtime PRIVATE aether_core)
+
+add_executable(test_milestone7_closures tests/test_milestone7_closures.cpp)
+target_link_libraries(test_milestone7_closures PRIVATE aether_core)

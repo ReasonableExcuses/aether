@@ -5,7 +5,7 @@
 
 namespace aether {
 
-TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args) {
+TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env) {
     // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
     if (const ExecutableMemory* t2 = bytecode.GetTier2Code()) {
         return BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
@@ -27,7 +27,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         }
     }
 
-    ExecutionFrame frame(bytecode, args);
+    ExecutionFrame frame(bytecode, args, this_val, env);
     const uint8_t* code_start = bytecode.Code().data();
     const uint8_t* pc = code_start;
     const uint8_t* code_end = code_start + bytecode.Code().size();
@@ -93,7 +93,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (slot_id != 0) {
-                    FeedbackSlot& slot = feedback_.GetSlot(slot_id);
+                    FeedbackSlot& slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                     slot.RecordType(acc_);
                     slot.RecordType(rhs);
                 }
@@ -124,7 +124,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (slot_id != 0) {
-                    FeedbackSlot& slot = feedback_.GetSlot(slot_id);
+                    FeedbackSlot& slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                     slot.RecordType(acc_);
                     slot.RecordType(rhs);
                 }
@@ -148,7 +148,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (slot_id != 0) {
-                    FeedbackSlot& slot = feedback_.GetSlot(slot_id);
+                    FeedbackSlot& slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                     slot.RecordType(acc_);
                     slot.RecordType(rhs);
                 }
@@ -322,11 +322,27 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 pc += 2;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
-                assert(obj_val.IsHeapObject() && obj_val.AsHeapObject()->IsJSObject());
+                assert(obj_val.IsHeapObject());
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (obj_val.AsHeapObject()->IsFunction()) {
+                    auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
+                    if (prop_key == "prototype") {
+                        if (!fn->GetPrototype()) {
+                            fn->SetPrototype(new JSObject(GetRootShape()));
+                        }
+                        acc_ = TaggedValue::FromHeapObject(fn->GetPrototype());
+                        break;
+                    }
+                }
+
+                assert(obj_val.AsHeapObject()->IsJSObject());
                 JSObject* js_obj = static_cast<JSObject*>(obj_val.AsHeapObject());
 
                 // Inline Cache check
-                FeedbackSlot& ic_slot = feedback_.GetSlot(slot_id);
+                FeedbackSlot& ic_slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                 Shape* obj_shape = js_obj->GetShape();
 
                 if (AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape)) {
@@ -334,10 +350,6 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = js_obj->GetFastSlot(ic_slot.cached_slot, ic_slot.cached_in_object);
                 } else {
                     // IC Miss: Slow path lookup and IC transition
-                    TaggedValue prop_name_val = bytecode.Constants()[name_idx];
-                    assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                    std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
-
                     acc_ = js_obj->GetNamedProperty(prop_key);
 
                     // Update IC to Monomorphic
@@ -358,11 +370,24 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 pc += 2;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
-                assert(obj_val.IsHeapObject() && obj_val.AsHeapObject()->IsJSObject());
+                assert(obj_val.IsHeapObject());
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (obj_val.AsHeapObject()->IsFunction()) {
+                    auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
+                    if (prop_key == "prototype" && acc_.IsHeapObject() && acc_.AsHeapObject()->IsJSObject()) {
+                        fn->SetPrototype(static_cast<JSObject*>(acc_.AsHeapObject()));
+                        break;
+                    }
+                }
+
+                assert(obj_val.AsHeapObject()->IsJSObject());
                 JSObject* js_obj = static_cast<JSObject*>(obj_val.AsHeapObject());
 
                 // Inline Cache check
-                FeedbackSlot& ic_slot = feedback_.GetSlot(slot_id);
+                FeedbackSlot& ic_slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                 Shape* obj_shape = js_obj->GetShape();
 
                 if (AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape)) {
@@ -370,10 +395,6 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     js_obj->SetFastSlot(ic_slot.cached_slot, ic_slot.cached_in_object, acc_);
                 } else {
                     // IC Miss: Set property and update Shape / IC
-                    TaggedValue prop_name_val = bytecode.Constants()[name_idx];
-                    assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                    std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
-
                     js_obj->SetNamedProperty(prop_key, acc_, next_shape_id_);
 
                     Shape* new_shape = js_obj->GetShape();
@@ -413,6 +434,132 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 acc_ = TaggedValue::FromHeapObject(obj);
                 break;
             }
+            case Opcode::LdaThis: {
+                acc_ = frame.GetThis();
+                break;
+            }
+            case Opcode::CreateClosure: {
+                uint16_t const_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+                TaggedValue proto_val = bytecode.Constants()[const_idx];
+                assert(proto_val.IsHeapObject() && proto_val.AsHeapObject()->IsFunction());
+                auto* proto_fn = static_cast<JSFunction*>(proto_val.AsHeapObject());
+                auto* closure = new JSFunction(proto_fn->Name(), 
+                                               proto_fn->GetSharedBytecode() ? proto_fn->GetSharedBytecode() : std::shared_ptr<const BytecodeArray>(proto_fn->GetBytecode(), [](const BytecodeArray*){}), 
+                                               frame.GetEnvironment());
+                closure->SetPrototype(proto_fn->GetPrototype());
+                acc_ = TaggedValue::FromHeapObject(closure);
+                break;
+            }
+            case Opcode::CreateFunctionContext: {
+                uint16_t slot_count = pc[0] | (pc[1] << 8);
+                pc += 2;
+                auto* new_env = new LexicalEnvironment(frame.GetEnvironment(), slot_count);
+                frame.SetEnvironment(new_env);
+                break;
+            }
+            case Opcode::LdaContextSlot: {
+                uint8_t depth = *pc++;
+                uint16_t slot = pc[0] | (pc[1] << 8);
+                pc += 2;
+                LexicalEnvironment* cur_env = frame.GetEnvironment();
+                acc_ = cur_env ? cur_env->Get(depth, slot) : TaggedValue::Undefined();
+                break;
+            }
+            case Opcode::StaContextSlot: {
+                uint8_t depth = *pc++;
+                uint16_t slot = pc[0] | (pc[1] << 8);
+                pc += 2;
+                LexicalEnvironment* cur_env = frame.GetEnvironment();
+                if (cur_env) {
+                    cur_env->Set(depth, slot, acc_);
+                }
+                break;
+            }
+            case Opcode::Construct: {
+                uint8_t ctor_reg = *pc++;
+                uint8_t args_start = *pc++;
+                uint8_t arg_count = *pc++;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+
+                TaggedValue ctor_val = frame.GetRegister(ctor_reg);
+                assert(ctor_val.IsHeapObject() && ctor_val.AsHeapObject()->IsFunction());
+                auto* ctor_fn = static_cast<JSFunction*>(ctor_val.AsHeapObject());
+                if (!ctor_fn->GetPrototype()) {
+                    ctor_fn->SetPrototype(new JSObject(GetRootShape()));
+                }
+                auto* instance = new JSObject(GetRootShape());
+                instance->SetPrototype(ctor_fn->GetPrototype());
+                TaggedValue instance_val = TaggedValue::FromHeapObject(instance);
+
+                std::vector<TaggedValue> call_args;
+                call_args.reserve(arg_count);
+                for (uint8_t i = 0; i < arg_count; ++i) {
+                    call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
+                }
+
+                TaggedValue ret = Execute(*ctor_fn->GetBytecode(), call_args, instance_val, ctor_fn->GetEnvironment());
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                } else {
+                    if (ret.IsHeapObject() && ret.AsHeapObject()->IsJSObject()) {
+                        acc_ = ret;
+                    } else {
+                        acc_ = instance_val;
+                    }
+                }
+                break;
+            }
+            case Opcode::CallMethod: {
+                uint8_t callee_reg = *pc++;
+                uint8_t this_reg = *pc++;
+                uint8_t args_start = *pc++;
+                uint8_t arg_count = *pc++;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+
+                TaggedValue callee_val = frame.GetRegister(callee_reg);
+                TaggedValue rec_this = frame.GetRegister(this_reg);
+                assert(callee_val.IsHeapObject() && callee_val.AsHeapObject()->IsFunction() && "Callee must be a Function");
+
+                std::vector<TaggedValue> call_args;
+                call_args.reserve(arg_count);
+                for (uint8_t i = 0; i < arg_count; ++i) {
+                    call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
+                }
+
+                if (callee_val.AsHeapObject()->IsNativeFunction()) {
+                    auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
+                    acc_ = native_fn->Callback()(call_args);
+                } else {
+                    auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
+                    acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
+                }
+
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                }
+                break;
+            }
             case Opcode::Call: {
                 uint8_t callee_reg = *pc++;
                 uint8_t args_start = *pc++;
@@ -435,7 +582,44 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = native_fn->Callback()(call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
-                    acc_ = Execute(*func->GetBytecode(), call_args);
+                    acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());
+                }
+
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                }
+                break;
+            }
+            case Opcode::PushExceptionHandler: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                const uint8_t* target = pc + offset;
+                frame.PushExceptionHandler(target, frame.GetEnvironment());
+                break;
+            }
+            case Opcode::PopExceptionHandler: {
+                frame.PopExceptionHandler();
+                break;
+            }
+            case Opcode::Throw: {
+                TaggedValue exc = acc_;
+                if (frame.HasExceptionHandler()) {
+                    auto h = frame.PopExceptionHandler();
+                    pc = h.target_pc;
+                    frame.SetEnvironment(h.env);
+                    acc_ = exc;
+                } else {
+                    has_pending_exception_ = true;
+                    pending_exception_ = exc;
+                    return exc;
                 }
                 break;
             }

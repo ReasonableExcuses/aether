@@ -41,7 +41,17 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";
         case Opcode::Call:               return "Call";
+        case Opcode::CallMethod:         return "CallMethod";
         case Opcode::CreateObject:       return "CreateObject";
+        case Opcode::Construct:          return "Construct";
+        case Opcode::LdaThis:            return "LdaThis";
+        case Opcode::CreateClosure:      return "CreateClosure";
+        case Opcode::CreateFunctionContext: return "CreateFunctionContext";
+        case Opcode::LdaContextSlot:     return "LdaContextSlot";
+        case Opcode::StaContextSlot:     return "StaContextSlot";
+        case Opcode::PushExceptionHandler: return "PushExceptionHandler";
+        case Opcode::PopExceptionHandler:  return "PopExceptionHandler";
+        case Opcode::Throw:              return "Throw";
         case Opcode::Return:             return "Return";
         case Opcode::Halt:               return "Halt";
         default:                         return "<UnknownOpcode>";
@@ -92,7 +102,7 @@ std::string BytecodeArray::Disassemble() const {
         size_t current_pc = pc;
         Opcode op = static_cast<Opcode>(bytes_[pc++]);
 
-        ss << "  [0x" << std::hex << std::setw(4) << std::setfill('0') << current_pc << std::dec << "] "
+        ss << "  [0x" << std::hex << std::right << std::setw(4) << std::setfill('0') << current_pc << std::dec << "] "
            << std::setfill(' ') << std::left << std::setw(18) << OpcodeToString(op) << " ";
 
         switch (op) {
@@ -176,6 +186,61 @@ std::string BytecodeArray::Disassemble() const {
                    << " [feedback_slot: " << slot << "]";
                 break;
             }
+            case Opcode::CallMethod: {
+                uint8_t callee = bytes_[pc++];
+                uint8_t this_reg = bytes_[pc++];
+                uint8_t args = bytes_[pc++];
+                uint8_t count = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "callee: r" << static_cast<int>(callee)
+                   << ", this: r" << static_cast<int>(this_reg)
+                   << ", args: r" << static_cast<int>(args) << ".." << static_cast<int>(args + count - 1)
+                   << " (count: " << static_cast<int>(count) << ")"
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::Construct: {
+                uint8_t ctor = bytes_[pc++];
+                uint8_t args = bytes_[pc++];
+                uint8_t count = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "ctor: r" << static_cast<int>(ctor)
+                   << ", args: r" << static_cast<int>(args) << ".." << static_cast<int>(args + count - 1)
+                   << " (count: " << static_cast<int>(count) << ")"
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::CreateClosure: {
+                uint16_t idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "const[" << idx << "]";
+                break;
+            }
+            case Opcode::CreateFunctionContext: {
+                uint16_t slots = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "slots: " << slots;
+                break;
+            }
+            case Opcode::LdaContextSlot:
+            case Opcode::StaContextSlot: {
+                uint8_t depth = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "depth: " << static_cast<int>(depth) << ", slot: " << slot;
+                break;
+            }
+            case Opcode::PushExceptionHandler: {
+                int32_t offset = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
+                pc += 4;
+                ss << "offset: " << offset << " -> [0x" << std::hex << (pc + offset) << std::dec << "]";
+                break;
+            }
+            case Opcode::PopExceptionHandler:
+            case Opcode::Throw:
+            case Opcode::LdaThis:
             case Opcode::CreateObject:
             case Opcode::LogicalNot:
             case Opcode::Negate:
