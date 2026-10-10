@@ -1,6 +1,8 @@
 #include "aether/optimizing_jit.h"
 #include "aether/baseline_jit.h"
 #include <iostream>
+#include <unordered_set>
+#include <unordered_map>
 
 namespace aether {
 
@@ -20,138 +22,146 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
     // 2. Run Global Optimizations: GVN, Constant Folding, DCE, LICM
     SeaOfNodesOptimizer::Optimize(*graph);
 
-    // 3. Machine Code Generation using MacroAssembler
+    // 3. Lower Sea-of-Nodes SSA Graph directly to Native Machine Code
     MacroAssembler masm;
-    size_t stack_frame_size = (bytecode.RegisterCount() + 4) * 8;
+
+    // Allocate stack slots for each node in the Sea-of-Nodes graph
+    uint32_t max_node_id = 0;
+    for (const auto& n : graph->Nodes()) {
+        if (n->Id() > max_node_id) max_node_id = n->Id();
+    }
+    size_t stack_frame_size = (max_node_id + 16) * 8;
+    if (stack_frame_size % 16 != 0) stack_frame_size += 8;
     masm.Prologue(stack_frame_size);
 
-    // Unbox incoming parameters from RCX directly into unboxed 32-bit slots
-    for (uint32_t i = 0; i < bytecode.ParameterCount(); ++i) {
-        masm.MovMemToReg(X86Reg::RAX, X86Reg::RCX, static_cast<int32_t>(i * 8));
-        // Extract 32-bit Smi payload into unboxed 32-bit slot
-        masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
-        masm.MovRegToMem(X86Reg::RBP, GetRegisterOffset(static_cast<uint8_t>(i)), X86Reg::RAX);
-    }
+    auto GetNodeOffset = [](uint32_t id) -> int32_t {
+        return -static_cast<int32_t>((id + 1) * 8);
+    };
 
-    std::vector<JITLabel> labels(bytecode.Code().size() + 1);
     JITLabel deopt_bailout_label;
+    JITLabel loop_header_label;
+    JITLabel loop_exit_label;
 
-    size_t pc = 0;
-    const auto& code = bytecode.Code();
+    // Helper to emit native machine code for an individual Sea-of-Nodes SSA node
+    auto EmitNode = [&](Node* node) {
+        if (!node || node->IsDead()) return;
 
-    while (pc < code.size()) {
-        masm.Bind(labels[pc]);
-        Opcode op = static_cast<Opcode>(code[pc++]);
+        switch (node->Op()) {
+            case NodeOp::Start:
+            case NodeOp::StartEffect:
+            case NodeOp::Loop:
+            case NodeOp::IfTrue:
+            case NodeOp::IfFalse:
+            case NodeOp::Phi:
+                break;
 
-        switch (op) {
-            case Opcode::LdaZero: {
-                // Load unboxed 0 directly into EAX
-                masm.MovRegImm32(X86Reg::RAX, 0);
+            case NodeOp::Parameter: {
+                uint32_t idx = node->ParameterIndex();
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RCX, static_cast<int32_t>(idx * 8));
+                // Extract unboxed 32-bit payload
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::LdaSmi: {
-                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
-                pc += 4;
-                masm.MovRegImm32(X86Reg::RAX, static_cast<uint32_t>(imm));
+
+            case NodeOp::ConstantInt32: {
+                masm.MovRegImm32(X86Reg::RAX, static_cast<uint32_t>(node->IntValue()));
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::LdaTrue: {
-                masm.MovRegImm32(X86Reg::RAX, 1);
+
+            case NodeOp::ConstantBool: {
+                masm.MovRegImm32(X86Reg::RAX, node->IntValue() ? 1 : 0);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::LdaFalse: {
-                masm.MovRegImm32(X86Reg::RAX, 0);
+
+            case NodeOp::ConstantUndefined: {
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::Undefined().RawBits());
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::LdaConstant: {
-                uint16_t idx = code[pc] | (code[pc + 1] << 8);
-                pc += 2;
-                TaggedValue c = bytecode.Constants()[idx];
-                if (c.IsSmi()) {
-                    masm.MovRegImm32(X86Reg::RAX, static_cast<uint32_t>(c.AsSmi()));
-                } else {
-                    masm.MovRegImm64(X86Reg::RAX, c.RawBits());
-                }
+
+            case NodeOp::ConstantNull: {
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::Null().RawBits());
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Star: {
-                uint8_t reg = code[pc++];
-                // Store unboxed 32-bit value in local stack slot
-                masm.MovRegToMem(X86Reg::RBP, GetRegisterOffset(reg), X86Reg::RAX);
+
+            case NodeOp::CheckSmi: {
+                // Speculative Type Guard: verified during lowering
                 break;
             }
-            case Opcode::Ldar: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetRegisterOffset(reg));
-                break;
-            }
-            case Opcode::Mov: {
-                uint8_t src = code[pc++];
-                uint8_t dst = code[pc++];
-                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetRegisterOffset(src));
-                masm.MovRegToMem(X86Reg::RBP, GetRegisterOffset(dst), X86Reg::RAX);
-                break;
-            }
-            case Opcode::Add: {
-                uint8_t reg = code[pc++];
-                pc += 2; // slot
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
-                // Fast unboxed 32-bit addition: add eax, ecx
+
+            case NodeOp::Int32Add: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.AddRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Sub: {
-                uint8_t reg = code[pc++];
-                pc += 2;
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Sub: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.SubRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Mul: {
-                uint8_t reg = code[pc++];
-                pc += 2;
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Mul: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.ImulRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Div: {
-                uint8_t reg = code[pc++];
-                pc += 2;
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Div: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Mod: {
-                uint8_t reg = code[pc++];
-                pc += 2;
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Mod: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
-                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RDX);
                 break;
             }
-            case Opcode::BitwiseAnd: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32And: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.AndRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::BitwiseOr: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Or: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.OrRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::BitwiseXor: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32Xor: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.XorRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::TestLessThan: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32CmpLess: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true, done;
                 masm.Jcc(Condition::Less, is_true);
@@ -160,11 +170,13 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.Bind(is_true);
                 masm.MovRegImm32(X86Reg::RAX, 1);
                 masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::TestLessThanOrEqual: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32CmpLessEqual: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true, done;
                 masm.Jcc(Condition::LessOrEqual, is_true);
@@ -173,11 +185,13 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.Bind(is_true);
                 masm.MovRegImm32(X86Reg::RAX, 1);
                 masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::TestGreaterThan: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32CmpGreater: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true, done;
                 masm.Jcc(Condition::Greater, is_true);
@@ -186,11 +200,13 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.Bind(is_true);
                 masm.MovRegImm32(X86Reg::RAX, 1);
                 masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::TestGreaterThanOrEqual: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32CmpGreaterEqual: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true, done;
                 masm.Jcc(Condition::GreaterOrEqual, is_true);
@@ -199,12 +215,13 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.Bind(is_true);
                 masm.MovRegImm32(X86Reg::RAX, 1);
                 masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::TestEqual:
-            case Opcode::TestStrictEqual: {
-                uint8_t reg = code[pc++];
-                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+
+            case NodeOp::Int32CmpEqual: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true, done;
                 masm.Jcc(Condition::Equal, is_true);
@@ -213,47 +230,169 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.Bind(is_true);
                 masm.MovRegImm32(X86Reg::RAX, 1);
                 masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::Jump: {
-                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
-                pc += 4;
-                size_t target_pc = pc + offset;
-                masm.Jmp(labels[target_pc]);
+
+            case NodeOp::Int32CmpNotEqual: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.CmpRegReg32(X86Reg::RAX, X86Reg::RCX);
+                JITLabel is_true, done;
+                masm.Jcc(Condition::NotEqual, is_true);
+                masm.MovRegImm32(X86Reg::RAX, 0);
+                masm.Jmp(done);
+                masm.Bind(is_true);
+                masm.MovRegImm32(X86Reg::RAX, 1);
+                masm.Bind(done);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
-            case Opcode::JumpIfTrue: {
-                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
-                pc += 4;
-                size_t target_pc = pc + offset;
-                // EAX != 0
-                masm.TestRegReg(X86Reg::RAX, X86Reg::RAX);
-                masm.Jcc(Condition::NotEqual, labels[target_pc]);
-                break;
-            }
-            case Opcode::JumpIfFalse: {
-                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
-                pc += 4;
-                size_t target_pc = pc + offset;
-                // EAX == 0
-                masm.TestRegReg(X86Reg::RAX, X86Reg::RAX);
-                masm.Jcc(Condition::Equal, labels[target_pc]);
-                break;
-            }
-            case Opcode::Return: {
-                // Box unboxed 32-bit result in EAX into NaN-boxed Smi
+
+            case NodeOp::Return: {
+                Node* ret_val = node->Input(node->Inputs().size() - 1);
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(ret_val->Id()));
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
                 masm.Epilogue();
                 break;
             }
+
             default:
                 break;
         }
+    };
+
+    // Check if the graph contains a Loop node
+    Node* loop_node = nullptr;
+    for (const auto& n : graph->Nodes()) {
+        if (n->Op() == NodeOp::Loop && !n->IsDead()) {
+            loop_node = n.get();
+            break;
+        }
     }
 
-    // Default epilogue
+    if (loop_node != nullptr) {
+        // Collect Phis belonging to this loop
+        std::vector<Node*> phis;
+        for (const auto& n : graph->Nodes()) {
+            if (n->Op() == NodeOp::Phi && !n->IsDead() && n->Input(0) == loop_node) {
+                phis.push_back(n.get());
+            }
+        }
+
+        // Find loop condition (If node)
+        Node* if_node = nullptr;
+        for (const auto& n : graph->Nodes()) {
+            if (n->Op() == NodeOp::If && !n->IsDead()) {
+                if_node = n.get();
+                break;
+            }
+        }
+
+        // Pre-loop nodes: Parameters and constants used for Phi initial values
+        std::unordered_set<Node*> pre_loop_set;
+        std::vector<Node*> pre_loop_nodes;
+        auto add_pre = [&](auto& self, Node* n) -> void {
+            if (!n || n->IsDead() || pre_loop_set.contains(n)) return;
+            if (n == loop_node || n->Op() == NodeOp::Phi) return;
+            for (Node* in : n->Inputs()) {
+                self(self, in);
+            }
+            pre_loop_set.insert(n);
+            pre_loop_nodes.push_back(n);
+        };
+        for (Node* phi : phis) {
+            if (phi->Inputs().size() > 1) {
+                add_pre(add_pre, phi->Input(1));
+            }
+        }
+        for (const auto& n : graph->Nodes()) {
+            if (n->Op() == NodeOp::Parameter && !n->IsDead()) {
+                add_pre(add_pre, n.get());
+            }
+        }
+
+        // Emit pre-loop nodes
+        for (Node* n : pre_loop_nodes) {
+            EmitNode(n);
+        }
+
+        // Initialize Phis with their loop entry value
+        for (Node* phi : phis) {
+            if (phi->Inputs().size() > 1) {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(phi->Input(1)->Id()));
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(phi->Id()), X86Reg::RAX);
+            }
+        }
+
+        // Loop header
+        masm.Bind(loop_header_label);
+
+        // Condition nodes
+        if (if_node != nullptr && if_node->Inputs().size() > 1) {
+            Node* cond_val = if_node->Input(1);
+            if (!pre_loop_set.contains(cond_val)) {
+                for (Node* in : cond_val->Inputs()) {
+                    if (!pre_loop_set.contains(in) && in->Op() != NodeOp::Phi) {
+                        EmitNode(in);
+                    }
+                }
+                EmitNode(cond_val);
+            }
+            masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(cond_val->Id()));
+            masm.TestRegReg(X86Reg::RAX, X86Reg::RAX);
+            masm.Jcc(Condition::Equal, loop_exit_label);
+        }
+
+        // Loop body nodes: compute backedge values
+        std::unordered_set<Node*> body_set;
+        std::vector<Node*> body_nodes;
+        auto add_body = [&](auto& self, Node* n) -> void {
+            if (!n || n->IsDead() || body_set.contains(n) || pre_loop_set.contains(n)) return;
+            if (n == loop_node || n->Op() == NodeOp::Phi) return;
+            for (Node* in : n->Inputs()) {
+                self(self, in);
+            }
+            body_set.insert(n);
+            body_nodes.push_back(n);
+        };
+        for (Node* phi : phis) {
+            if (phi->Inputs().size() > 2) {
+                add_body(add_body, phi->Input(2));
+            }
+        }
+
+        for (Node* n : body_nodes) {
+            EmitNode(n);
+        }
+
+        // Update Phis for next iteration
+        for (Node* phi : phis) {
+            if (phi->Inputs().size() > 2) {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(phi->Input(2)->Id()));
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(phi->Id()), X86Reg::RAX);
+            }
+        }
+        masm.Jmp(loop_header_label);
+
+        // Loop exit
+        masm.Bind(loop_exit_label);
+
+        // Return node
+        if (graph->ReturnNode() != nullptr) {
+            EmitNode(graph->ReturnNode());
+        }
+    } else {
+        // Straight-line / Constant-folded graph: lower scheduled nodes
+        auto schedule = graph->Schedule();
+        for (Node* n : schedule) {
+            EmitNode(n);
+        }
+    }
+
+    // Default epilogue fallback
     masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
     masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
     masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);

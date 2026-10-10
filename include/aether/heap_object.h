@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 #include <functional>
+#include <new>
+#include <utility>
 
 namespace aether {
 
@@ -90,8 +92,14 @@ public:
         }
     }
 
+    HeapObject(HeapObject&& other) noexcept
+        : shape_(other.shape_),
+          type_(other.type_),
+          gc_metadata_(other.gc_metadata_) {}
+
     virtual size_t ObjectSize() const { return sizeof(*this); }
     virtual void IteratePointers(const std::function<void(TaggedValue&)>& visitor) { (void)visitor; }
+    virtual HeapObject* RelocateTo(void* dst) = 0;
 
 private:
     Shape* shape_{nullptr};
@@ -108,6 +116,7 @@ public:
         : HeapObject(HeapObjectType::String, shape), data_(str) {
         ComputeHash();
     }
+    JSString(JSString&& other) noexcept = default;
 
     const std::string& Value() const noexcept { return data_; }
     std::string_view View() const noexcept { return data_; }
@@ -116,6 +125,10 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSString); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSString(std::move(*this));
+    }
 
 private:
     void ComputeHash() noexcept {
@@ -142,6 +155,19 @@ public:
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
             in_object_slots_[i] = TaggedValue::Empty();
         }
+    }
+
+    JSObject(JSObject&& other) noexcept
+        : HeapObject(std::move(other)),
+          prototype_(other.prototype_),
+          out_of_line_slots_(std::move(other.out_of_line_slots_)) {
+        for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
+            in_object_slots_[i] = other.in_object_slots_[i];
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSObject(std::move(*this));
     }
 
     // Fast-path direct slot access using cached Inline Cache offset
@@ -234,11 +260,17 @@ public:
         if (curr && index < curr->slots_.size()) curr->slots_[index] = val;
     }
 
+    LexicalEnvironment(LexicalEnvironment&& other) noexcept = default;
+
     size_t ObjectSize() const override { return sizeof(LexicalEnvironment) + slots_.size() * sizeof(TaggedValue); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         for (auto& s : slots_) {
             if (!s.IsEmpty()) visitor(s);
         }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) LexicalEnvironment(std::move(*this));
     }
 
 private:
@@ -264,6 +296,8 @@ public:
           bytecode_(bytecode),
           environment_(env) {}
 
+    JSFunction(JSFunction&& other) noexcept = default;
+
     const std::string& Name() const noexcept { return name_; }
     const BytecodeArray* GetBytecode() const noexcept { return bytecode_; }
     void SetBytecode(const BytecodeArray* bytecode) noexcept { 
@@ -285,6 +319,10 @@ public:
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
 
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSFunction(std::move(*this));
+    }
+
 private:
     std::string name_;
     std::shared_ptr<const BytecodeArray> bytecode_shared_{nullptr};
@@ -302,12 +340,17 @@ public:
         : HeapObject(HeapObjectType::JSError, shape),
           name_(name),
           message_(message) {}
+    JSError(JSError&& other) noexcept = default;
 
     const std::string& Name() const noexcept { return name_; }
     const std::string& Message() const noexcept { return message_; }
 
     size_t ObjectSize() const override { return sizeof(JSError); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSError(std::move(*this));
+    }
 
 private:
     std::string name_;

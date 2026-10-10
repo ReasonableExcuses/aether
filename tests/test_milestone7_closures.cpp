@@ -7,6 +7,9 @@
 #include "aether/interpreter.h"
 
 #include <iostream>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 
 using namespace aether;
@@ -16,19 +19,14 @@ static TaggedValue RunScript(std::string_view source) {
         Lexer lexer(source);
         Parser parser(lexer);
         auto program = parser.ParseProgram();
-        std::cout << "Parsed program successfully!\n";
 
         BytecodeEmitter emitter;
         auto bytecode = emitter.Emit(program.get());
-        std::cout << "Emitted bytecode successfully!\n" << std::flush;
-        std::cout << bytecode->Disassemble() << "\n" << std::flush;
 
         Interpreter interpreter;
-        TaggedValue val = interpreter.Execute(*bytecode);
-        std::cout << "Execute returned successfully!\n" << std::flush;
-        return val;
+        return interpreter.Execute(*bytecode);
     } catch (const std::exception& e) {
-        std::cout << "EXCEPTION in RunScript: " << e.what() << "\n" << std::flush;
+        std::cerr << "EXCEPTION in RunScript: " << e.what() << "\n" << std::flush;
         return TaggedValue::Undefined();
     }
 }

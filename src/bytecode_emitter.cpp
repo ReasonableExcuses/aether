@@ -134,14 +134,16 @@ BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view
     if (reg_it != scope_.end()) {
         return VarResolution{VarResolution::LocalReg, reg_it->second, 0, 0, nullptr};
     }
-    uint8_t depth = 1;
+    uint8_t depth = context_slots_.empty() ? 0 : 1;
     BytecodeEmitter* parent = parent_emitter_;
     while (parent != nullptr) {
         auto p_cs = parent->context_slots_.find(std::string(name));
         if (p_cs != parent->context_slots_.end()) {
             return VarResolution{VarResolution::ContextSlot, 0, depth, p_cs->second, nullptr};
         }
-        depth++;
+        if (!parent->context_slots_.empty()) {
+            depth++;
+        }
         parent = parent->parent_emitter_;
     }
     JSFunction* fn = LookupFunction(name);

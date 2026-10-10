@@ -29,9 +29,7 @@ void IsolateHeap::EvacuateObject(TaggedValue& slot) {
         // Tenure object into Immix Old Generation
         void* old_mem = old_gen_.Allocate(obj_size);
         assert(old_mem != nullptr && "Old Generation out of memory");
-        std::memcpy(old_mem, obj, obj_size);
-
-        HeapObject* tenured = reinterpret_cast<HeapObject*>(old_mem);
+        HeapObject* tenured = obj->RelocateTo(old_mem);
         tenured->SetOld(true);
         obj->SetForwardedAddress(tenured);
         slot = TaggedValue::FromHeapObject(tenured);
@@ -42,17 +40,14 @@ void IsolateHeap::EvacuateObject(TaggedValue& slot) {
         if (to_space_bump_ + obj_size <= to_limit) {
             void* to_mem = reinterpret_cast<void*>(to_space_bump_);
             to_space_bump_ += obj_size;
-            std::memcpy(to_mem, obj, obj_size);
-
-            HeapObject* evacuated = reinterpret_cast<HeapObject*>(to_mem);
+            HeapObject* evacuated = obj->RelocateTo(to_mem);
             evacuated->SetOld(false);
             obj->SetForwardedAddress(evacuated);
             slot = TaggedValue::FromHeapObject(evacuated);
         } else {
             // To-space exhausted during scavenge, promote to Old Gen
             void* old_mem = old_gen_.Allocate(obj_size);
-            std::memcpy(old_mem, obj, obj_size);
-            HeapObject* tenured = reinterpret_cast<HeapObject*>(old_mem);
+            HeapObject* tenured = obj->RelocateTo(old_mem);
             tenured->SetOld(true);
             obj->SetForwardedAddress(tenured);
             slot = TaggedValue::FromHeapObject(tenured);

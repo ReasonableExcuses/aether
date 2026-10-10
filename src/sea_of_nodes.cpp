@@ -181,6 +181,45 @@ void Graph::Dump(std::ostream& os) const {
     os << "=========================================================\n";
 }
 
+std::vector<Node*> Graph::Schedule() const {
+    std::vector<Node*> schedule;
+    std::unordered_set<Node*> visited;
+    std::unordered_set<Node*> in_stack;
+
+    auto dfs = [&](auto& self, Node* node) -> void {
+        if (!node || node->IsDead()) return;
+        if (visited.contains(node)) return;
+        if (in_stack.contains(node)) {
+            // Cycle backedge (Loop or Phi backedge) - break cycle
+            return;
+        }
+
+        in_stack.insert(node);
+
+        for (size_t i = 0; i < node->Inputs().size(); ++i) {
+            Node* in = node->Input(i);
+            // Ignore backedge inputs for Phi (input 2) and Loop (input 1) during forward DAG scheduling
+            if (node->Op() == NodeOp::Phi && i == 2) {
+                continue;
+            }
+            if (node->Op() == NodeOp::Loop && i == 1) {
+                continue;
+            }
+            self(self, in);
+        }
+
+        in_stack.erase(node);
+        visited.insert(node);
+        schedule.push_back(node);
+    };
+
+    if (return_node_) {
+        dfs(dfs, return_node_);
+    }
+
+    return schedule;
+}
+
 SeaOfNodesBuilder::SeaOfNodesBuilder(const BytecodeArray& bytecode, TypeFeedbackVector* feedback)
     : bytecode_(bytecode), feedback_(feedback) {
     graph_ = std::make_unique<Graph>();
@@ -210,10 +249,73 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
     std::unordered_map<size_t, Node*> pc_to_loop_node;
     std::unordered_map<size_t, std::vector<Node*>> loop_phi_registers;
     std::unordered_map<size_t, Node*> loop_phi_acc;
+    std::unordered_map<size_t, Node*> loop_exit_control;
+
+    // Pre-pass: detect loop headers (targets of negative jumps)
+    std::unordered_set<size_t> loop_headers;
+    size_t scan_pc = 0;
+    while (scan_pc < code.size()) {
+        Opcode scan_op = static_cast<Opcode>(code[scan_pc++]);
+        switch (scan_op) {
+            case Opcode::LdaSmi: scan_pc += 4; break;
+            case Opcode::LdaConstant: scan_pc += 2; break;
+            case Opcode::Star: scan_pc += 1; break;
+            case Opcode::Ldar: scan_pc += 1; break;
+            case Opcode::Mov: scan_pc += 2; break;
+            case Opcode::Add:
+            case Opcode::Sub:
+            case Opcode::Mul:
+            case Opcode::Div:
+            case Opcode::Mod: scan_pc += 3; break;
+            case Opcode::BitwiseAnd:
+            case Opcode::BitwiseOr:
+            case Opcode::BitwiseXor:
+            case Opcode::TestLessThan:
+            case Opcode::TestLessThanOrEqual:
+            case Opcode::TestGreaterThan:
+            case Opcode::TestGreaterThanOrEqual:
+            case Opcode::TestEqual:
+            case Opcode::TestStrictEqual: scan_pc += 1; break;
+            case Opcode::Jump:
+            case Opcode::JumpIfTrue:
+            case Opcode::JumpIfFalse: {
+                int32_t offset = code[scan_pc] | (code[scan_pc + 1] << 8) | (code[scan_pc + 2] << 16) | (code[scan_pc + 3] << 24);
+                scan_pc += 4;
+                if (scan_op == Opcode::Jump && offset < 0) {
+                    size_t target_pc = scan_pc + offset;
+                    loop_headers.insert(target_pc);
+                }
+                break;
+            }
+            default: break;
+        }
+    }
 
     while (pc < code.size()) {
         size_t cur_pc = pc;
-        (void)cur_pc;
+        if (loop_headers.contains(cur_pc) && !pc_to_loop_node.contains(cur_pc)) {
+            Node* loop_node = graph_->NewNode(NodeOp::Loop);
+            loop_node->AddInput(cur_control_);
+            cur_control_ = loop_node;
+            pc_to_loop_node[cur_pc] = loop_node;
+
+            Node* phi_acc = graph_->NewNode(NodeOp::Phi);
+            phi_acc->AddInput(loop_node);
+            phi_acc->AddInput(acc_);
+            acc_ = phi_acc;
+            loop_phi_acc[cur_pc] = phi_acc;
+
+            std::vector<Node*> phi_regs;
+            for (size_t r = 0; r < registers_.size(); ++r) {
+                Node* phi_r = graph_->NewNode(NodeOp::Phi);
+                phi_r->AddInput(loop_node);
+                phi_r->AddInput(registers_[r]);
+                registers_[r] = phi_r;
+                phi_regs.push_back(phi_r);
+            }
+            loop_phi_registers[cur_pc] = phi_regs;
+        }
+
         Opcode op = static_cast<Opcode>(code[pc++]);
 
         switch (op) {
@@ -422,18 +524,42 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
             case Opcode::Jump: {
                 int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;
-                // Backedge detected: create Loop control
                 if (offset < 0) {
-                    Node* loop_node = graph_->NewNode(NodeOp::Loop);
-                    loop_node->AddInput(cur_control_);
-                    cur_control_ = loop_node;
+                    size_t target_pc = pc + offset;
+                    auto it_loop = pc_to_loop_node.find(target_pc);
+                    if (it_loop != pc_to_loop_node.end()) {
+                        it_loop->second->AddInput(cur_control_);
+                    }
+                    auto it_acc = loop_phi_acc.find(target_pc);
+                    if (it_acc != loop_phi_acc.end()) {
+                        it_acc->second->AddInput(acc_);
+                    }
+                    auto it_regs = loop_phi_registers.find(target_pc);
+                    if (it_regs != loop_phi_registers.end()) {
+                        for (size_t r = 0; r < registers_.size() && r < it_regs->second.size(); ++r) {
+                            it_regs->second[r]->AddInput(registers_[r]);
+                        }
+                    }
+                    // After the loop, control continues from the loop exit edge (IfFalse)
+                    size_t loop_exit_pc = pc;
+                    auto it_exit = loop_exit_control.find(loop_exit_pc);
+                    if (it_exit != loop_exit_control.end()) {
+                        cur_control_ = it_exit->second;
+                    }
+                    if (it_regs != loop_phi_registers.end()) {
+                        for (size_t r = 0; r < registers_.size() && r < it_regs->second.size(); ++r) {
+                            registers_[r] = it_regs->second[r];
+                        }
+                    }
+                    if (it_acc != loop_phi_acc.end()) {
+                        acc_ = it_acc->second;
+                    }
                 }
                 break;
             }
             case Opcode::JumpIfFalse: {
                 int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;
-                (void)offset;
                 Node* if_node = graph_->NewNode(NodeOp::If);
                 if_node->AddInput(cur_control_);
                 if_node->AddInput(acc_);
@@ -441,7 +567,12 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
                 Node* if_true = graph_->NewNode(NodeOp::IfTrue);
                 if_true->AddInput(if_node);
 
+                Node* if_false = graph_->NewNode(NodeOp::IfFalse);
+                if_false->AddInput(if_node);
+
                 cur_control_ = if_true;
+                size_t target_pc = pc + offset;
+                loop_exit_control[target_pc] = if_false;
                 break;
             }
             case Opcode::JumpIfTrue: {

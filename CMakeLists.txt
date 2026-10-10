@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/std:c++latest /W4 /permissive- /Zc:preprocessor)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic -fno-exceptions -fno-rtti)
+    add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 include_directories(include)

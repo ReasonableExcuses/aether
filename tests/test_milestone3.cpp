@@ -4,6 +4,9 @@
 #include "aether/heap_object.h"
 #include "aether/heap.h"
 #include <iostream>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 
 using namespace aether;

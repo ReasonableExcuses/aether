@@ -23,15 +23,20 @@ using NativeCallback = TaggedValue (*)(const std::vector<TaggedValue>& args);
 class JSNativeFunction : public HeapObject {
 public:
     JSNativeFunction(std::string_view name, NativeCallback callback, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::JSFunction, shape),
+        : HeapObject(HeapObjectType::JSNativeFunction, shape),
           name_(name),
           callback_(callback) {}
+    JSNativeFunction(JSNativeFunction&& other) noexcept = default;
 
     const std::string& Name() const noexcept { return name_; }
     NativeCallback Callback() const noexcept { return callback_; }
 
     size_t ObjectSize() const override { return sizeof(JSNativeFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSNativeFunction(std::move(*this));
+    }
 
 private:
     std::string name_;

@@ -191,6 +191,8 @@ public:
     // Global Value Numbering (GVN) Hash Consing
     Node* GVN(Node* node);
 
+    std::vector<Node*> Schedule() const;
+
     void Dump(std::ostream& os = std::cout) const;
 
 private:
