@@ -24,7 +24,8 @@ public:
         : bytecode_(bytecode),
           this_value_(this_val),
           environment_(env),
-          registers_(bytecode.RegisterCount(), TaggedValue::Undefined()) {
+          registers_(bytecode.RegisterCount(), TaggedValue::Undefined()),
+          args_(args) {
         // Copy incoming arguments into registers if specified
         for (size_t i = 0; i < args.size() && i < registers_.size(); ++i) {
             registers_[i] = args[i];
@@ -66,6 +67,7 @@ public:
     }
 
     const BytecodeArray& GetBytecode() const noexcept { return bytecode_; }
+    const std::vector<TaggedValue>& Args() const noexcept { return args_; }
 
 private:
     const BytecodeArray& bytecode_;
@@ -73,6 +75,7 @@ private:
     LexicalEnvironment* environment_{nullptr};
     std::vector<TaggedValue> registers_;
     std::vector<ExceptionHandler> handlers_;
+    const std::vector<TaggedValue>& args_;
 };
 
 /**

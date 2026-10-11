@@ -56,6 +56,8 @@ enum class Opcode : uint8_t {
     Jump,               // [Op, offset: i32]           pc += offset
     JumpIfTrue,         // [Op, offset: i32]           if (ToBoolean(acc)) pc += offset
     JumpIfFalse,        // [Op, offset: i32]           if (!ToBoolean(acc)) pc += offset
+    JumpIfNotNullish,   // [Op, offset: i32]           if (!acc.IsNull() && !acc.IsUndefined()) pc += offset
+    JumpIfNullish,      // [Op, offset: i32]           if (acc.IsNull() || acc.IsUndefined()) pc += offset
 
     // Object & Property Access (Inline Cache enabled)
     LdaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  acc = obj.name
@@ -76,6 +78,10 @@ enum class Opcode : uint8_t {
     CreateArray,            // [Op, start_reg: u8, count: u16] acc = new JSArray(...)
     Construct,              // [Op, ctor: u8, args: u8, count: u8, slot: u16]
     LdaThis,                // [Op]                    acc = this
+    ArrayPush,              // [Op, arr_reg: u8, val_reg: u8]  arr.push(val)
+    ArraySpread,            // [Op, target_reg: u8, src_reg: u8] arr.push(...src)
+    ObjectSpread,           // [Op, target_reg: u8, src_reg: u8] Object.assign(target, src)
+    CreateRestArray,        // [Op, dest_reg: u8, start_idx: u16] dest = args.slice(start_idx)
 
     // Closures & Lexical Scopes
     CreateClosure,          // [Op, const_idx: u16]    acc = new JSFunction(const[idx], env)

@@ -411,6 +411,22 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 }
                 break;
             }
+            case Opcode::JumpIfNotNullish: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (!acc_.IsNull() && !acc_.IsUndefined()) {
+                    pc += offset;
+                }
+                break;
+            }
+            case Opcode::JumpIfNullish: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (acc_.IsNull() || acc_.IsUndefined()) {
+                    pc += offset;
+                }
+                break;
+            }
             case Opcode::LdaNamed: {
                 uint8_t obj_reg = *pc++;
                 uint16_t name_idx = pc[0] | (pc[1] << 8);
@@ -633,6 +649,79 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     arr->SetElement(i, frame.GetRegister(static_cast<uint8_t>(start_reg + i)));
                 }
                 acc_ = TaggedValue::FromHeapObject(arr);
+                break;
+            }
+            case Opcode::ArrayPush: {
+                uint8_t arr_reg = *pc++;
+                uint8_t val_reg = *pc++;
+                TaggedValue arr_val = frame.GetRegister(arr_reg);
+                TaggedValue val = frame.GetRegister(val_reg);
+                if (arr_val.IsHeapObject() && arr_val.AsHeapObject()->IsArray()) {
+                    static_cast<JSArray*>(arr_val.AsHeapObject())->Push(val);
+                }
+                break;
+            }
+            case Opcode::ArraySpread: {
+                uint8_t target_arr_reg = *pc++;
+                uint8_t src_reg = *pc++;
+                TaggedValue target_val = frame.GetRegister(target_arr_reg);
+                TaggedValue src_val = frame.GetRegister(src_reg);
+                if (target_val.IsHeapObject() && target_val.AsHeapObject()->IsArray()) {
+                    auto* target_arr = static_cast<JSArray*>(target_val.AsHeapObject());
+                    if (src_val.IsHeapObject()) {
+                        HeapObject* src_obj = src_val.AsHeapObject();
+                        if (src_obj->IsArray()) {
+                            auto* src_arr = static_cast<JSArray*>(src_obj);
+                            for (size_t i = 0; i < src_arr->Length(); ++i) {
+                                target_arr->Push(src_arr->GetElement(i));
+                            }
+                        } else if (src_obj->IsTypedArray()) {
+                            auto* src_ta = static_cast<JSTypedArray*>(src_obj);
+                            for (size_t i = 0; i < src_ta->Length(); ++i) {
+                                target_arr->Push(src_ta->GetElement(i));
+                            }
+                        } else if (src_obj->IsString()) {
+                            auto* src_str = static_cast<JSString*>(src_obj);
+                            for (size_t i = 0; i < src_str->Length(); ++i) {
+                                target_arr->Push(TaggedValue::FromHeapObject(new JSString(src_str->View().substr(i, 1))));
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case Opcode::ObjectSpread: {
+                uint8_t target_reg = *pc++;
+                uint8_t src_reg = *pc++;
+                TaggedValue target_val = frame.GetRegister(target_reg);
+                TaggedValue src_val = frame.GetRegister(src_reg);
+                if (target_val.IsHeapObject() && target_val.AsHeapObject()->IsJSObject() &&
+                    src_val.IsHeapObject() && src_val.AsHeapObject()->IsJSObject()) {
+                    auto* target_obj = static_cast<JSObject*>(target_val.AsHeapObject());
+                    auto* source_obj = static_cast<JSObject*>(src_val.AsHeapObject());
+                    const Shape* s = source_obj->GetShape();
+                    if (s) {
+                        for (const auto& [prop_name, desc] : s->GetPropertyMap()) {
+                            TaggedValue val = source_obj->GetNamedProperty(prop_name);
+                            target_obj->SetNamedProperty(prop_name, val, next_shape_id_);
+                        }
+                    }
+                }
+                break;
+            }
+            case Opcode::CreateRestArray: {
+                uint8_t dest_reg = *pc++;
+                uint16_t start_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+                size_t count = (frame.Args().size() > start_idx) ? (frame.Args().size() - start_idx) : 0;
+                auto* arr = new JSArray(GetRootShape(), count);
+                if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                    arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+                }
+                for (size_t i = 0; i < count; ++i) {
+                    arr->SetElement(i, frame.Args()[start_idx + i]);
+                }
+                frame.SetRegister(dest_reg, TaggedValue::FromHeapObject(arr));
                 break;
             }
             case Opcode::LdaKeyed: {

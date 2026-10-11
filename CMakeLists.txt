@@ -71,7 +71,11 @@ target_link_libraries(test_milestone11_typed_arrays PRIVATE aether_core)
 add_executable(test_test262_harness tests/test_test262_harness.cpp)
 target_link_libraries(test_test262_harness PRIVATE aether_core)
 
+add_executable(test_milestone12_modern_syntax tests/test_milestone12_modern_syntax.cpp)
+target_link_libraries(test_milestone12_modern_syntax PRIVATE aether_core)
+
 add_executable(aether src/main.cpp)
 target_link_libraries(aether PRIVATE aether_core)
+
 
 

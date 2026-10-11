@@ -76,6 +76,14 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::GreaterGreater:    return ">>";
         case TokenKind::PlusPlus:          return "++";
         case TokenKind::MinusMinus:        return "--";
+        case TokenKind::QuestionQuestion:  return "??";
+        case TokenKind::QuestionDot:       return "?.";
+        case TokenKind::QuestionQuestionEqual: return "??=";
+        case TokenKind::AmpAmpEqual:       return "&&=";
+        case TokenKind::BarBarEqual:       return "||=";
+        case TokenKind::DotDotDot:         return "...";
+        case TokenKind::Arrow:             return "=>";
+        case TokenKind::Backtick:          return "`";
         default:                           return "<Unknown>";
     }
 }
@@ -199,6 +207,12 @@ Token Lexer::NextToken() {
         return ScanString(Advance());
     }
 
+    // Template Literals
+    if (c == '`') {
+        Advance(); // Consume opening backtick
+        return ScanTemplateLiteral();
+    }
+
     // Single / Double character operators & punctuators
     Advance();
     switch (c) {
@@ -210,9 +224,22 @@ Token Lexer::NextToken() {
         case ']': return Token{TokenKind::CloseBracket, "]", 0, false, 0, loc};
         case ';': return Token{TokenKind::Semicolon, ";", 0, false, 0, loc};
         case ',': return Token{TokenKind::Comma, ",", 0, false, 0, loc};
-        case '.': return Token{TokenKind::Dot, ".", 0, false, 0, loc};
+        case '.':
+            if (Peek() == '.' && PeekNext() == '.') {
+                Advance(); Advance();
+                return Token{TokenKind::DotDotDot, "...", 0, false, 0, loc};
+            }
+            return Token{TokenKind::Dot, ".", 0, false, 0, loc};
         case ':': return Token{TokenKind::Colon, ":", 0, false, 0, loc};
-        case '?': return Token{TokenKind::Question, "?", 0, false, 0, loc};
+        case '?':
+            if (Match('?')) {
+                if (Match('=')) return Token{TokenKind::QuestionQuestionEqual, "??=", 0, false, 0, loc};
+                return Token{TokenKind::QuestionQuestion, "??", 0, false, 0, loc};
+            }
+            if (Match('.')) {
+                return Token{TokenKind::QuestionDot, "?.", 0, false, 0, loc};
+            }
+            return Token{TokenKind::Question, "?", 0, false, 0, loc};
         case '~': return Token{TokenKind::Tilde, "~", 0, false, 0, loc};
         case '^': return Token{TokenKind::Caret, "^", 0, false, 0, loc};
 
@@ -238,6 +265,9 @@ Token Lexer::NextToken() {
             return Token{TokenKind::Percent, "%", 0, false, 0, loc};
 
         case '=':
+            if (Match('>')) {
+                return Token{TokenKind::Arrow, "=>", 0, false, 0, loc};
+            }
             if (Match('=')) {
                 if (Match('=')) return Token{TokenKind::StrictEqual, "===", 0, false, 0, loc};
                 return Token{TokenKind::EqualEqual, "==", 0, false, 0, loc};
@@ -262,11 +292,17 @@ Token Lexer::NextToken() {
             return Token{TokenKind::Greater, ">", 0, false, 0, loc};
 
         case '&':
-            if (Match('&')) return Token{TokenKind::AmpAmp, "&&", 0, false, 0, loc};
+            if (Match('&')) {
+                if (Match('=')) return Token{TokenKind::AmpAmpEqual, "&&=", 0, false, 0, loc};
+                return Token{TokenKind::AmpAmp, "&&", 0, false, 0, loc};
+            }
             return Token{TokenKind::Ampersand, "&", 0, false, 0, loc};
 
         case '|':
-            if (Match('|')) return Token{TokenKind::BarBar, "||", 0, false, 0, loc};
+            if (Match('|')) {
+                if (Match('=')) return Token{TokenKind::BarBarEqual, "||=", 0, false, 0, loc};
+                return Token{TokenKind::BarBar, "||", 0, false, 0, loc};
+            }
             return Token{TokenKind::Bar, "|", 0, false, 0, loc};
 
         default:
@@ -401,6 +437,92 @@ Token Lexer::ScanString(char quote) {
     }
 
     return Token{TokenKind::String, result, 0.0, false, 0, loc};
+}
+
+Token Lexer::ScanTemplateLiteral() {
+    SourceLocation loc{line_, column_};
+    Token tok{TokenKind::Backtick, "", 0.0, false, 0, loc};
+
+    std::string current_quasi;
+    while (!IsAtEnd()) {
+        char c = Peek();
+        if (c == '`') {
+            Advance(); // Consume closing backtick
+            tok.template_quasis.push_back(std::move(current_quasi));
+            return tok;
+        } else if (c == '$' && PeekNext() == '{') {
+            Advance(); // Consume '$'
+            Advance(); // Consume '{'
+            tok.template_quasis.push_back(std::move(current_quasi));
+            current_quasi.clear();
+
+            // Scan embedded expression until closing '}'
+            int brace_depth = 1;
+            std::string expr_text;
+            while (!IsAtEnd() && brace_depth > 0) {
+                char ec = Peek();
+                if (ec == '{') {
+                    brace_depth++;
+                    expr_text.push_back(Advance());
+                } else if (ec == '}') {
+                    brace_depth--;
+                    if (brace_depth == 0) {
+                        Advance(); // Consume closing '}'
+                        break;
+                    }
+                    expr_text.push_back(Advance());
+                } else if (ec == '"' || ec == '\'') {
+                    char q = Advance();
+                    expr_text.push_back(q);
+                    while (!IsAtEnd() && Peek() != q) {
+                        if (Peek() == '\\') {
+                            expr_text.push_back(Advance());
+                        }
+                        if (!IsAtEnd()) expr_text.push_back(Advance());
+                    }
+                    if (!IsAtEnd()) expr_text.push_back(Advance());
+                } else if (ec == '`') {
+                    char q = Advance();
+                    expr_text.push_back(q);
+                    while (!IsAtEnd() && Peek() != '`') {
+                        if (Peek() == '\\') {
+                            expr_text.push_back(Advance());
+                        }
+                        if (!IsAtEnd()) expr_text.push_back(Advance());
+                    }
+                    if (!IsAtEnd()) expr_text.push_back(Advance());
+                } else {
+                    if (ec == '\n') {
+                        line_++;
+                        column_ = 1;
+                    }
+                    expr_text.push_back(Advance());
+                }
+            }
+            tok.template_exprs.push_back(std::move(expr_text));
+        } else if (c == '\\') {
+            Advance(); // Consume '\'
+            if (IsAtEnd()) break;
+            char esc = Advance();
+            switch (esc) {
+                case 'n': current_quasi.push_back('\n'); break;
+                case 't': current_quasi.push_back('\t'); break;
+                case 'r': current_quasi.push_back('\r'); break;
+                case '\\': current_quasi.push_back('\\'); break;
+                case '`': current_quasi.push_back('`'); break;
+                case '$': current_quasi.push_back('$'); break;
+                default: current_quasi.push_back(esc); break;
+            }
+        } else {
+            if (c == '\n') {
+                line_++;
+                column_ = 1;
+            }
+            current_quasi.push_back(Advance());
+        }
+    }
+    tok.template_quasis.push_back(std::move(current_quasi));
+    return tok;
 }
 
 } // namespace aether

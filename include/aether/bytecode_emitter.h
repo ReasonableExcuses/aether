@@ -43,6 +43,11 @@ public:
     void VisitIndexAccess(IndexAccessExpr* node) override;
     void VisitIndexAssign(IndexAssignExpr* node) override;
     void VisitConditional(ConditionalExpr* node) override;
+    void VisitTemplateLiteral(TemplateLiteralExpr* node) override;
+    void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) override;
+    void VisitOptionalIndexAccess(OptionalIndexAccessExpr* node) override;
+    void VisitOptionalCall(OptionalCallExpr* node) override;
+    void VisitSpread(SpreadExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;

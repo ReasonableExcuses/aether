@@ -64,6 +64,23 @@ public:
         node->ThenBranch()->Accept(this);
         node->ElseBranch()->Accept(this);
     }
+    void VisitTemplateLiteral(TemplateLiteralExpr* node) override {
+        for (const auto& e : node->Expressions()) e->Accept(this);
+    }
+    void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) override {
+        node->Object()->Accept(this);
+    }
+    void VisitOptionalIndexAccess(OptionalIndexAccessExpr* node) override {
+        node->Object()->Accept(this);
+        node->Index()->Accept(this);
+    }
+    void VisitOptionalCall(OptionalCallExpr* node) override {
+        node->Callee()->Accept(this);
+        for (const auto& a : node->Args()) a->Accept(this);
+    }
+    void VisitSpread(SpreadExpr* node) override {
+        node->GetExpr()->Accept(this);
+    }
     void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitVarDecl(VarDeclStmt* node) override {
         if (node->Initializer()) node->Initializer()->Accept(this);
@@ -233,6 +250,14 @@ std::unique_ptr<BytecodeArray> BytecodeEmitter::EmitFunction(FunctionDeclStmt* f
     for (uint32_t i = 0; i < param_count; ++i) {
         uint8_t reg = AllocateRegister();
         scope_[func->Params()[i]] = reg;
+    }
+
+    if (func->HasRest()) {
+        uint8_t rest_reg = AllocateRegister();
+        scope_[func->RestParam()] = rest_reg;
+        bytecode_->EmitOpcode(Opcode::CreateRestArray);
+        bytecode_->EmitU8(rest_reg);
+        bytecode_->EmitU16(static_cast<uint16_t>(param_count));
     }
 
     if (!context_slots_.empty()) {
@@ -614,15 +639,27 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
     bytecode_->EmitU8(obj_reg);
 
     for (const auto& [prop_name, expr] : node->Properties()) {
-        expr->Accept(this);
-        auto* s = new JSString(prop_name);
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
-        uint16_t slot = next_feedback_slot_++;
+        if (prop_name.empty() || dynamic_cast<SpreadExpr*>(expr.get()) != nullptr) {
+            Expr* target_expr = dynamic_cast<SpreadExpr*>(expr.get()) ? dynamic_cast<SpreadExpr*>(expr.get())->GetExpr() : expr.get();
+            target_expr->Accept(this);
+            uint8_t src_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(src_reg);
+            bytecode_->EmitOpcode(Opcode::ObjectSpread);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU8(src_reg);
+            FreeRegister(src_reg);
+        } else {
+            expr->Accept(this);
+            auto* s = new JSString(prop_name);
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
+            uint16_t slot = next_feedback_slot_++;
 
-        bytecode_->EmitOpcode(Opcode::StaNamed);
-        bytecode_->EmitU8(obj_reg);
-        bytecode_->EmitU16(name_idx);
-        bytecode_->EmitU16(slot);
+            bytecode_->EmitOpcode(Opcode::StaNamed);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+        }
     }
 
     bytecode_->EmitOpcode(Opcode::Ldar);
@@ -631,20 +668,64 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
 }
 
 void BytecodeEmitter::VisitArrayLiteral(ArrayLiteralExpr* node) {
-    uint8_t count = static_cast<uint8_t>(node->Elements().size());
-    uint8_t args_start = AllocateRegisterRange(count);
-
-    for (uint8_t i = 0; i < count; ++i) {
-        node->Elements()[i]->Accept(this);
-        bytecode_->EmitOpcode(Opcode::Star);
-        bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+    bool has_spread = false;
+    for (const auto& el : node->Elements()) {
+        if (dynamic_cast<SpreadExpr*>(el.get()) != nullptr) {
+            has_spread = true;
+            break;
+        }
     }
 
-    bytecode_->EmitOpcode(Opcode::CreateArray);
-    bytecode_->EmitU8(args_start);
-    bytecode_->EmitU16(count);
+    if (!has_spread) {
+        uint8_t count = static_cast<uint8_t>(node->Elements().size());
+        uint8_t args_start = AllocateRegisterRange(count);
 
-    FreeRegisterRange(args_start, count);
+        for (uint8_t i = 0; i < count; ++i) {
+            node->Elements()[i]->Accept(this);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+        }
+
+        bytecode_->EmitOpcode(Opcode::CreateArray);
+        bytecode_->EmitU8(args_start);
+        bytecode_->EmitU16(count);
+
+        FreeRegisterRange(args_start, count);
+        return;
+    }
+
+    uint8_t arr_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::CreateArray);
+    bytecode_->EmitU8(0);
+    bytecode_->EmitU16(0);
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(arr_reg);
+
+    for (const auto& el : node->Elements()) {
+        if (auto* sp = dynamic_cast<SpreadExpr*>(el.get())) {
+            sp->GetExpr()->Accept(this);
+            uint8_t src_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(src_reg);
+            bytecode_->EmitOpcode(Opcode::ArraySpread);
+            bytecode_->EmitU8(arr_reg);
+            bytecode_->EmitU8(src_reg);
+            FreeRegister(src_reg);
+        } else {
+            el->Accept(this);
+            uint8_t val_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(val_reg);
+            bytecode_->EmitOpcode(Opcode::ArrayPush);
+            bytecode_->EmitU8(arr_reg);
+            bytecode_->EmitU8(val_reg);
+            FreeRegister(val_reg);
+        }
+    }
+
+    bytecode_->EmitOpcode(Opcode::Ldar);
+    bytecode_->EmitU8(arr_reg);
+    FreeRegister(arr_reg);
 }
 
 void BytecodeEmitter::VisitIndexAccess(IndexAccessExpr* node) {
@@ -716,6 +797,14 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
         node->Lhs()->Accept(this);
         Label short_circuit;
         EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        Bind(short_circuit);
+        return;
+    }
+    if (node->Op() == BinaryOp::NullishCoalescing) {
+        node->Lhs()->Accept(this);
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfNotNullish, short_circuit);
         node->Rhs()->Accept(this);
         Bind(short_circuit);
         return;
@@ -987,9 +1076,9 @@ void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
 
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
-    auto fn_bc = std::make_unique<BytecodeArray>();
+    sub_emitter.bytecode_ = std::make_unique<BytecodeArray>();
     uint32_t param_count = static_cast<uint32_t>(node->Params().size());
-    fn_bc->SetParameterCount(param_count);
+    sub_emitter.bytecode_->SetParameterCount(param_count);
 
     sub_emitter.ScanAndSetupContextSlots(node->Params(), node->Body());
 
@@ -998,7 +1087,13 @@ void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
         sub_emitter.scope_[node->Params()[i]] = reg;
     }
 
-    sub_emitter.bytecode_ = std::move(fn_bc);
+    if (node->HasRest()) {
+        uint8_t rest_reg = sub_emitter.AllocateRegister();
+        sub_emitter.scope_[node->RestParam()] = rest_reg;
+        sub_emitter.bytecode_->EmitOpcode(Opcode::CreateRestArray);
+        sub_emitter.bytecode_->EmitU8(rest_reg);
+        sub_emitter.bytecode_->EmitU16(static_cast<uint16_t>(param_count));
+    }
 
     if (!sub_emitter.context_slots_.empty()) {
         sub_emitter.bytecode_->EmitOpcode(Opcode::CreateFunctionContext);
@@ -1153,6 +1248,158 @@ void BytecodeEmitter::VisitProgram(Program* node) {
     for (const auto& stmt : node->Statements()) {
         stmt->Accept(this);
     }
+}
+
+void BytecodeEmitter::VisitTemplateLiteral(TemplateLiteralExpr* node) {
+    assert(node->Quasis().size() == node->Expressions().size() + 1);
+
+    auto* s0 = new JSString(node->Quasis()[0]);
+    uint16_t c0 = bytecode_->AddConstant(TaggedValue::FromHeapObject(s0));
+    bytecode_->EmitOpcode(Opcode::LdaConstant);
+    bytecode_->EmitU16(c0);
+
+    for (size_t i = 0; i < node->Expressions().size(); ++i) {
+        uint8_t lhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(lhs_reg);
+
+        node->Expressions()[i]->Accept(this);
+        uint8_t rhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rhs_reg);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(lhs_reg);
+        uint16_t add_slot1 = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::Add);
+        bytecode_->EmitU8(rhs_reg);
+        bytecode_->EmitU16(add_slot1);
+
+        FreeRegister(rhs_reg);
+        FreeRegister(lhs_reg);
+
+        if (!node->Quasis()[i + 1].empty()) {
+            uint8_t str_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(str_reg);
+
+            auto* q_str = new JSString(node->Quasis()[i + 1]);
+            uint16_t q_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(q_str));
+            uint8_t q_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(q_idx);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(q_reg);
+
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(str_reg);
+            uint16_t add_slot2 = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::Add);
+            bytecode_->EmitU8(q_reg);
+            bytecode_->EmitU16(add_slot2);
+
+            FreeRegister(q_reg);
+            FreeRegister(str_reg);
+        }
+    }
+}
+
+void BytecodeEmitter::VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) {
+    node->Object()->Accept(this);
+    Label is_nullish;
+    Label done;
+    EmitJump(Opcode::JumpIfNullish, is_nullish);
+
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    auto* s = new JSString(node->Property());
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
+    uint16_t slot = next_feedback_slot_++;
+
+    bytecode_->EmitOpcode(Opcode::LdaNamed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+    bytecode_->EmitU16(slot);
+    FreeRegister(obj_reg);
+
+    EmitJump(Opcode::Jump, done);
+
+    Bind(is_nullish);
+    bytecode_->EmitOpcode(Opcode::LdaUndefined);
+
+    Bind(done);
+}
+
+void BytecodeEmitter::VisitOptionalIndexAccess(OptionalIndexAccessExpr* node) {
+    node->Object()->Accept(this);
+    Label is_nullish;
+    Label done;
+    EmitJump(Opcode::JumpIfNullish, is_nullish);
+
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    node->Index()->Accept(this);
+    uint8_t idx_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(idx_reg);
+
+    uint16_t slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(idx_reg);
+    bytecode_->EmitU16(slot);
+
+    FreeRegister(idx_reg);
+    FreeRegister(obj_reg);
+    EmitJump(Opcode::Jump, done);
+
+    Bind(is_nullish);
+    bytecode_->EmitOpcode(Opcode::LdaUndefined);
+
+    Bind(done);
+}
+
+void BytecodeEmitter::VisitOptionalCall(OptionalCallExpr* node) {
+    node->Callee()->Accept(this);
+    Label is_nullish;
+    Label done;
+    EmitJump(Opcode::JumpIfNullish, is_nullish);
+
+    uint8_t callee_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(callee_reg);
+
+    uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+    uint8_t args_start = AllocateRegisterRange(arg_count);
+    for (uint8_t i = 0; i < arg_count; ++i) {
+        node->Args()[i]->Accept(this);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+    }
+
+    uint16_t slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::Call);
+    bytecode_->EmitU8(callee_reg);
+    bytecode_->EmitU8(args_start);
+    bytecode_->EmitU8(arg_count);
+    bytecode_->EmitU16(slot);
+
+    FreeRegisterRange(args_start, arg_count);
+    FreeRegister(callee_reg);
+    EmitJump(Opcode::Jump, done);
+
+    Bind(is_nullish);
+    bytecode_->EmitOpcode(Opcode::LdaUndefined);
+
+    Bind(done);
+}
+
+void BytecodeEmitter::VisitSpread(SpreadExpr* node) {
+    node->GetExpr()->Accept(this);
 }
 
 } // namespace aether

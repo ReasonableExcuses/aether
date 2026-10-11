@@ -33,6 +33,7 @@ enum class BinaryOp {
     GreaterThanOrEqual,
     LogicalAnd,
     LogicalOr,
+    NullishCoalescing,
     InstanceOf
 };
 
@@ -250,6 +251,73 @@ private:
     std::unique_ptr<Expr> else_branch_;
 };
 
+class TemplateLiteralExpr : public Expr {
+public:
+    TemplateLiteralExpr(std::vector<std::string> quasis, std::vector<std::unique_ptr<Expr>> exprs)
+        : quasis_(std::move(quasis)), expressions_(std::move(exprs)) {}
+
+    const std::vector<std::string>& Quasis() const noexcept { return quasis_; }
+    const std::vector<std::unique_ptr<Expr>>& Expressions() const noexcept { return expressions_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::vector<std::string> quasis_;
+    std::vector<std::unique_ptr<Expr>> expressions_;
+};
+
+class OptionalPropertyAccessExpr : public Expr {
+public:
+    OptionalPropertyAccessExpr(std::unique_ptr<Expr> obj, std::string_view prop)
+        : object_(std::move(obj)), property_(prop) {}
+
+    Expr* Object() const noexcept { return object_.get(); }
+    const std::string& Property() const noexcept { return property_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> object_;
+    std::string property_;
+};
+
+class OptionalIndexAccessExpr : public Expr {
+public:
+    OptionalIndexAccessExpr(std::unique_ptr<Expr> obj, std::unique_ptr<Expr> index)
+        : object_(std::move(obj)), index_(std::move(index)) {}
+
+    Expr* Object() const noexcept { return object_.get(); }
+    Expr* Index() const noexcept { return index_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> object_;
+    std::unique_ptr<Expr> index_;
+};
+
+class OptionalCallExpr : public Expr {
+public:
+    OptionalCallExpr(std::unique_ptr<Expr> callee, std::vector<std::unique_ptr<Expr>> args)
+        : callee_(std::move(callee)), args_(std::move(args)) {}
+
+    Expr* Callee() const noexcept { return callee_.get(); }
+    const std::vector<std::unique_ptr<Expr>>& Args() const noexcept { return args_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> callee_;
+    std::vector<std::unique_ptr<Expr>> args_;
+};
+
+class SpreadExpr : public Expr {
+public:
+    explicit SpreadExpr(std::unique_ptr<Expr> expr) : expr_(std::move(expr)) {}
+
+    Expr* GetExpr() const noexcept { return expr_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> expr_;
+};
+
 // Statements
 class Stmt : public ASTNode {};
 
@@ -346,12 +414,19 @@ public:
     const std::string& Name() const noexcept { return name_; }
     const std::vector<std::string>& Params() const noexcept { return params_; }
     BlockStmt* Body() const noexcept { return body_.get(); }
+
+    bool HasRest() const noexcept { return has_rest_; }
+    const std::string& RestParam() const noexcept { return rest_param_; }
+    void SetRest(std::string_view r) { has_rest_ = true; rest_param_ = r; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
     std::string name_;
     std::vector<std::string> params_;
     std::unique_ptr<BlockStmt> body_;
+    bool has_rest_{false};
+    std::string rest_param_;
 };
 
 class FunctionExpr : public Expr {
@@ -362,12 +437,19 @@ public:
     const std::string& Name() const noexcept { return name_; }
     const std::vector<std::string>& Params() const noexcept { return params_; }
     BlockStmt* Body() const noexcept { return body_.get(); }
+
+    bool HasRest() const noexcept { return has_rest_; }
+    const std::string& RestParam() const noexcept { return rest_param_; }
+    void SetRest(std::string_view r) { has_rest_ = true; rest_param_ = r; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
     std::string name_;
     std::vector<std::string> params_;
     std::unique_ptr<BlockStmt> body_;
+    bool has_rest_{false};
+    std::string rest_param_;
 };
 
 class ReturnStmt : public Stmt {
@@ -456,6 +538,11 @@ public:
     virtual void VisitIndexAccess(IndexAccessExpr* node) = 0;
     virtual void VisitIndexAssign(IndexAssignExpr* node) = 0;
     virtual void VisitConditional(ConditionalExpr* node) = 0;
+    virtual void VisitTemplateLiteral(TemplateLiteralExpr* node) = 0;
+    virtual void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) = 0;
+    virtual void VisitOptionalIndexAccess(OptionalIndexAccessExpr* node) = 0;
+    virtual void VisitOptionalCall(OptionalCallExpr* node) = 0;
+    virtual void VisitSpread(SpreadExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -486,6 +573,11 @@ inline void ArrayLiteralExpr::Accept(ASTVisitor* v) { v->VisitArrayLiteral(this)
 inline void IndexAccessExpr::Accept(ASTVisitor* v) { v->VisitIndexAccess(this); }
 inline void IndexAssignExpr::Accept(ASTVisitor* v) { v->VisitIndexAssign(this); }
 inline void ConditionalExpr::Accept(ASTVisitor* v) { v->VisitConditional(this); }
+inline void TemplateLiteralExpr::Accept(ASTVisitor* v) { v->VisitTemplateLiteral(this); }
+inline void OptionalPropertyAccessExpr::Accept(ASTVisitor* v) { v->VisitOptionalPropertyAccess(this); }
+inline void OptionalIndexAccessExpr::Accept(ASTVisitor* v) { v->VisitOptionalIndexAccess(this); }
+inline void OptionalCallExpr::Accept(ASTVisitor* v) { v->VisitOptionalCall(this); }
+inline void SpreadExpr::Accept(ASTVisitor* v) { v->VisitSpread(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }

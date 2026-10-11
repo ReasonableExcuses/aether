@@ -36,6 +36,8 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
+        case Opcode::JumpIfNotNullish:   return "JumpIfNotNullish";
+        case Opcode::JumpIfNullish:      return "JumpIfNullish";
         case Opcode::LdaNamed:           return "LdaNamed";
         case Opcode::StaNamed:           return "StaNamed";
         case Opcode::LdaKeyed:           return "LdaKeyed";
@@ -50,6 +52,10 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::CreateArray:        return "CreateArray";
         case Opcode::Construct:          return "Construct";
         case Opcode::LdaThis:            return "LdaThis";
+        case Opcode::ArrayPush:          return "ArrayPush";
+        case Opcode::ArraySpread:        return "ArraySpread";
+        case Opcode::ObjectSpread:       return "ObjectSpread";
+        case Opcode::CreateRestArray:    return "CreateRestArray";
         case Opcode::CreateClosure:      return "CreateClosure";
         case Opcode::CreateFunctionContext: return "CreateFunctionContext";
         case Opcode::LdaContextSlot:     return "LdaContextSlot";
@@ -163,7 +169,9 @@ std::string BytecodeArray::Disassemble() const {
             }
             case Opcode::Jump:
             case Opcode::JumpIfTrue:
-            case Opcode::JumpIfFalse: {
+            case Opcode::JumpIfFalse:
+            case Opcode::JumpIfNotNullish:
+            case Opcode::JumpIfNullish: {
                 int32_t offset = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
                 pc += 4;
                 ss << "offset: " << offset << " -> [0x" << std::hex << (pc + offset) << std::dec << "]";
@@ -188,6 +196,26 @@ std::string BytecodeArray::Disassemble() const {
                 pc += 2;
                 ss << "r" << static_cast<int>(obj) << "[r" << static_cast<int>(key) << "]"
                    << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::ArrayPush: {
+                uint8_t arr = bytes_[pc++];
+                uint8_t val = bytes_[pc++];
+                ss << "arr: r" << static_cast<int>(arr) << ", val: r" << static_cast<int>(val);
+                break;
+            }
+            case Opcode::ArraySpread:
+            case Opcode::ObjectSpread: {
+                uint8_t target = bytes_[pc++];
+                uint8_t src = bytes_[pc++];
+                ss << "target: r" << static_cast<int>(target) << ", src: r" << static_cast<int>(src);
+                break;
+            }
+            case Opcode::CreateRestArray: {
+                uint8_t dest = bytes_[pc++];
+                uint16_t start_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "dest: r" << static_cast<int>(dest) << ", start_idx: " << start_idx;
                 break;
             }
             case Opcode::CreateArray: {

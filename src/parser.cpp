@@ -46,10 +46,14 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::MinusEqual:
         case TokenKind::StarEqual:
         case TokenKind::SlashEqual:
+        case TokenKind::AmpAmpEqual:
+        case TokenKind::BarBarEqual:
+        case TokenKind::QuestionQuestionEqual:
             return Precedence::Assignment;
         case TokenKind::Question:
             return Precedence::Conditional;
         case TokenKind::BarBar:
+        case TokenKind::QuestionQuestion:
             return Precedence::LogicalOr;
         case TokenKind::AmpAmp:
             return Precedence::LogicalAnd;
@@ -85,6 +89,7 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::MinusMinus:
             return Precedence::Call;
         case TokenKind::Dot:
+        case TokenKind::QuestionDot:
         case TokenKind::OpenBracket:
             return Precedence::Member;
         default:
@@ -138,6 +143,68 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
 }
 
 std::unique_ptr<Stmt> Parser::ParseVarDecl() {
+    // 1. Array destructuring: let [a, b, c] = expr;
+    if (Match(TokenKind::OpenBracket)) {
+        std::vector<std::string> names;
+        if (!Check(TokenKind::CloseBracket)) {
+            do {
+                Token elem_tok = Consume(TokenKind::Identifier, "Expected identifier in array destructuring");
+                names.push_back(elem_tok.text);
+            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
+        }
+        Consume(TokenKind::CloseBracket, "Expected ']' in array destructuring");
+        Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
+        auto rhs = ParseExpression();
+        Match(TokenKind::Semicolon);
+
+        static uint32_t s_destruct_arr_id = 0;
+        std::string temp_var = "$d_arr_" + std::to_string(++s_destruct_arr_id);
+        auto block = std::make_unique<BlockStmt>();
+        block->AddStatement(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
+        for (size_t i = 0; i < names.size(); ++i) {
+            auto idx_access = std::make_unique<IndexAccessExpr>(
+                std::make_unique<IdentifierExpr>(temp_var),
+                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
+            );
+            block->AddStatement(std::make_unique<VarDeclStmt>(names[i], std::move(idx_access)));
+        }
+        return block;
+    }
+
+    // 2. Object destructuring: let { a, b: c } = expr;
+    if (Match(TokenKind::OpenBrace)) {
+        std::vector<std::pair<std::string, std::string>> bindings;
+        if (!Check(TokenKind::CloseBrace)) {
+            do {
+                Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
+                std::string local_var = prop_tok.text;
+                if (Match(TokenKind::Colon)) {
+                    Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
+                    local_var = alias_tok.text;
+                }
+                bindings.emplace_back(prop_tok.text, local_var);
+            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+        }
+        Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
+        Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
+        auto rhs = ParseExpression();
+        Match(TokenKind::Semicolon);
+
+        static uint32_t s_destruct_obj_id = 0;
+        std::string temp_var = "$d_obj_" + std::to_string(++s_destruct_obj_id);
+        auto block = std::make_unique<BlockStmt>();
+        block->AddStatement(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
+        for (const auto& [prop, local] : bindings) {
+            auto prop_access = std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>(temp_var),
+                prop
+            );
+            block->AddStatement(std::make_unique<VarDeclStmt>(local, std::move(prop_access)));
+        }
+        return block;
+    }
+
+    // 3. Regular variable declaration: let x = expr;
     Token name_tok = Consume(TokenKind::Identifier, "Expected identifier in variable declaration");
     std::unique_ptr<Expr> init = nullptr;
     if (Match(TokenKind::Equal)) {
@@ -153,18 +220,33 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl() {
     Consume(TokenKind::OpenParen, "Expected '(' after function name");
 
     std::vector<std::string> params;
+    std::string rest_param = "";
     if (!Check(TokenKind::CloseParen)) {
-        Token param = Consume(TokenKind::Identifier, "Expected parameter name");
-        params.push_back(param.text);
-        while (Match(TokenKind::Comma)) {
-            Token next_param = Consume(TokenKind::Identifier, "Expected parameter name after ','");
-            params.push_back(next_param.text);
+        if (Match(TokenKind::DotDotDot)) {
+            Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+            rest_param = r.text;
+        } else {
+            Token param = Consume(TokenKind::Identifier, "Expected parameter name");
+            params.push_back(param.text);
+            while (Match(TokenKind::Comma)) {
+                if (Match(TokenKind::DotDotDot)) {
+                    Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                    rest_param = r.text;
+                    break;
+                }
+                Token next_param = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                params.push_back(next_param.text);
+            }
         }
     }
     Consume(TokenKind::CloseParen, "Expected ')' after parameters");
 
     std::unique_ptr<BlockStmt> body = ParseBlock();
-    return std::make_unique<FunctionDeclStmt>(name_tok.text, std::move(params), std::move(body));
+    auto fn_decl = std::make_unique<FunctionDeclStmt>(name_tok.text, std::move(params), std::move(body));
+    if (!rest_param.empty()) {
+        fn_decl->SetRest(rest_param);
+    }
+    return fn_decl;
 }
 
 std::unique_ptr<Stmt> Parser::ParseIf() {
@@ -330,18 +412,117 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<LiteralExpr>(TaggedValue::Null());
         case TokenKind::Undefined:
             return std::make_unique<LiteralExpr>(TaggedValue::Undefined());
-        case TokenKind::Identifier:
+        case TokenKind::Backtick: {
+            if (tok.template_exprs.empty()) {
+                auto* s = new JSString(tok.template_quasis.empty() ? "" : tok.template_quasis[0]);
+                return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(s));
+            }
+            std::vector<std::unique_ptr<Expr>> expr_nodes;
+            for (const auto& expr_str : tok.template_exprs) {
+                Lexer sub_lexer(expr_str);
+                Parser sub_parser(sub_lexer);
+                expr_nodes.push_back(sub_parser.ParseExpression());
+            }
+            return std::make_unique<TemplateLiteralExpr>(std::move(tok.template_quasis), std::move(expr_nodes));
+        }
+        case TokenKind::DotDotDot: {
+            return std::make_unique<SpreadExpr>(ParseExpression());
+        }
+        case TokenKind::Identifier: {
+            if (Match(TokenKind::Arrow)) {
+                std::vector<std::string> params = {tok.text};
+                if (Check(TokenKind::OpenBrace)) {
+                    auto body = ParseBlock();
+                    return std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+                } else {
+                    auto arrow_expr = ParseExpression();
+                    auto body = std::make_unique<BlockStmt>();
+                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                    return std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+                }
+            }
             return std::make_unique<IdentifierExpr>(tok.text);
+        }
         case TokenKind::OpenParen: {
+            Lexer saved_lexer = lexer_;
+            Token saved_tok = current_token_;
+
+            // Check if this looks like arrow parameters: ( [param [, param]* [, ...rest]?]? ) =>
+            bool is_arrow = false;
+            std::vector<std::string> arrow_params;
+            std::string arrow_rest;
+
+            if (Check(TokenKind::CloseParen)) {
+                Advance();
+                if (Match(TokenKind::Arrow)) {
+                    is_arrow = true;
+                }
+            } else {
+                while (true) {
+                    if (Match(TokenKind::DotDotDot)) {
+                        if (Check(TokenKind::Identifier)) {
+                            arrow_rest = Advance().text;
+                            if (Check(TokenKind::CloseParen)) {
+                                Advance();
+                                if (Match(TokenKind::Arrow)) {
+                                    is_arrow = true;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    if (Check(TokenKind::Identifier)) {
+                        arrow_params.push_back(Advance().text);
+                        if (Match(TokenKind::Comma)) {
+                            continue;
+                        }
+                        if (Check(TokenKind::CloseParen)) {
+                            Advance();
+                            if (Match(TokenKind::Arrow)) {
+                                is_arrow = true;
+                            }
+                            break;
+                        }
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if (is_arrow) {
+                std::unique_ptr<BlockStmt> body;
+                if (Check(TokenKind::OpenBrace)) {
+                    body = ParseBlock();
+                } else {
+                    auto arrow_expr = ParseExpression();
+                    body = std::make_unique<BlockStmt>();
+                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                }
+                auto fn_expr = std::make_unique<FunctionExpr>("", std::move(arrow_params), std::move(body));
+                if (!arrow_rest.empty()) {
+                    fn_expr->SetRest(arrow_rest);
+                }
+                return fn_expr;
+            }
+
+            // Fallback: restore lexer and current token, parse parenthesized expression
+            lexer_ = saved_lexer;
+            current_token_ = saved_tok;
             auto expr = ParseExpression();
             Consume(TokenKind::CloseParen, "Expected ')' after expression");
             return expr;
         }
         case TokenKind::OpenBrace: {
-            // Object literal: { key: val, ... }
+            // Object literal: { key: val, ...spread }
             std::vector<std::pair<std::string, std::unique_ptr<Expr>>> props;
             if (!Check(TokenKind::CloseBrace)) {
                 do {
+                    if (Match(TokenKind::DotDotDot)) {
+                        auto spread_expr = ParseExpression();
+                        props.emplace_back("", std::make_unique<SpreadExpr>(std::move(spread_expr)));
+                        continue;
+                    }
                     Token key_tok = Advance();
                     if (key_tok.kind != TokenKind::Identifier && key_tok.kind != TokenKind::String) {
                         throw std::runtime_error("Expected property key in object literal");
@@ -355,7 +536,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<ObjectLiteralExpr>(std::move(props));
         }
         case TokenKind::OpenBracket: {
-            // Array literal: [ elem1, elem2, ... ]
+            // Array literal: [ elem1, ...spread, elem2 ]
             std::vector<std::unique_ptr<Expr>> elements;
             if (!Check(TokenKind::CloseBracket)) {
                 elements.push_back(ParseExpression());
@@ -443,23 +624,86 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
 }
 
 std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_token) {
-    if (op_token.kind == TokenKind::Equal) {
-        // Assignment
+    if (op_token.kind == TokenKind::Equal ||
+        op_token.kind == TokenKind::PlusEqual ||
+        op_token.kind == TokenKind::MinusEqual ||
+        op_token.kind == TokenKind::StarEqual ||
+        op_token.kind == TokenKind::SlashEqual ||
+        op_token.kind == TokenKind::AmpAmpEqual ||
+        op_token.kind == TokenKind::BarBarEqual ||
+        op_token.kind == TokenKind::QuestionQuestionEqual) {
+
         auto rhs = ParseExpression(Precedence::Assignment);
+
+        if (op_token.kind == TokenKind::Equal) {
+            if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
+                return std::make_unique<AssignExpr>(id->Name(), std::move(rhs));
+            }
+            if (auto* prop = dynamic_cast<PropertyAccessExpr*>(lhs.get())) {
+                std::string prop_name = prop->Property();
+                auto obj = prop->ReleaseObject();
+                return std::make_unique<PropertyAssignExpr>(std::move(obj), prop_name, std::move(rhs));
+            }
+            if (auto* idx = dynamic_cast<IndexAccessExpr*>(lhs.get())) {
+                auto obj = idx->ReleaseObject();
+                auto index = idx->ReleaseIndex();
+                return std::make_unique<IndexAssignExpr>(std::move(obj), std::move(index), std::move(rhs));
+            }
+            throw std::runtime_error("Invalid assignment target");
+        }
+
+        BinaryOp bin_op;
+        switch (op_token.kind) {
+            case TokenKind::PlusEqual:               bin_op = BinaryOp::Add; break;
+            case TokenKind::MinusEqual:              bin_op = BinaryOp::Sub; break;
+            case TokenKind::StarEqual:               bin_op = BinaryOp::Mul; break;
+            case TokenKind::SlashEqual:              bin_op = BinaryOp::Div; break;
+            case TokenKind::AmpAmpEqual:             bin_op = BinaryOp::LogicalAnd; break;
+            case TokenKind::BarBarEqual:             bin_op = BinaryOp::LogicalOr; break;
+            case TokenKind::QuestionQuestionEqual:   bin_op = BinaryOp::NullishCoalescing; break;
+            default: throw std::runtime_error("Unhandled compound assignment");
+        }
+
         if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
-            return std::make_unique<AssignExpr>(id->Name(), std::move(rhs));
+            auto bin_expr = std::make_unique<BinaryExpr>(bin_op, std::make_unique<IdentifierExpr>(id->Name()), std::move(rhs));
+            return std::make_unique<AssignExpr>(id->Name(), std::move(bin_expr));
         }
         if (auto* prop = dynamic_cast<PropertyAccessExpr*>(lhs.get())) {
             std::string prop_name = prop->Property();
             auto obj = prop->ReleaseObject();
-            return std::make_unique<PropertyAssignExpr>(std::move(obj), prop_name, std::move(rhs));
+            if (auto* obj_id = dynamic_cast<IdentifierExpr*>(obj.get())) {
+                auto get_prop = std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>(obj_id->Name()), prop_name);
+                auto bin_expr = std::make_unique<BinaryExpr>(bin_op, std::move(get_prop), std::move(rhs));
+                return std::make_unique<PropertyAssignExpr>(std::move(obj), prop_name, std::move(bin_expr));
+            }
+            auto bin_expr = std::make_unique<BinaryExpr>(bin_op, std::make_unique<PropertyAccessExpr>(std::move(obj), prop_name), std::move(rhs));
+            return std::make_unique<PropertyAssignExpr>(nullptr, prop_name, std::move(bin_expr));
         }
-        if (auto* idx = dynamic_cast<IndexAccessExpr*>(lhs.get())) {
-            auto obj = idx->ReleaseObject();
-            auto index = idx->ReleaseIndex();
-            return std::make_unique<IndexAssignExpr>(std::move(obj), std::move(index), std::move(rhs));
+        throw std::runtime_error("Invalid left-hand side in compound assignment");
+    }
+
+    if (op_token.kind == TokenKind::QuestionDot) {
+        if (Match(TokenKind::OpenBracket)) {
+            auto index = ParseExpression();
+            Consume(TokenKind::CloseBracket, "Expected ']' after index in optional chaining");
+            return std::make_unique<OptionalIndexAccessExpr>(std::move(lhs), std::move(index));
         }
-        throw std::runtime_error("Invalid assignment target");
+        if (Match(TokenKind::OpenParen)) {
+            std::vector<std::unique_ptr<Expr>> args;
+            if (!Check(TokenKind::CloseParen)) {
+                args.push_back(ParseExpression());
+                while (Match(TokenKind::Comma)) {
+                    args.push_back(ParseExpression());
+                }
+            }
+            Consume(TokenKind::CloseParen, "Expected ')' after argument list in optional call");
+            return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args));
+        }
+        if (current_token_.text.empty() || (!std::isalpha(static_cast<unsigned char>(current_token_.text[0])) && current_token_.text[0] != '_' && current_token_.text[0] != '$')) {
+            throw std::runtime_error("Expected property identifier after '?.'");
+        }
+        Token prop_tok = Advance();
+        return std::make_unique<OptionalPropertyAccessExpr>(std::move(lhs), prop_tok.text);
     }
 
     if (op_token.kind == TokenKind::Dot) {
@@ -526,27 +770,28 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
 
     BinaryOp op;
     switch (op_token.kind) {
-        case TokenKind::Plus:           op = BinaryOp::Add; break;
-        case TokenKind::Minus:          op = BinaryOp::Sub; break;
-        case TokenKind::Star:           op = BinaryOp::Mul; break;
-        case TokenKind::Slash:          op = BinaryOp::Div; break;
-        case TokenKind::Percent:        op = BinaryOp::Mod; break;
-        case TokenKind::Ampersand:      op = BinaryOp::BitwiseAnd; break;
-        case TokenKind::Bar:            op = BinaryOp::BitwiseOr; break;
-        case TokenKind::Caret:          op = BinaryOp::BitwiseXor; break;
-        case TokenKind::LessLess:       op = BinaryOp::ShiftLeft; break;
-        case TokenKind::GreaterGreater: op = BinaryOp::ShiftRight; break;
-        case TokenKind::EqualEqual:     op = BinaryOp::Equal; break;
-        case TokenKind::StrictEqual:    op = BinaryOp::StrictEqual; break;
-        case TokenKind::NotEqual:       op = BinaryOp::NotEqual; break;
-        case TokenKind::StrictNotEqual: op = BinaryOp::StrictNotEqual; break;
-        case TokenKind::Less:           op = BinaryOp::LessThan; break;
-        case TokenKind::LessEqual:      op = BinaryOp::LessThanOrEqual; break;
-        case TokenKind::Greater:        op = BinaryOp::GreaterThan; break;
-        case TokenKind::GreaterEqual:   op = BinaryOp::GreaterThanOrEqual; break;
-        case TokenKind::AmpAmp:         op = BinaryOp::LogicalAnd; break;
-        case TokenKind::BarBar:         op = BinaryOp::LogicalOr; break;
-        case TokenKind::InstanceOf:     op = BinaryOp::InstanceOf; break;
+        case TokenKind::Plus:               op = BinaryOp::Add; break;
+        case TokenKind::Minus:              op = BinaryOp::Sub; break;
+        case TokenKind::Star:               op = BinaryOp::Mul; break;
+        case TokenKind::Slash:              op = BinaryOp::Div; break;
+        case TokenKind::Percent:            op = BinaryOp::Mod; break;
+        case TokenKind::Ampersand:          op = BinaryOp::BitwiseAnd; break;
+        case TokenKind::Bar:                op = BinaryOp::BitwiseOr; break;
+        case TokenKind::Caret:              op = BinaryOp::BitwiseXor; break;
+        case TokenKind::LessLess:           op = BinaryOp::ShiftLeft; break;
+        case TokenKind::GreaterGreater:     op = BinaryOp::ShiftRight; break;
+        case TokenKind::EqualEqual:         op = BinaryOp::Equal; break;
+        case TokenKind::StrictEqual:        op = BinaryOp::StrictEqual; break;
+        case TokenKind::NotEqual:           op = BinaryOp::NotEqual; break;
+        case TokenKind::StrictNotEqual:     op = BinaryOp::StrictNotEqual; break;
+        case TokenKind::Less:               op = BinaryOp::LessThan; break;
+        case TokenKind::LessEqual:          op = BinaryOp::LessThanOrEqual; break;
+        case TokenKind::Greater:            op = BinaryOp::GreaterThan; break;
+        case TokenKind::GreaterEqual:       op = BinaryOp::GreaterThanOrEqual; break;
+        case TokenKind::AmpAmp:             op = BinaryOp::LogicalAnd; break;
+        case TokenKind::BarBar:             op = BinaryOp::LogicalOr; break;
+        case TokenKind::QuestionQuestion:   op = BinaryOp::NullishCoalescing; break;
+        case TokenKind::InstanceOf:         op = BinaryOp::InstanceOf; break;
         default:
             throw std::runtime_error("Unhandled binary operator");
     }

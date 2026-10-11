@@ -87,6 +87,16 @@ enum class TokenKind {
     GreaterGreater,     // >>
     PlusPlus,           // ++
     MinusMinus,         // --
+
+    // Modern ECMAScript operators & punctuators
+    QuestionQuestion,       // ??
+    QuestionDot,            // ?.
+    QuestionQuestionEqual,  // ??=
+    AmpAmpEqual,            // &&=
+    BarBarEqual,            // ||=
+    DotDotDot,              // ...
+    Arrow,                  // =>
+    Backtick,               // `
 };
 
 const char* TokenKindToString(TokenKind kind);
@@ -103,6 +113,8 @@ struct Token {
     bool is_integer{false};
     int32_t int_value{0};
     SourceLocation location;
+    std::vector<std::string> template_quasis;
+    std::vector<std::string> template_exprs;
 };
 
 class Lexer {
@@ -123,6 +135,7 @@ private:
     Token ScanIdentifierOrKeyword();
     Token ScanNumber();
     Token ScanString(char quote);
+    Token ScanTemplateLiteral();
 
     std::string_view source_;
     size_t cursor_{0};
