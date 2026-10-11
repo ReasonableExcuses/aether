@@ -30,6 +30,14 @@ bool TaggedValue::ToBoolean() const noexcept {
     return false;
 }
 
+bool TaggedValue::IsSymbol() const noexcept {
+    return (raw_ & kTagMask) == kTagSymbol || (IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::Symbol);
+}
+
+bool TaggedValue::IsGeneratorObject() const noexcept {
+    return IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::JSGenerator;
+}
+
 std::string TaggedValue::ToString() const {
     if (IsSmi()) {
         return std::to_string(AsSmi());
@@ -58,6 +66,9 @@ std::string TaggedValue::ToString() const {
         HeapObject* obj = AsHeapObject();
         if (obj->IsString()) {
             return static_cast<JSString*>(obj)->Value();
+        }
+        if (obj->GetType() == HeapObjectType::Symbol) {
+            return "Symbol(" + static_cast<JSSymbol*>(obj)->Description() + ")";
         }
         if (obj->IsNativeFunction()) {
             return "[Function " + static_cast<JSNativeFunction*>(obj)->Name() + "]";

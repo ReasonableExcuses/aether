@@ -55,6 +55,55 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     }
 
     ExecutionFrame frame(bytecode, args, this_val, env);
+    acc_ = TaggedValue::Undefined();
+    return RunExecutionLoop(frame, bytecode.Code().data(), nullptr);
+}
+
+TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val) {
+    if (!gen) return TaggedValue::Undefined();
+    if (gen->GetState() == JSGeneratorObject::State::Completed) {
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    }
+    if (gen->GetState() == JSGeneratorObject::State::Executing) {
+        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Generator is already running"));
+        has_pending_exception_ = true;
+        pending_exception_ = exc;
+        return exc;
+    }
+
+    gen->SetState(JSGeneratorObject::State::Executing);
+    const BytecodeArray& bytecode = *gen->Function()->GetBytecode();
+    ExecutionFrame frame(bytecode, gen->Args(), gen->ThisVal(), gen->Environment());
+    frame.SetGenerator(gen);
+
+    const uint8_t* code_start = bytecode.Code().data();
+    const uint8_t* start_pc = code_start;
+    if (gen->PCOffset() > 0) {
+        frame.GetRegisters() = gen->SavedRegisters();
+        start_pc = code_start + gen->PCOffset();
+        acc_ = sent_val;
+    } else {
+        acc_ = TaggedValue::Undefined();
+    }
+
+    bool yielded = false;
+    TaggedValue result = RunExecutionLoop(frame, start_pc, &yielded);
+
+    if (has_pending_exception_) {
+        gen->SetState(JSGeneratorObject::State::Completed);
+        return pending_exception_;
+    }
+
+    if (yielded) {
+        return TaggedValue::FromHeapObject(CreateIterResult(result, false));
+    } else {
+        gen->SetState(JSGeneratorObject::State::Completed);
+        return TaggedValue::FromHeapObject(CreateIterResult(result, true));
+    }
+}
+
+TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded) {
+    const BytecodeArray& bytecode = frame.GetBytecode();
     struct RootGuard {
         TaggedValue* acc_ptr;
         ExecutionFrame& frame;
@@ -86,10 +135,8 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     } env_guard{*this, frame};
 
     const uint8_t* code_start = bytecode.Code().data();
-    const uint8_t* pc = code_start;
+    const uint8_t* pc = start_pc;
     const uint8_t* code_end = code_start + bytecode.Code().size();
-
-    acc_ = TaggedValue::Undefined();
 
     while (pc < code_end) {
         Opcode op = static_cast<Opcode>(*pc++);
@@ -618,6 +665,8 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
                 } else if (acc_.IsNull()) {
                     acc_ = TaggedValue::FromHeapObject(new JSString("object"));
+                } else if (acc_.IsSymbol()) {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("symbol"));
                 } else if (acc_.IsHeapObject()) {
                     auto* h = acc_.AsHeapObject();
                     if (h->IsString()) {
@@ -739,6 +788,23 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     break;
                 }
 
+                if (key_val.IsSymbol()) {
+                    auto* sym = static_cast<JSSymbol*>(key_val.AsHeapObject());
+                    HeapObject* ho = obj_val.AsHeapObject();
+                    if (ho->IsJSObject()) {
+                        acc_ = static_cast<JSObject*>(ho)->GetNamedProperty(sym->Key());
+                    } else if (ho->IsString()) {
+                        if (Realm::Current() && Realm::Current()->GetStringPrototype()) {
+                            acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(sym->Key());
+                        } else {
+                            acc_ = TaggedValue::Undefined();
+                        }
+                    } else {
+                        acc_ = TaggedValue::Undefined();
+                    }
+                    break;
+                }
+
                 HeapObject* h_obj = obj_val.AsHeapObject();
                 if (h_obj->IsArray()) {
                     auto* arr = static_cast<JSArray*>(h_obj);
@@ -826,6 +892,14 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 TaggedValue key_val = frame.GetRegister(key_reg);
 
                 if (obj_val.IsHeapObject()) {
+                    if (key_val.IsSymbol()) {
+                        auto* sym = static_cast<JSSymbol*>(key_val.AsHeapObject());
+                        HeapObject* ho = obj_val.AsHeapObject();
+                        if (ho->IsJSObject()) {
+                            static_cast<JSObject*>(ho)->SetNamedProperty(sym->Key(), acc_, next_shape_id_);
+                        }
+                        break;
+                    }
                     HeapObject* h_obj = obj_val.AsHeapObject();
                     if (h_obj->IsArray()) {
                         auto* arr = static_cast<JSArray*>(h_obj);
@@ -876,6 +950,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                                                proto_fn->GetSharedBytecode() ? proto_fn->GetSharedBytecode() : std::shared_ptr<const BytecodeArray>(proto_fn->GetBytecode(), [](const BytecodeArray*){}), 
                                                frame.GetEnvironment());
                 closure->SetPrototype(proto_fn->GetPrototype());
+                closure->SetGenerator(proto_fn->IsGenerator());
                 acc_ = TaggedValue::FromHeapObject(closure);
                 break;
             }
@@ -993,7 +1068,15 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = native_fn->Invoke(rec_this, call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
-                    acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
+                    if (func->IsGenerator()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
+                            gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
+                        }
+                        acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else {
+                        acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
+                    }
                 }
 
                 if (has_pending_exception_) {
@@ -1031,7 +1114,15 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
-                    acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());
+                    if (func->IsGenerator()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
+                            gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
+                        }
+                        acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else {
+                        acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());
+                    }
                 }
 
                 if (has_pending_exception_) {
@@ -1068,14 +1159,37 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                 } else {
                     has_pending_exception_ = true;
                     pending_exception_ = exc;
+                    if (frame.GetGenerator()) {
+                        frame.GetGenerator()->SetState(JSGeneratorObject::State::Completed);
+                    }
                     return exc;
                 }
                 break;
             }
+            case Opcode::Yield: {
+                if (frame.GetGenerator()) {
+                    auto* gen = frame.GetGenerator();
+                    TaggedValue yielded_val = acc_;
+                    gen->SetPCOffset(static_cast<uint32_t>(pc - code_start));
+                    gen->SavedRegisters() = frame.GetRegisters();
+                    gen->SetEnvironment(frame.GetEnvironment());
+                    gen->SetState(JSGeneratorObject::State::SuspendedYield);
+                    if (out_yielded) *out_yielded = true;
+                    return yielded_val;
+                }
+                acc_ = TaggedValue::Undefined();
+                break;
+            }
             case Opcode::Return: {
+                if (frame.GetGenerator()) {
+                    frame.GetGenerator()->SetState(JSGeneratorObject::State::Completed);
+                }
                 return acc_;
             }
             case Opcode::Halt: {
+                if (frame.GetGenerator()) {
+                    frame.GetGenerator()->SetState(JSGeneratorObject::State::Completed);
+                }
                 return acc_;
             }
             default:
@@ -1084,6 +1198,9 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         }
     }
 
+    if (frame.GetGenerator()) {
+        frame.GetGenerator()->SetState(JSGeneratorObject::State::Completed);
+    }
     return acc_;
 }
 

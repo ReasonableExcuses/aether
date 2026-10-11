@@ -36,11 +36,28 @@ TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::ve
     }
     if (h_obj->IsFunction()) {
         auto* fn = static_cast<JSFunction*>(h_obj);
+        if (fn->IsGenerator()) {
+            Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+            auto* gen_obj = AllocateRuntime<JSGeneratorObject>(fn, args, this_val, fn->GetEnvironment(), root);
+            if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
+                gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
+            }
+            return TaggedValue::FromHeapObject(gen_obj);
+        }
         if (Interpreter::Current()) {
             return Interpreter::Current()->Execute(*fn->GetBytecode(), args, this_val, fn->GetEnvironment());
         }
     }
     return TaggedValue::Undefined();
+}
+
+JSObject* CreateIterResult(TaggedValue value, bool done) {
+    Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    auto* obj = AllocateRuntime<JSObject>(root);
+    uint32_t sid = 5000;
+    obj->SetNamedProperty("value", value, sid);
+    obj->SetNamedProperty("done", TaggedValue::FromBoolean(done), sid);
+    return obj;
 }
 
 // Math Builtins
@@ -1395,6 +1412,314 @@ static TaggedValue DataView_setFloat64(TaggedValue this_val, const std::vector<T
     return TaggedValue::Undefined();
 }
 
+static TaggedValue Array_values(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* obj = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject())
+                ? static_cast<JSObject*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [obj, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!obj) return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+        size_t len = 0;
+        if (obj->IsArray()) {
+            len = static_cast<JSArray*>(obj)->Length();
+        } else {
+            TaggedValue len_val = obj->GetNamedProperty("length");
+            len = len_val.IsNumber() ? static_cast<size_t>(len_val.AsNumber()) : 0;
+        }
+        if (*idx_ptr < len) {
+            size_t idx = (*idx_ptr)++;
+            TaggedValue el = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(idx) : obj->GetNamedProperty(std::to_string(idx));
+            return TaggedValue::FromHeapObject(CreateIterResult(el, false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5100;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Array_keys(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* obj = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject())
+                ? static_cast<JSObject*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [obj, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!obj) return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+        size_t len = 0;
+        if (obj->IsArray()) {
+            len = static_cast<JSArray*>(obj)->Length();
+        } else {
+            TaggedValue len_val = obj->GetNamedProperty("length");
+            len = len_val.IsNumber() ? static_cast<size_t>(len_val.AsNumber()) : 0;
+        }
+        if (*idx_ptr < len) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromSmi(static_cast<int32_t>(idx)), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5101;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Array_entries(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* obj = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject())
+                ? static_cast<JSObject*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [obj, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!obj) return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+        size_t len = 0;
+        if (obj->IsArray()) {
+            len = static_cast<JSArray*>(obj)->Length();
+        } else {
+            TaggedValue len_val = obj->GetNamedProperty("length");
+            len = len_val.IsNumber() ? static_cast<size_t>(len_val.AsNumber()) : 0;
+        }
+        if (*idx_ptr < len) {
+            size_t idx = (*idx_ptr)++;
+            TaggedValue el = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(idx) : obj->GetNamedProperty(std::to_string(idx));
+            auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
+            if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                pair->SetPrototype(Realm::Current()->GetArrayPrototype());
+            }
+            pair->SetElement(0, TaggedValue::FromSmi(static_cast<int32_t>(idx)));
+            pair->SetElement(1, el);
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(pair), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5102;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue String_iterator(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    std::string str = "";
+    if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsString()) {
+        str = static_cast<JSString*>(this_val.AsHeapObject())->Value();
+    }
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [str, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (*idx_ptr < str.length()) {
+            size_t idx = (*idx_ptr)++;
+            std::string ch(1, str[idx]);
+            auto* s = AllocateRuntime<JSString>(ch);
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(s), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5103;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Map_entries(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* map = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsMap())
+                ? static_cast<JSMap*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (map && *idx_ptr < map->Entries().size()) {
+            size_t idx = (*idx_ptr)++;
+            const auto& entry = map->Entries()[idx];
+            auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
+            if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                pair->SetPrototype(Realm::Current()->GetArrayPrototype());
+            }
+            pair->SetElement(0, entry.first);
+            pair->SetElement(1, entry.second);
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(pair), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5104;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Map_keys(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* map = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsMap())
+                ? static_cast<JSMap*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (map && *idx_ptr < map->Entries().size()) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(map->Entries()[idx].first, false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5105;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Map_values(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* map = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsMap())
+                ? static_cast<JSMap*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (map && *idx_ptr < map->Entries().size()) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(map->Entries()[idx].second, false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5106;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Set_values(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* set = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsSet())
+                ? static_cast<JSSet*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [set, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (set && *idx_ptr < set->Values().size()) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(set->Values()[idx], false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5107;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue Set_entries(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* set = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsSet())
+                ? static_cast<JSSet*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [set, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (set && *idx_ptr < set->Values().size()) {
+            size_t idx = (*idx_ptr)++;
+            TaggedValue val = set->Values()[idx];
+            auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
+            if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                pair->SetPrototype(Realm::Current()->GetArrayPrototype());
+            }
+            pair->SetElement(0, val);
+            pair->SetElement(1, val);
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(pair), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5108;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue TypedArray_values(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* ta = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsTypedArray())
+               ? static_cast<JSTypedArray*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [ta, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (ta && *idx_ptr < ta->Length()) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(ta->GetElement(idx), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5109;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue TypedArray_keys(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* ta = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsTypedArray())
+               ? static_cast<JSTypedArray*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [ta, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (ta && *idx_ptr < ta->Length()) {
+            size_t idx = (*idx_ptr)++;
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromSmi(static_cast<int32_t>(idx)), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5110;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
+static TaggedValue TypedArray_entries(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    auto* ta = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsTypedArray())
+               ? static_cast<JSTypedArray*>(this_val.AsHeapObject()) : nullptr;
+    auto idx_ptr = std::make_shared<size_t>(0);
+    auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [ta, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
+        if (ta && *idx_ptr < ta->Length()) {
+            size_t idx = (*idx_ptr)++;
+            auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
+            if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                pair->SetPrototype(Realm::Current()->GetArrayPrototype());
+            }
+            pair->SetElement(0, TaggedValue::FromSmi(static_cast<int32_t>(idx)));
+            pair->SetElement(1, ta->GetElement(idx));
+            return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(pair), false));
+        }
+        return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
+    });
+    uint32_t sid = 5111;
+    iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
+    auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::FromHeapObject(iter_obj);
+    });
+    iter_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(self_fn), sid);
+    return TaggedValue::FromHeapObject(iter_obj);
+}
+
 Realm::Realm(Heap& heap) {
     heap_ = &heap;
     s_current_realm_ = this;
@@ -1455,6 +1780,69 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     array_buffer_prototype_ = make_old_obj();
     typed_array_prototype_ = make_old_obj();
     data_view_prototype_ = make_old_obj();
+    generator_prototype_ = make_old_obj();
+
+    // Well-Known Symbols
+    static uint32_t s_symbol_counter = 1000;
+    auto make_symbol = [&heap](std::string_view desc) -> JSSymbol* {
+        uint32_t id = ++s_symbol_counter;
+        JSSymbol* sym = heap.AllocateOld<JSSymbol>(desc, id);
+        return sym;
+    };
+
+    auto* sym_iterator = make_symbol("@@iterator");
+    auto* sym_toStringTag = make_symbol("@@toStringTag");
+    auto* sym_hasInstance = make_symbol("@@hasInstance");
+    auto* sym_toPrimitive = make_symbol("@@toPrimitive");
+
+    symbol_iterator_ = TaggedValue::FromHeapObject(sym_iterator);
+    symbol_toStringTag_ = TaggedValue::FromHeapObject(sym_toStringTag);
+    symbol_hasInstance_ = TaggedValue::FromHeapObject(sym_hasInstance);
+    symbol_toPrimitive_ = TaggedValue::FromHeapObject(sym_toPrimitive);
+
+    auto sym_iter_root = std::make_unique<TaggedValue>(symbol_iterator_);
+    heap.RegisterExtraRoot(sym_iter_root.get());
+    root_values_.push_back(std::move(sym_iter_root));
+
+    auto sym_tag_root = std::make_unique<TaggedValue>(symbol_toStringTag_);
+    heap.RegisterExtraRoot(sym_tag_root.get());
+    root_values_.push_back(std::move(sym_tag_root));
+
+    auto sym_inst_root = std::make_unique<TaggedValue>(symbol_hasInstance_);
+    heap.RegisterExtraRoot(sym_inst_root.get());
+    root_values_.push_back(std::move(sym_inst_root));
+
+    auto sym_prim_root = std::make_unique<TaggedValue>(symbol_toPrimitive_);
+    heap.RegisterExtraRoot(sym_prim_root.get());
+    root_values_.push_back(std::move(sym_prim_root));
+
+    // Generator Prototype
+    generator_prototype_->SetNamedProperty("next", TaggedValue::FromHeapObject(make_native("next", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            return TaggedValue::Undefined();
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        TaggedValue sent_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        if (Interpreter::Current()) {
+            return Interpreter::Current()->ResumeGenerator(gen, sent_val);
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+
+    generator_prototype_->SetNamedProperty("return", TaggedValue::FromHeapObject(make_native("return", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            return TaggedValue::Undefined();
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        TaggedValue ret_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        gen->SetState(JSGeneratorObject::State::Completed);
+        return TaggedValue::FromHeapObject(CreateIterResult(ret_val, true));
+    })), next_shape_id_);
+
+    auto* gen_iter_self = make_native("[Symbol.iterator]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        return this_val;
+    });
+    generator_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(gen_iter_self), next_shape_id_);
 
     // Register Math functions
     math_object_->SetNamedProperty("abs", TaggedValue::FromHeapObject(make_native("abs", &Math_abs)), next_shape_id_);
@@ -1483,6 +1871,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &Array_filter)), next_shape_id_);
     array_prototype_->SetNamedProperty("forEach", TaggedValue::FromHeapObject(make_native("forEach", &Array_forEach)), next_shape_id_);
     array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &Array_reduce)), next_shape_id_);
+    auto* arr_values = make_native("values", &Array_values);
+    auto* arr_keys = make_native("keys", &Array_keys);
+    auto* arr_entries = make_native("entries", &Array_entries);
+    array_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(arr_values), next_shape_id_);
+    array_prototype_->SetNamedProperty("keys", TaggedValue::FromHeapObject(arr_keys), next_shape_id_);
+    array_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(arr_entries), next_shape_id_);
+    array_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(arr_values), next_shape_id_);
 
     // Array Constructor
     auto* array_ctor = make_native("Array", [](const std::vector<TaggedValue>& a_args) -> TaggedValue {
@@ -1510,6 +1905,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     string_prototype_->SetNamedProperty("trim", TaggedValue::FromHeapObject(make_native("trim", &String_trim)), next_shape_id_);
     string_prototype_->SetNamedProperty("split", TaggedValue::FromHeapObject(make_native("split", &String_split)), next_shape_id_);
     string_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &String_includes)), next_shape_id_);
+    auto* str_iter = make_native("values", &String_iterator);
+    string_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(str_iter), next_shape_id_);
 
     // JSON Methods
     json_object_->SetNamedProperty("parse", TaggedValue::FromHeapObject(make_native("parse", &JSON_parse)), next_shape_id_);
@@ -1521,6 +1918,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     map_prototype_->SetNamedProperty("has", TaggedValue::FromHeapObject(make_native("has", &Map_has)), next_shape_id_);
     map_prototype_->SetNamedProperty("delete", TaggedValue::FromHeapObject(make_native("delete", &Map_delete)), next_shape_id_);
     map_prototype_->SetNamedProperty("clear", TaggedValue::FromHeapObject(make_native("clear", &Map_clear)), next_shape_id_);
+    auto* map_entries = make_native("entries", &Map_entries);
+    auto* map_keys = make_native("keys", &Map_keys);
+    auto* map_values = make_native("values", &Map_values);
+    map_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(map_entries), next_shape_id_);
+    map_prototype_->SetNamedProperty("keys", TaggedValue::FromHeapObject(map_keys), next_shape_id_);
+    map_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(map_values), next_shape_id_);
+    map_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(map_entries), next_shape_id_);
     auto* map_ctor = make_native("Map", &Map_ctor);
     map_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(map_prototype_), next_shape_id_);
 
@@ -1529,6 +1933,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     set_prototype_->SetNamedProperty("has", TaggedValue::FromHeapObject(make_native("has", &Set_has)), next_shape_id_);
     set_prototype_->SetNamedProperty("delete", TaggedValue::FromHeapObject(make_native("delete", &Set_delete)), next_shape_id_);
     set_prototype_->SetNamedProperty("clear", TaggedValue::FromHeapObject(make_native("clear", &Set_clear)), next_shape_id_);
+    auto* set_values = make_native("values", &Set_values);
+    auto* set_keys = make_native("keys", &Set_values);
+    auto* set_entries = make_native("entries", &Set_entries);
+    set_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(set_values), next_shape_id_);
+    set_prototype_->SetNamedProperty("keys", TaggedValue::FromHeapObject(set_keys), next_shape_id_);
+    set_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(set_entries), next_shape_id_);
+    set_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(set_values), next_shape_id_);
     auto* set_ctor = make_native("Set", &Set_ctor);
     set_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(set_prototype_), next_shape_id_);
 
@@ -1578,6 +1989,49 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     global_object_->SetNamedProperty("Object", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
 
     global_object_->SetNamedProperty("globalThis", TaggedValue::FromHeapObject(global_object_), next_shape_id_);
+
+    // Symbol Constructor & Registry
+    auto* symbol_ctor = make_native("Symbol", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        std::string desc = "";
+        if (!args.empty() && !args[0].IsUndefined()) {
+            desc = args[0].ToString();
+        }
+        static uint32_t s_sym_id = 2000;
+        auto* sym = AllocateRuntime<JSSymbol>(desc, ++s_sym_id);
+        return TaggedValue::FromHeapObject(sym);
+    });
+
+    symbol_ctor->SetNamedProperty("iterator", symbol_iterator_, next_shape_id_);
+    symbol_ctor->SetNamedProperty("toStringTag", symbol_toStringTag_, next_shape_id_);
+    symbol_ctor->SetNamedProperty("hasInstance", symbol_hasInstance_, next_shape_id_);
+    symbol_ctor->SetNamedProperty("toPrimitive", symbol_toPrimitive_, next_shape_id_);
+
+    symbol_ctor->SetNamedProperty("for", TaggedValue::FromHeapObject(make_native("for", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
+        std::string key = args.empty() ? "undefined" : args[0].ToString();
+        auto it = symbol_registry_.find(key);
+        if (it != symbol_registry_.end()) {
+            return TaggedValue::FromHeapObject(it->second);
+        }
+        static uint32_t s_registry_sym_id = 50000;
+        auto* sym = AllocateRuntime<JSSymbol>(key, ++s_registry_sym_id);
+        symbol_registry_[key] = sym;
+        return TaggedValue::FromHeapObject(sym);
+    })), next_shape_id_);
+
+    symbol_ctor->SetNamedProperty("keyFor", TaggedValue::FromHeapObject(make_native("keyFor", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || !args[0].IsSymbol()) {
+            return TaggedValue::Undefined();
+        }
+        auto* sym = static_cast<JSSymbol*>(args[0].AsHeapObject());
+        for (const auto& [k, s] : symbol_registry_) {
+            if (s == sym) {
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(k));
+            }
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+
+    global_object_->SetNamedProperty("Symbol", TaggedValue::FromHeapObject(symbol_ctor), next_shape_id_);
 
     // Event Loop, Timer & Microtask Intrinsics
     global_object_->SetNamedProperty("setTimeout", TaggedValue::FromHeapObject(make_native("setTimeout", &Global_setTimeout)), next_shape_id_);
@@ -1723,6 +2177,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     typed_array_prototype_->SetNamedProperty("map", TaggedValue::FromHeapObject(make_native("map", &TypedArray_map)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &TypedArray_filter)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &TypedArray_reduce)), next_shape_id_);
+    auto* ta_values = make_native("values", &TypedArray_values);
+    auto* ta_keys = make_native("keys", &TypedArray_keys);
+    auto* ta_entries = make_native("entries", &TypedArray_entries);
+    typed_array_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(ta_values), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("keys", TaggedValue::FromHeapObject(ta_keys), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(ta_entries), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(ta_values), next_shape_id_);
 
     auto make_typed_array_ctor = [&](TypedArrayKind kind, std::string_view name) -> JSNativeFunction* {
         auto* proto = make_old_obj();

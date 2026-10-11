@@ -165,16 +165,32 @@ private:
 
 class ObjectLiteralExpr : public Expr {
 public:
-    ObjectLiteralExpr(std::vector<std::pair<std::string, std::unique_ptr<Expr>>> props)
+    struct Property {
+        std::string key;
+        std::unique_ptr<Expr> computed_key;
+        std::unique_ptr<Expr> value;
+    };
+
+    explicit ObjectLiteralExpr(std::vector<Property> props)
         : properties_(std::move(props)) {}
 
-    const std::vector<std::pair<std::string, std::unique_ptr<Expr>>>& Properties() const noexcept {
+    explicit ObjectLiteralExpr(std::vector<std::pair<std::string, std::unique_ptr<Expr>>> props) {
+        for (auto& p : props) {
+            properties_.push_back(Property{
+                .key = std::move(p.first),
+                .computed_key = nullptr,
+                .value = std::move(p.second)
+            });
+        }
+    }
+
+    const std::vector<Property>& Properties() const noexcept {
         return properties_;
     }
     void Accept(ASTVisitor* visitor) override;
 
 private:
-    std::vector<std::pair<std::string, std::unique_ptr<Expr>>> properties_;
+    std::vector<Property> properties_;
 };
 
 class ArrayLiteralExpr : public Expr {
@@ -318,6 +334,20 @@ private:
     std::unique_ptr<Expr> expr_;
 };
 
+class YieldExpr : public Expr {
+public:
+    explicit YieldExpr(std::unique_ptr<Expr> expr = nullptr, bool is_delegate = false)
+        : expr_(std::move(expr)), is_delegate_(is_delegate) {}
+
+    Expr* GetExpr() const noexcept { return expr_.get(); }
+    bool IsDelegate() const noexcept { return is_delegate_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> expr_;
+    bool is_delegate_{false};
+};
+
 // Statements
 class Stmt : public ASTNode {};
 
@@ -419,6 +449,9 @@ public:
     const std::string& RestParam() const noexcept { return rest_param_; }
     void SetRest(std::string_view r) { has_rest_ = true; rest_param_ = r; }
 
+    bool IsGenerator() const noexcept { return is_generator_; }
+    void SetGenerator(bool g) noexcept { is_generator_ = g; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
@@ -427,6 +460,7 @@ private:
     std::unique_ptr<BlockStmt> body_;
     bool has_rest_{false};
     std::string rest_param_;
+    bool is_generator_{false};
 };
 
 class FunctionExpr : public Expr {
@@ -442,6 +476,9 @@ public:
     const std::string& RestParam() const noexcept { return rest_param_; }
     void SetRest(std::string_view r) { has_rest_ = true; rest_param_ = r; }
 
+    bool IsGenerator() const noexcept { return is_generator_; }
+    void SetGenerator(bool g) noexcept { is_generator_ = g; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
@@ -450,6 +487,7 @@ private:
     std::unique_ptr<BlockStmt> body_;
     bool has_rest_{false};
     std::string rest_param_;
+    bool is_generator_{false};
 };
 
 class ReturnStmt : public Stmt {
@@ -543,6 +581,7 @@ public:
     virtual void VisitOptionalIndexAccess(OptionalIndexAccessExpr* node) = 0;
     virtual void VisitOptionalCall(OptionalCallExpr* node) = 0;
     virtual void VisitSpread(SpreadExpr* node) = 0;
+    virtual void VisitYield(YieldExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -578,6 +617,7 @@ inline void OptionalPropertyAccessExpr::Accept(ASTVisitor* v) { v->VisitOptional
 inline void OptionalIndexAccessExpr::Accept(ASTVisitor* v) { v->VisitOptionalIndexAccess(this); }
 inline void OptionalCallExpr::Accept(ASTVisitor* v) { v->VisitOptionalCall(this); }
 inline void SpreadExpr::Accept(ASTVisitor* v) { v->VisitSpread(this); }
+inline void YieldExpr::Accept(ASTVisitor* v) { v->VisitYield(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }

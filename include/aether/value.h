@@ -124,6 +124,9 @@ public:
         return IsNull() || IsUndefined();
     }
 
+    bool IsSymbol() const noexcept;
+    bool IsGeneratorObject() const noexcept;
+
     AETHER_ALWAYS_INLINE bool IsTrue() const noexcept {
         return raw_ == (kTagBoolean | 1ULL);
     }

@@ -4,14 +4,14 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-12%20of%2012%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-13%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-94%2F94%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-104%2F104%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -74,7 +74,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 ### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (12/12 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (13/13 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -91,12 +91,13 @@ Foundation Progress: [███████████████████�
 | **10** | Full Ecosystem & Modules | CommonJS require/exports, Module Cache, process global, aether CLI driver | Complete | `[==========] 100%` |
 | **11** | Binary Buffers & TypedArrays | ArrayBuffer, DataView, Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array | Complete | `[==========] 100%` |
 | **12** | Modern Syntax & Lowerings | Nullish Coalescing (??), Optional Chaining (?.), Logical Assignments (&&=, \|\|=, ??=), Template Literals, Rest Params & Spread, Destructuring, Arrow Functions | Complete | `[==========] 100%` |
+| **13** | Iteration Protocols, Symbols & Generators | Symbols (`Symbol()`, descriptions, uniqueness, typeof `"symbol"`), Global Registry (`Symbol.for`, `Symbol.keyFor`), Well-Known Symbols (`Symbol.iterator`, etc.), Builtin Iterators (`values`, `keys`, `entries`), For-Of Loops with Destructuring, Generator Coroutines (`function*`, `yield`, `next`, `return`) | Complete | `[==========] 100%` |
 
 ---
 
 ### Phase 2: V8 Performance Supremacy Track (Active)
 ```
-V8 Supremacy Track:  [████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 42% In Progress
+V8 Supremacy Track:  [██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 52% In Progress
 ```
 
 | Optimization Track | Engineering Objective | Deliverables | Target Status |
@@ -165,11 +166,14 @@ V8 Supremacy Track:  [███████████████████�
         - Structured exception handling (try / catch / finally)<br/>
         - Nullish coalescing (??), Optional chaining (?.), Logical assignments (&&=, ||=, ??=)<br/>
         - Template literals with interpolated expression chains<br/>
-        - Rest parameters (...rest), Array & Object spread, Destructuring, Arrow functions
+        - Rest parameters (...rest), Array & Object spread, Destructuring, Arrow functions<br/>
+        - Symbol primitives, descriptions, global registry (Symbol.for, Symbol.keyFor)<br/>
+        - Well-known symbols (Symbol.iterator, Symbol.toStringTag, Symbol.hasInstance, Symbol.toPrimitive)<br/>
+        - Iteration protocols and for...of loops with scalar and destructuring bindings<br/>
+        - Generator Coroutines (function*, yield, next(val), return(val))
       </td>
       <td>
         - Proxy and Reflect API<br/>
-        - Iterators, Generators, and Symbol keys<br/>
         - Async functions and async generators<br/>
         - Private class fields (<code>#field</code>)
       </td>
@@ -183,14 +187,14 @@ V8 Supremacy Track:  [███████████████████�
         - ECMA-262 Microtask Queue FIFO dispatcher<br/>
         - Math builtins (abs, sqrt, max, pow)<br/>
         - Standard console.log host output<br/>
-        - Full Array methods (push, pop, slice, map, filter, etc.)<br/>
-        - String prototypes (indexOf, slice, split, trim, etc.)<br/>
+        - Full Array methods (push, pop, slice, map, filter, etc.) and [Symbol.iterator]<br/>
+        - String prototypes (indexOf, slice, split, trim, etc.) and [Symbol.iterator]<br/>
         - JSON parser & serializer (parse, stringify)<br/>
-        - Map and Set collections (get, set, has, delete, size)<br/>
+        - Map and Set collections with keys(), values(), entries(), [Symbol.iterator]<br/>
         - Promise/A+ microtask execution chain and RegExp<br/>
         - Full Asynchronous Event Loop (setTimeout, setInterval, setImmediate)<br/>
         - performance.now high-resolution monotonic clock<br/>
-        - ArrayBuffer, DataView, and 9 TypedArray constructors with full method suites
+        - ArrayBuffer, DataView, and 9 TypedArray constructors with full method & iterator suites
       </td>
       <td>
         - WeakMap & WeakSet<br/>
@@ -210,7 +214,7 @@ V8 Supremacy Track:  [███████████████████�
         - Official Test262 Conformance Test Suite harness (YAML frontmatter, $262 host object, assert/sta)<br/>
         - Strict negative error type validation in C++ and Python runners<br/>
         - Native C++ and Python CLI Test262 runners<br/>
-        - 94 test verification suites (74 core architectural + 20 curated Test262, 100% pass)
+        - 104 test verification suites (84 core architectural + 20 curated Test262, 100% pass)
       </td>
       <td>
         - ES Modules (import / export) static grammar<br/>
@@ -509,6 +513,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone10_modules.cpp   # Full Ecosystem & CommonJS Module tests
 │   ├── test_milestone11_typed_arrays.cpp # Binary Buffers, DataView & TypedArrays tests
 │   ├── test_milestone12_modern_syntax.cpp # Modern ECMAScript Syntax & Lowerings tests
+│   ├── test_milestone13_iteration_symbols_generators.cpp # Symbols, Iteration Protocols & Generators tests
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
     └── run_test262.py            # Automated CLI Test262 runner tool
@@ -543,7 +548,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 12 verification binaries
+# Run Milestone 1 through 13 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -556,6 +561,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone10_modules.exe
 .\build\Release\test_milestone11_typed_arrays.exe
 .\build\Release\test_milestone12_modern_syntax.exe
+.\build\Release\test_milestone13_iteration_symbols_generators.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe

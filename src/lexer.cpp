@@ -84,6 +84,8 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::DotDotDot:         return "...";
         case TokenKind::Arrow:             return "=>";
         case TokenKind::Backtick:          return "`";
+        case TokenKind::Of:                return "of";
+        case TokenKind::Yield:             return "yield";
         default:                           return "<Unknown>";
     }
 }
@@ -350,6 +352,8 @@ Token Lexer::ScanIdentifierOrKeyword() {
     else if (text == "false")     kind = TokenKind::False;
     else if (text == "null")      kind = TokenKind::Null;
     else if (text == "undefined") kind = TokenKind::Undefined;
+    else if (text == "of")        kind = TokenKind::Of;
+    else if (text == "yield")     kind = TokenKind::Yield;
 
     return Token{kind, std::string(text), 0, false, 0, loc};
 }

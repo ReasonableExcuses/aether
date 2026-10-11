@@ -77,5 +77,9 @@ target_link_libraries(test_milestone12_modern_syntax PRIVATE aether_core)
 add_executable(aether src/main.cpp)
 target_link_libraries(aether PRIVATE aether_core)
 
+add_executable(test_milestone13_iteration_symbols_generators tests/test_milestone13_iteration_symbols_generators.cpp)
+target_link_libraries(test_milestone13_iteration_symbols_generators PRIVATE aether_core)
+
+
 
 

@@ -45,7 +45,10 @@ public:
         inside_nested_function = prev;
     }
     void VisitObjectLiteral(ObjectLiteralExpr* node) override {
-        for (const auto& p : node->Properties()) p.second->Accept(this);
+        for (const auto& p : node->Properties()) {
+            if (p.computed_key) p.computed_key->Accept(this);
+            if (p.value) p.value->Accept(this);
+        }
     }
     void VisitArrayLiteral(ArrayLiteralExpr* node) override {
         for (const auto& el : node->Elements()) el->Accept(this);
@@ -80,6 +83,9 @@ public:
     }
     void VisitSpread(SpreadExpr* node) override {
         node->GetExpr()->Accept(this);
+    }
+    void VisitYield(YieldExpr* node) override {
+        if (node->GetExpr()) node->GetExpr()->Accept(this);
     }
     void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitVarDecl(VarDeclStmt* node) override {
@@ -638,9 +644,24 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    for (const auto& [prop_name, expr] : node->Properties()) {
-        if (prop_name.empty() || dynamic_cast<SpreadExpr*>(expr.get()) != nullptr) {
-            Expr* target_expr = dynamic_cast<SpreadExpr*>(expr.get()) ? dynamic_cast<SpreadExpr*>(expr.get())->GetExpr() : expr.get();
+    for (const auto& prop : node->Properties()) {
+        if (prop.computed_key != nullptr) {
+            // Evaluates computed property key expression
+            prop.computed_key->Accept(this);
+            uint8_t key_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(key_reg);
+
+            // Evaluates value expression
+            prop.value->Accept(this);
+            uint16_t slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::StaKeyed);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU8(key_reg);
+            bytecode_->EmitU16(slot);
+            FreeRegister(key_reg);
+        } else if (prop.key.empty() || dynamic_cast<SpreadExpr*>(prop.value.get()) != nullptr) {
+            Expr* target_expr = dynamic_cast<SpreadExpr*>(prop.value.get()) ? dynamic_cast<SpreadExpr*>(prop.value.get())->GetExpr() : prop.value.get();
             target_expr->Accept(this);
             uint8_t src_reg = AllocateRegister();
             bytecode_->EmitOpcode(Opcode::Star);
@@ -650,8 +671,8 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
             bytecode_->EmitU8(src_reg);
             FreeRegister(src_reg);
         } else {
-            expr->Accept(this);
-            auto* s = new JSString(prop_name);
+            prop.value->Accept(this);
+            auto* s = new JSString(prop.key);
             uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
             uint16_t slot = next_feedback_slot_++;
 
@@ -1013,6 +1034,7 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
 void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
     // 1. Allocate function object placeholder and register for recursive lookups
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
+    fn_obj->SetGenerator(node->IsGenerator());
     functions_[node->Name()] = fn_obj;
 
     // 2. Compile child routine
@@ -1073,6 +1095,7 @@ void BytecodeEmitter::VisitNew(NewExpr* node) {
 
 void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
+    fn_obj->SetGenerator(node->IsGenerator());
 
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
@@ -1400,6 +1423,15 @@ void BytecodeEmitter::VisitOptionalCall(OptionalCallExpr* node) {
 
 void BytecodeEmitter::VisitSpread(SpreadExpr* node) {
     node->GetExpr()->Accept(this);
+}
+
+void BytecodeEmitter::VisitYield(YieldExpr* node) {
+    if (node->GetExpr()) {
+        node->GetExpr()->Accept(this);
+    } else {
+        bytecode_->EmitOpcode(Opcode::LdaUndefined);
+    }
+    bytecode_->EmitOpcode(Opcode::Yield);
 }
 
 } // namespace aether

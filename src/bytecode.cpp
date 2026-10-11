@@ -63,6 +63,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::PushExceptionHandler: return "PushExceptionHandler";
         case Opcode::PopExceptionHandler:  return "PopExceptionHandler";
         case Opcode::Throw:              return "Throw";
+        case Opcode::Yield:              return "Yield";
         case Opcode::Return:             return "Return";
         case Opcode::Halt:               return "Halt";
         default:                         return "<UnknownOpcode>";
@@ -301,6 +302,7 @@ std::string BytecodeArray::Disassemble() const {
             case Opcode::LdaNull:
             case Opcode::LdaTrue:
             case Opcode::LdaFalse:
+            case Opcode::Yield:
             case Opcode::Return:
             case Opcode::Halt:
                 break;

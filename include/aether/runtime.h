@@ -12,6 +12,7 @@
 #include <string_view>
 #include <memory>
 #include <vector>
+#include <unordered_map>
 
 namespace aether {
 
@@ -62,6 +63,7 @@ private:
 };
 
 TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
+JSObject* CreateIterResult(TaggedValue value, bool done);
 
 /**
  * @brief ECMA-262 Microtask Queue processing asynchronous Promise reactions.
@@ -116,6 +118,11 @@ public:
     JSObject* GetArrayBufferPrototype() const noexcept { return array_buffer_prototype_; }
     JSObject* GetTypedArrayPrototype() const noexcept { return typed_array_prototype_; }
     JSObject* GetDataViewPrototype() const noexcept { return data_view_prototype_; }
+    JSObject* GetGeneratorPrototype() const noexcept { return generator_prototype_; }
+    TaggedValue GetSymbolIterator() const noexcept { return symbol_iterator_; }
+    TaggedValue GetSymbolToStringTag() const noexcept { return symbol_toStringTag_; }
+    TaggedValue GetSymbolHasInstance() const noexcept { return symbol_hasInstance_; }
+    TaggedValue GetSymbolToPrimitive() const noexcept { return symbol_toPrimitive_; }
 
 private:
     void InitializeIntrinsics(Heap& heap);
@@ -140,6 +147,12 @@ private:
     JSObject* array_buffer_prototype_{nullptr};
     JSObject* typed_array_prototype_{nullptr};
     JSObject* data_view_prototype_{nullptr};
+    JSObject* generator_prototype_{nullptr};
+    TaggedValue symbol_iterator_{TaggedValue::Undefined()};
+    TaggedValue symbol_toStringTag_{TaggedValue::Undefined()};
+    TaggedValue symbol_hasInstance_{TaggedValue::Undefined()};
+    TaggedValue symbol_toPrimitive_{TaggedValue::Undefined()};
+    std::unordered_map<std::string, JSSymbol*> symbol_registry_;
 };
 
 inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape)

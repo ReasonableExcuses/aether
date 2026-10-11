@@ -97,6 +97,8 @@ enum class TokenKind {
     DotDotDot,              // ...
     Arrow,                  // =>
     Backtick,               // `
+    Of,                     // of
+    Yield,                  // yield
 };
 
 const char* TokenKindToString(TokenKind kind);

@@ -34,6 +34,7 @@ enum class HeapObjectType : uint16_t {
     JSArrayBuffer     = 0x0F,
     JSTypedArray      = 0x10,
     JSDataView        = 0x11,
+    JSGenerator       = 0x12,
 };
 
 /**
@@ -65,7 +66,8 @@ public:
                type_ == HeapObjectType::JSNativeFunction ||
                type_ == HeapObjectType::JSArrayBuffer ||
                type_ == HeapObjectType::JSTypedArray ||
-               type_ == HeapObjectType::JSDataView;
+               type_ == HeapObjectType::JSDataView ||
+               type_ == HeapObjectType::JSGenerator;
     }
     AETHER_ALWAYS_INLINE bool IsPlainObject() const noexcept { return type_ == HeapObjectType::JSObject; }
     AETHER_ALWAYS_INLINE bool IsString() const noexcept { return type_ == HeapObjectType::String; }
@@ -81,6 +83,8 @@ public:
     AETHER_ALWAYS_INLINE bool IsArrayBuffer() const noexcept { return type_ == HeapObjectType::JSArrayBuffer; }
     AETHER_ALWAYS_INLINE bool IsTypedArray() const noexcept { return type_ == HeapObjectType::JSTypedArray; }
     AETHER_ALWAYS_INLINE bool IsDataView() const noexcept { return type_ == HeapObjectType::JSDataView; }
+    AETHER_ALWAYS_INLINE bool IsSymbol() const noexcept { return type_ == HeapObjectType::Symbol; }
+    AETHER_ALWAYS_INLINE bool IsGeneratorObject() const noexcept { return type_ == HeapObjectType::JSGenerator; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;
@@ -173,6 +177,40 @@ private:
 
     std::string data_;
     uint32_t hash_{0};
+};
+
+/**
+ * @brief Managed JavaScript Symbol primitive object on the heap.
+ */
+class JSSymbol : public HeapObject {
+public:
+    explicit JSSymbol(std::string_view description, uint32_t id, Shape* shape = nullptr)
+        : HeapObject(HeapObjectType::Symbol, shape),
+          description_(description),
+          id_(id) {
+        if (!description_.empty() && description_.rfind("@@", 0) == 0) {
+            key_ = description_;
+        } else {
+            key_ = "@@Symbol(" + std::string(description_) + ")_" + std::to_string(id_);
+        }
+    }
+    JSSymbol(JSSymbol&& other) noexcept = default;
+
+    const std::string& Description() const noexcept { return description_; }
+    const std::string& Key() const noexcept { return key_; }
+    uint32_t Id() const noexcept { return id_; }
+
+    size_t ObjectSize() const override { return sizeof(JSSymbol); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSSymbol(std::move(*this));
+    }
+
+private:
+    std::string description_;
+    std::string key_;
+    uint32_t id_{0};
 };
 
 /**
@@ -637,6 +675,9 @@ public:
     JSObject* GetPrototype() const noexcept { return prototype_; }
     void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
 
+    bool IsGenerator() const noexcept { return is_generator_; }
+    void SetGenerator(bool g) noexcept { is_generator_ = g; }
+
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         if (environment_ != nullptr) {
@@ -665,6 +706,79 @@ private:
     const BytecodeArray* bytecode_{nullptr};
     LexicalEnvironment* environment_{nullptr};
     JSObject* prototype_{nullptr};
+    bool is_generator_{false};
+};
+
+/**
+ * @brief Managed ECMAScript Generator Object suspended/resumed across yield points.
+ */
+class JSGeneratorObject : public JSObject {
+public:
+    enum class State : uint8_t {
+        SuspendedStart,
+        SuspendedYield,
+        Executing,
+        Completed
+    };
+
+    JSGeneratorObject(JSFunction* fn, std::vector<TaggedValue> args, TaggedValue this_val, LexicalEnvironment* env, Shape* shape = nullptr)
+        : JSObject(HeapObjectType::JSGenerator, shape),
+          function_(fn),
+          args_(std::move(args)),
+          this_val_(this_val),
+          environment_(env),
+          state_(State::SuspendedStart) {}
+
+    JSGeneratorObject(JSGeneratorObject&& other) noexcept = default;
+
+    JSFunction* Function() const noexcept { return function_; }
+    State GetState() const noexcept { return state_; }
+    void SetState(State s) noexcept { state_ = s; }
+    uint32_t PCOffset() const noexcept { return pc_offset_; }
+    void SetPCOffset(uint32_t pc) noexcept { pc_offset_ = pc; }
+    std::vector<TaggedValue>& SavedRegisters() noexcept { return saved_registers_; }
+    const std::vector<TaggedValue>& Args() const noexcept { return args_; }
+    TaggedValue ThisVal() const noexcept { return this_val_; }
+    LexicalEnvironment* Environment() const noexcept { return environment_; }
+    void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
+
+    size_t ObjectSize() const override {
+        return sizeof(JSGeneratorObject) + saved_registers_.capacity() * sizeof(TaggedValue);
+    }
+
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        if (function_ != nullptr) {
+            TaggedValue fn_val = TaggedValue::FromHeapObject(function_);
+            visitor(fn_val);
+            if (fn_val.IsHeapObject()) function_ = static_cast<JSFunction*>(fn_val.AsHeapObject());
+        }
+        if (environment_ != nullptr) {
+            TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
+            visitor(env_val);
+            if (env_val.IsHeapObject()) environment_ = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
+        }
+        if (!this_val_.IsEmpty()) visitor(this_val_);
+        for (auto& r : saved_registers_) {
+            if (!r.IsEmpty()) visitor(r);
+        }
+        for (auto& a : args_) {
+            if (!a.IsEmpty()) visitor(a);
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSGeneratorObject(std::move(*this));
+    }
+
+private:
+    JSFunction* function_{nullptr};
+    std::vector<TaggedValue> args_;
+    TaggedValue this_val_{TaggedValue::Undefined()};
+    LexicalEnvironment* environment_{nullptr};
+    std::vector<TaggedValue> saved_registers_;
+    uint32_t pc_offset_{0};
+    State state_{State::SuspendedStart};
 };
 
 /**

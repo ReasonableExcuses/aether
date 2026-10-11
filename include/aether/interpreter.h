@@ -69,6 +69,9 @@ public:
     const BytecodeArray& GetBytecode() const noexcept { return bytecode_; }
     const std::vector<TaggedValue>& Args() const noexcept { return args_; }
 
+    JSGeneratorObject* GetGenerator() const noexcept { return generator_; }
+    void SetGenerator(JSGeneratorObject* gen) noexcept { generator_ = gen; }
+
 private:
     const BytecodeArray& bytecode_;
     TaggedValue this_value_{TaggedValue::Undefined()};
@@ -76,6 +79,7 @@ private:
     std::vector<TaggedValue> registers_;
     std::vector<ExceptionHandler> handlers_;
     const std::vector<TaggedValue>& args_;
+    JSGeneratorObject* generator_{nullptr};
 };
 
 /**
@@ -89,6 +93,11 @@ public:
      * @brief Executes a bytecode array and returns the resulting TaggedValue.
      */
     TaggedValue Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args = {}, TaggedValue this_val = TaggedValue::Undefined(), LexicalEnvironment* env = nullptr);
+
+    /**
+     * @brief Resumes a suspended JSGeneratorObject with the given sent value.
+     */
+    TaggedValue ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val);
 
     TypeFeedbackVector& GetFeedbackVector() noexcept { return feedback_; }
 
@@ -120,6 +129,8 @@ private:
     bool has_pending_exception_{false};
     TaggedValue pending_exception_{TaggedValue::Undefined()};
     LexicalEnvironment* last_environment_{nullptr};
+
+    TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr);
 };
 
 } // namespace aether

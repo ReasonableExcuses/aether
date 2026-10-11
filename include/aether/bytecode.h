@@ -95,6 +95,7 @@ enum class Opcode : uint8_t {
     Throw,                  // [Op]                    throw acc
 
     // Execution & Control
+    Yield,              // [Op]                        suspend and yield acc
     Return,             // [Op]                        return acc
     Halt,               // [Op]                        halt execution
     Count               // Total opcode count marker

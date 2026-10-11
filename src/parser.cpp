@@ -216,6 +216,7 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl() {
 
 std::unique_ptr<Stmt> Parser::ParseFunctionDecl() {
     Consume(TokenKind::Function, "Expected 'function'");
+    bool is_generator = Match(TokenKind::Star);
     Token name_tok = Consume(TokenKind::Identifier, "Expected function name");
     Consume(TokenKind::OpenParen, "Expected '(' after function name");
 
@@ -243,6 +244,9 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl() {
 
     std::unique_ptr<BlockStmt> body = ParseBlock();
     auto fn_decl = std::make_unique<FunctionDeclStmt>(name_tok.text, std::move(params), std::move(body));
+    if (is_generator) {
+        fn_decl->SetGenerator(true);
+    }
     if (!rest_param.empty()) {
         fn_decl->SetRest(rest_param);
     }
@@ -273,6 +277,121 @@ std::unique_ptr<Stmt> Parser::ParseWhile() {
 
 std::unique_ptr<Stmt> Parser::ParseFor() {
     Consume(TokenKind::OpenParen, "Expected '(' after 'for'");
+
+    // Speculative lookahead for "for ( [let|var|const]? (id | [a, b]) of iterable )"
+    Lexer saved_lexer = lexer_;
+    Token saved_tok = current_token_;
+
+    bool is_for_of = false;
+    bool is_destruct = false;
+    std::string var_name = "";
+    std::vector<std::string> destruct_vars;
+
+    if (Match(TokenKind::Var) || Match(TokenKind::Let) || Match(TokenKind::Const)) {
+        // Declaration specifier matched
+    }
+
+    if (Check(TokenKind::Identifier)) {
+        Token id_tok = Advance();
+        if (Match(TokenKind::Of)) {
+            is_for_of = true;
+            var_name = id_tok.text;
+        }
+    } else if (Match(TokenKind::OpenBracket)) {
+        if (!Check(TokenKind::CloseBracket)) {
+            do {
+                Token el = Consume(TokenKind::Identifier, "Expected identifier in destructuring");
+                destruct_vars.push_back(el.text);
+            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
+        }
+        Consume(TokenKind::CloseBracket, "Expected ']' in destructuring");
+        if (Match(TokenKind::Of)) {
+            is_for_of = true;
+            is_destruct = true;
+        }
+    }
+
+    if (is_for_of) {
+        auto iterable = ParseExpression();
+        Consume(TokenKind::CloseParen, "Expected ')' after for-of iterable");
+        auto body = ParseStatement();
+
+        static uint32_t s_for_of_id = 0;
+        std::string iter_var = "$iter_" + std::to_string(++s_for_of_id);
+        std::string step_var = "$step_" + std::to_string(s_for_of_id);
+
+        auto outer_block = std::make_unique<BlockStmt>();
+
+        // $iter = iterable[Symbol.iterator]()
+        auto get_sym_iter = std::make_unique<PropertyAccessExpr>(
+            std::make_unique<IdentifierExpr>("Symbol"),
+            "iterator"
+        );
+        auto get_iter_fn = std::make_unique<IndexAccessExpr>(
+            std::move(iterable),
+            std::move(get_sym_iter)
+        );
+        auto call_iter = std::make_unique<CallExpr>(
+            std::move(get_iter_fn),
+            std::vector<std::unique_ptr<Expr>>{}
+        );
+        outer_block->AddStatement(std::make_unique<VarDeclStmt>(iter_var, std::move(call_iter)));
+
+        // $step = $iter.next()
+        auto call_next = [iter_var]() {
+            auto get_next_fn = std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>(iter_var),
+                "next"
+            );
+            return std::make_unique<CallExpr>(std::move(get_next_fn), std::vector<std::unique_ptr<Expr>>{});
+        };
+        outer_block->AddStatement(std::make_unique<VarDeclStmt>(step_var, call_next()));
+
+        // condition: !$step.done
+        auto cond = std::make_unique<UnaryExpr>(
+            UnaryOp::LogicalNot,
+            std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>(step_var),
+                "done"
+            )
+        );
+
+        // loop body block
+        auto loop_body = std::make_unique<BlockStmt>();
+        if (is_destruct) {
+            std::string temp_val = "$item_" + std::to_string(s_for_of_id);
+            loop_body->AddStatement(std::make_unique<VarDeclStmt>(
+                temp_val,
+                std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>(step_var), "value")
+            ));
+            for (size_t i = 0; i < destruct_vars.size(); ++i) {
+                auto idx_access = std::make_unique<IndexAccessExpr>(
+                    std::make_unique<IdentifierExpr>(temp_val),
+                    std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
+                );
+                loop_body->AddStatement(std::make_unique<VarDeclStmt>(destruct_vars[i], std::move(idx_access)));
+            }
+        } else {
+            auto step_val = std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>(step_var),
+                "value"
+            );
+            loop_body->AddStatement(std::make_unique<VarDeclStmt>(var_name, std::move(step_val)));
+        }
+
+        loop_body->AddStatement(std::move(body));
+
+        // update: $step = $iter.next()
+        auto update_step = std::make_unique<AssignExpr>(step_var, call_next());
+        loop_body->AddStatement(std::make_unique<ExprStmt>(std::move(update_step)));
+
+        outer_block->AddStatement(std::make_unique<WhileStmt>(std::move(cond), std::move(loop_body)));
+        return outer_block;
+    }
+
+    // Standard for loop
+    lexer_ = saved_lexer;
+    current_token_ = saved_tok;
 
     std::unique_ptr<Stmt> init = nullptr;
     if (!Check(TokenKind::Semicolon)) {
@@ -514,22 +633,42 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return expr;
         }
         case TokenKind::OpenBrace: {
-            // Object literal: { key: val, ...spread }
-            std::vector<std::pair<std::string, std::unique_ptr<Expr>>> props;
+            // Object literal: { key: val, [expr]: val, ...spread }
+            std::vector<ObjectLiteralExpr::Property> props;
             if (!Check(TokenKind::CloseBrace)) {
                 do {
                     if (Match(TokenKind::DotDotDot)) {
                         auto spread_expr = ParseExpression();
-                        props.emplace_back("", std::make_unique<SpreadExpr>(std::move(spread_expr)));
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = "",
+                            .computed_key = nullptr,
+                            .value = std::make_unique<SpreadExpr>(std::move(spread_expr))
+                        });
+                        continue;
+                    }
+                    if (Match(TokenKind::OpenBracket)) {
+                        auto computed_key = ParseExpression();
+                        Consume(TokenKind::CloseBracket, "Expected ']' after computed property key");
+                        Consume(TokenKind::Colon, "Expected ':' after computed property key");
+                        auto val = ParseExpression();
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = "",
+                            .computed_key = std::move(computed_key),
+                            .value = std::move(val)
+                        });
                         continue;
                     }
                     Token key_tok = Advance();
-                    if (key_tok.kind != TokenKind::Identifier && key_tok.kind != TokenKind::String) {
+                    if (key_tok.kind != TokenKind::Identifier && key_tok.kind != TokenKind::String && key_tok.kind != TokenKind::Number) {
                         throw std::runtime_error("Expected property key in object literal");
                     }
                     Consume(TokenKind::Colon, "Expected ':' after property key");
                     auto val = ParseExpression();
-                    props.emplace_back(key_tok.text, std::move(val));
+                    props.push_back(ObjectLiteralExpr::Property{
+                        .key = key_tok.text,
+                        .computed_key = nullptr,
+                        .value = std::move(val)
+                    });
                 } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
             }
             Consume(TokenKind::CloseBrace, "Expected '}' after object literal");
@@ -597,24 +736,51 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             }
             return std::make_unique<NewExpr>(std::move(callee), std::move(args));
         }
+        case TokenKind::Yield: {
+            bool is_delegate = Match(TokenKind::Star);
+            std::unique_ptr<Expr> expr = nullptr;
+            if (!Check(TokenKind::Semicolon) && !Check(TokenKind::CloseBrace) && !Check(TokenKind::CloseParen) && !Check(TokenKind::Comma) && !Check(TokenKind::EndOfFile)) {
+                expr = ParseExpression();
+            }
+            return std::make_unique<YieldExpr>(std::move(expr), is_delegate);
+        }
         case TokenKind::Function: {
+            bool is_generator = Match(TokenKind::Star);
             std::string name = "";
             if (Check(TokenKind::Identifier)) {
                 name = Advance().text;
             }
             Consume(TokenKind::OpenParen, "Expected '(' after 'function'");
             std::vector<std::string> params;
+            std::string rest_param = "";
             if (!Check(TokenKind::CloseParen)) {
-                Token p = Consume(TokenKind::Identifier, "Expected parameter name");
-                params.push_back(p.text);
-                while (Match(TokenKind::Comma)) {
-                    Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
-                    params.push_back(np.text);
+                if (Match(TokenKind::DotDotDot)) {
+                    Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                    rest_param = r.text;
+                } else {
+                    Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                    params.push_back(p.text);
+                    while (Match(TokenKind::Comma)) {
+                        if (Match(TokenKind::DotDotDot)) {
+                            Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                            rest_param = r.text;
+                            break;
+                        }
+                        Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                        params.push_back(np.text);
+                    }
                 }
             }
             Consume(TokenKind::CloseParen, "Expected ')' after parameters");
             auto body = ParseBlock();
-            return std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+            auto fn_expr = std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+            if (is_generator) {
+                fn_expr->SetGenerator(true);
+            }
+            if (!rest_param.empty()) {
+                fn_expr->SetRest(rest_param);
+            }
+            return fn_expr;
         }
         default:
             throw std::runtime_error(std::string("SyntaxError: Unexpected token '") + tok.text + 
