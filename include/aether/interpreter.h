@@ -41,6 +41,9 @@ public:
         registers_[reg] = val;
     }
 
+    std::vector<TaggedValue>& GetRegisters() noexcept { return registers_; }
+    const std::vector<TaggedValue>& GetRegisters() const noexcept { return registers_; }
+
     TaggedValue GetThis() const noexcept { return this_value_; }
     void SetThis(TaggedValue val) noexcept { this_value_ = val; }
 

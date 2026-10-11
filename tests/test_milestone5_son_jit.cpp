@@ -3,6 +3,7 @@
 #include "aether/bytecode.h"
 #include "aether/sea_of_nodes.h"
 #include "aether/optimizing_jit.h"
+#include "aether/interpreter.h"
 #include "aether/lexer.h"
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
@@ -178,6 +179,93 @@ void TestTier2PeakThroughputBenchmark() {
     assert(result.AsSmi() == 3000000);
 }
 
+void TestTier2AutomaticPromotion() {
+    std::cout << "[Test 6] Verifying Automatic Three-Tier Execution Pipeline (Tier 0 -> Tier 1 -> Tier 2)...\n" << std::flush;
+
+    const char* src = 
+        "function compute(n) {\n"
+        "    var sum = 0;\n"
+        "    var i = 0;\n"
+        "    while (i < n) {\n"
+        "        sum = sum + i;\n"
+        "        i = i + 1;\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n";
+
+    Lexer lexer(src);
+    Parser parser(lexer);
+    auto func_decl = parser.ParseStatement();
+
+    BytecodeEmitter emitter;
+    auto bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+    assert(bc != nullptr);
+
+    Interpreter interp;
+
+    // Initially: Tier 0 (Interpreter only)
+    assert(bc->GetTier1Code() == nullptr);
+    assert(bc->GetTier2Code() == nullptr);
+    assert(bc->InvocationCount() == 0);
+
+    while (bc->InvocationCount() < BaselineJIT::kInvocationThreshold - 1) {
+        TaggedValue res = interp.Execute(*bc, { TaggedValue::FromSmi(10) });
+        assert(res.IsSmi() && res.AsSmi() == 45);
+        assert(bc->GetTier1Code() == nullptr);
+        assert(bc->GetTier2Code() == nullptr);
+    }
+
+    // Invocation at threshold: automatically promotes to Tier 1 Baseline JIT
+    TaggedValue res_t1 = interp.Execute(*bc, { TaggedValue::FromSmi(10) });
+    assert(res_t1.IsSmi() && res_t1.AsSmi() == 45);
+    assert(bc->GetTier1Code() != nullptr);
+    assert(bc->GetTier2Code() == nullptr);
+
+    // Invocations up to OptimizingJIT::kInvocationThreshold - 1: runs through Tier 1 Baseline JIT
+    while (bc->InvocationCount() < OptimizingJIT::kInvocationThreshold - 1) {
+        TaggedValue res = interp.Execute(*bc, { TaggedValue::FromSmi(10) });
+        assert(res.IsSmi() && res.AsSmi() == 45);
+        assert(bc->GetTier1Code() != nullptr);
+        assert(bc->GetTier2Code() == nullptr);
+    }
+
+    // Invocation at threshold: automatically promotes to Tier 2 Optimizing JIT
+    TaggedValue res_t2 = interp.Execute(*bc, { TaggedValue::FromSmi(10) });
+    assert(res_t2.IsSmi() && res_t2.AsSmi() == 45);
+    assert(bc->GetTier2Code() != nullptr);
+
+    // Invocations running directly through Tier 2 Optimizing JIT
+    for (uint32_t i = 0; i < 10; ++i) {
+        TaggedValue res = interp.Execute(*bc, { TaggedValue::FromSmi(10) });
+        assert(res.IsSmi() && res.AsSmi() == 45);
+    }
+
+    std::cout << "  -> Automatically promoted from Interpreter to Tier 1 JIT to Tier 2 JIT with identical output (45).\n" << std::flush;
+}
+
+void TestUnsupportedBytecodeGating() {
+    std::cout << "[Test 7] Verifying Unsupported Bytecode Gating in Tier 2 Compiler...\n" << std::flush;
+
+    // Bytecode that creates an object literal (Opcode::CreateObject)
+    BytecodeArray bc(1, 0);
+    bc.EmitOpcode(Opcode::CreateObject);
+    bc.EmitOpcode(Opcode::Return);
+
+    // Tier 2 should explicitly reject this bytecode
+    assert(!OptimizingJIT::CanCompile(bc));
+
+    Interpreter interp;
+    for (uint32_t i = 0; i < 150; ++i) {
+        TaggedValue res = interp.Execute(bc, {});
+        assert(res.IsHeapObject() && res.AsHeapObject()->IsJSObject());
+    }
+
+    // Must never compile to Tier 2
+    assert(bc.GetTier2Code() == nullptr);
+
+    std::cout << "  -> Unsupported bytecode successfully gated and excluded from Tier 2 compilation.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 5 (Tier 2 Sea-of-Nodes JIT) Tests  \n"
@@ -192,9 +280,13 @@ int main() {
     TestTier2OptimizedExecution();
     std::cout << "\n" << std::flush;
     TestTier2PeakThroughputBenchmark();
+    std::cout << "\n" << std::flush;
+    TestTier2AutomaticPromotion();
+    std::cout << "\n" << std::flush;
+    TestUnsupportedBytecodeGating();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (5/5)         \n"
+              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (7/7)         \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

@@ -113,6 +113,11 @@ public:
     void Jmp(JITLabel& label);
     void Jcc(Condition cond, JITLabel& label);
     void Bind(JITLabel& label);
+    void CallReg(X86Reg reg);
+
+    // Stack Adjustment
+    void SubRspImm32(int32_t imm);
+    void AddRspImm32(int32_t imm);
 
     // Utilities
     size_t CurrentOffset() const noexcept { return code_.size(); }

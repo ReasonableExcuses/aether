@@ -6,6 +6,7 @@
 #include "aether/heap_object.h"
 #include "aether/gc.h"
 #include <vector>
+#include <unordered_set>
 #include <functional>
 #include <iostream>
 
@@ -103,12 +104,24 @@ public:
         return obj;
     }
 
+    template <typename T, typename... Args>
+    T* AllocateOld(Args&&... args) {
+        size_t bytes = sizeof(T);
+        bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+        void* mem = old_gen_.Allocate(bytes);
+        assert(mem != nullptr && "Old Generation allocation failed");
+        T* obj = new (mem) T(std::forward<Args>(args)...);
+        obj->SetOld(true);
+        return obj;
+    }
+
     // Generational Write Barrier
     AETHER_ALWAYS_INLINE void WriteBarrier(HeapObject* source, TaggedValue value) noexcept {
         if (source != nullptr && source->IsOld() && value.IsHeapObject()) {
             HeapObject* target = value.AsHeapObject();
             if (target->IsYoung()) {
                 card_table_.MarkCard(source);
+                remembered_old_objects_.insert(source);
             }
         }
     }
@@ -116,6 +129,9 @@ public:
     // GC Passes
     void MinorGC(); // Cheney Scavenge
     void MajorGC(); // Full Mark-Sweep
+
+    static IsolateHeap* Current() noexcept;
+    static void SetCurrent(IsolateHeap* heap) noexcept;
 
     // Root management
     void PushHandleScope(HandleScope* scope) noexcept {
@@ -157,6 +173,8 @@ private:
 
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;
+    std::unordered_set<HeapObject*> remembered_old_objects_;
+    std::vector<HeapObject*> previously_marked_objects_;
 
     size_t minor_gc_count_{0};
     size_t major_gc_count_{0};
@@ -173,6 +191,14 @@ inline HandleScope::~HandleScope() {
 }
 
 using Heap = IsolateHeap;
+
+template <typename T, typename... Args>
+inline T* AllocateRuntime(Args&&... args) {
+    if (IsolateHeap* h = IsolateHeap::Current()) {
+        return h->Allocate<T>(std::forward<Args>(args)...);
+    }
+    return new T(std::forward<Args>(args)...);
+}
 
 } // namespace aether
 

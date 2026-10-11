@@ -122,6 +122,68 @@ void TestCuratedTest262Suite() {
     std::cout << "  -> Curated Test262 Conformance Suite 100% Passed!\n" << std::flush;
 }
 
+void TestNegativeErrorTypeMismatch() {
+    std::cout << "[Test 4] Verifying Negative Test Strict Error-Type Validation...\n" << std::flush;
+
+    Test262Harness harness("test/test262/harness");
+
+    // Case 1: Test expects TypeError, but code produces a SyntaxError.
+    // The harness MUST mark this as FAIL, never PASS!
+    std::string wrong_err_script = R"(
+/*---
+negative:
+  phase: parse
+  type: TypeError
+---*/
+let invalid syntax ; =
+)";
+    Test262Result res1 = harness.RunTest(wrong_err_script, "negative_mismatch_syntax_for_typeerror.js");
+    assert(res1.kind == Test262ResultKind::Fail);
+    assert(res1.message.find("TypeError") != std::string::npos);
+
+    // Case 2: Test expects TypeError, and code throws TypeError.
+    // The harness MUST mark this as PASS.
+    std::string matching_type_script = R"(
+/*---
+negative:
+  phase: runtime
+  type: TypeError
+---*/
+throw new TypeError("correct type error");
+)";
+    Test262Result res2 = harness.RunTest(matching_type_script, "negative_match_typeerror.js");
+    assert(res2.kind == Test262ResultKind::Pass);
+
+    // Case 3: Test expects ReferenceError, but code throws TypeError.
+    // The harness MUST mark this as FAIL.
+    std::string wrong_runtime_script = R"(
+/*---
+negative:
+  phase: runtime
+  type: ReferenceError
+---*/
+throw new TypeError("wrong error type");
+)";
+    Test262Result res3 = harness.RunTest(wrong_runtime_script, "negative_mismatch_runtime.js");
+    assert(res3.kind == Test262ResultKind::Fail);
+    assert(res3.message.find("ReferenceError") != std::string::npos);
+
+    // Case 4: Test expects SyntaxError and produces SyntaxError.
+    // The harness MUST mark this as PASS.
+    std::string matching_syntax_script = R"(
+/*---
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+let bad +++ syntax;
+)";
+    Test262Result res4 = harness.RunTest(matching_syntax_script, "negative_match_syntaxerror.js");
+    assert(res4.kind == Test262ResultKind::Pass);
+
+    std::cout << "  -> Negative test error matching strictly verified: mismatch errors correctly marked as failures.\n" << std::flush;
+}
+
 int main() {
     std::cout << "=========================================================\n";
     std::cout << " AetherVM Test262 Conformance Suite & Harness Tests\n";
@@ -130,6 +192,7 @@ int main() {
     TestFrontmatterParsing();
     TestDirectHarnessAssertions();
     TestCuratedTest262Suite();
+    TestNegativeErrorTypeMismatch();
 
     std::cout << "\n[PASS] All Test262 Conformance Suite Tests Passed Successfully!\n";
     return 0;

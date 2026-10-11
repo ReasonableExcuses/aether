@@ -1,5 +1,9 @@
 #include "aether/baseline_jit.h"
 
+extern "C" uint64_t Aether_ToBoolean(uint64_t raw_bits) {
+    return aether::TaggedValue(raw_bits).ToBoolean() ? 1ULL : 0ULL;
+}
+
 namespace aether {
 
 bool BaselineJIT::CanCompile(const BytecodeArray& bytecode) {
@@ -308,34 +312,55 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;
                 size_t target_pc = pc + offset;
-                masm.MovRegImm64(X86Reg::RCX, TaggedValue::True().RawBits());
-                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
-                masm.Jcc(Condition::Equal, labels[target_pc]);
+                // Preserve accumulator in RBX (callee-saved)
+                masm.MovRegReg(X86Reg::RBX, X86Reg::RAX);
+                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.SubRspImm32(40);
+                masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
+                masm.CallReg(X86Reg::R10);
+                masm.AddRspImm32(40);
+                // RAX has boolean result (0 or 1). Move to RCX, restore original acc into RAX.
+                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.MovRegReg(X86Reg::RAX, X86Reg::RBX);
+                // Check if result was truthy (RCX != 0)
+                masm.TestRegReg(X86Reg::RCX, X86Reg::RCX);
+                masm.Jcc(Condition::NotEqual, labels[target_pc]);
                 break;
             }
             case Opcode::JumpIfFalse: {
                 int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;
                 size_t target_pc = pc + offset;
-                // Check False
-                masm.MovRegImm64(X86Reg::RCX, TaggedValue::False().RawBits());
-                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
-                masm.Jcc(Condition::Equal, labels[target_pc]);
-                // Check Smi(0)
-                masm.MovRegImm64(X86Reg::RCX, TaggedValue::FromSmi(0).RawBits());
-                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                // Preserve accumulator in RBX (callee-saved)
+                masm.MovRegReg(X86Reg::RBX, X86Reg::RAX);
+                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.SubRspImm32(40);
+                masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
+                masm.CallReg(X86Reg::R10);
+                masm.AddRspImm32(40);
+                // RAX has boolean result (0 or 1). Move to RCX, restore original acc into RAX.
+                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.MovRegReg(X86Reg::RAX, X86Reg::RBX);
+                // Check if result was falsy (RCX == 0)
+                masm.TestRegReg(X86Reg::RCX, X86Reg::RCX);
                 masm.Jcc(Condition::Equal, labels[target_pc]);
                 break;
             }
             case Opcode::LogicalNot: {
-                masm.MovRegImm64(X86Reg::RCX, TaggedValue::True().RawBits());
-                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
-                JITLabel was_true;
+                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.SubRspImm32(40);
+                masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
+                masm.CallReg(X86Reg::R10);
+                masm.AddRspImm32(40);
+                // RAX now has boolean result (0 or 1).
+                // If it was truthy (RAX != 0), output False. If falsy (RAX == 0), output True.
+                masm.TestRegReg(X86Reg::RAX, X86Reg::RAX);
+                JITLabel was_truthy;
                 JITLabel done;
-                masm.Jcc(Condition::Equal, was_true);
+                masm.Jcc(Condition::NotEqual, was_truthy);
                 masm.MovRegImm64(X86Reg::RAX, TaggedValue::True().RawBits());
                 masm.Jmp(done);
-                masm.Bind(was_true);
+                masm.Bind(was_truthy);
                 masm.MovRegImm64(X86Reg::RAX, TaggedValue::False().RawBits());
                 masm.Bind(done);
                 break;

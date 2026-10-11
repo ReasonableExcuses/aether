@@ -297,4 +297,22 @@ void MacroAssembler::Bind(JITLabel& label) {
     label.unresolved_branches.clear();
 }
 
+void MacroAssembler::CallReg(X86Reg reg) {
+    if (static_cast<uint8_t>(reg) >= 8) {
+        Emit8(0x41);
+    }
+    Emit8(0xFF);
+    Emit8(static_cast<uint8_t>(0xD0 | (static_cast<uint8_t>(reg) & 7)));
+}
+
+void MacroAssembler::SubRspImm32(int32_t imm) {
+    Emit8(0x48); Emit8(0x81); Emit8(0xEC);
+    Emit32(static_cast<uint32_t>(imm));
+}
+
+void MacroAssembler::AddRspImm32(int32_t imm) {
+    Emit8(0x48); Emit8(0x81); Emit8(0xC4);
+    Emit32(static_cast<uint32_t>(imm));
+}
+
 } // namespace aether

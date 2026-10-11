@@ -13,6 +13,9 @@
 
 namespace aether {
 
+class HeapObject;
+void RecordWriteBarrier(HeapObject* source, TaggedValue value);
+
 enum class HeapObjectType : uint16_t {
     Shape       = 0x01,
     String      = 0x02,
@@ -204,13 +207,16 @@ public:
         if (AETHER_LIKELY(in_object)) {
             assert(slot_index < Shape::kDefaultInObjectProperties);
             in_object_slots_[slot_index] = value;
-            return;
+        } else {
+            size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
+            if (ool_idx >= out_of_line_slots_.size()) {
+                out_of_line_slots_.resize(ool_idx + 1, TaggedValue::Empty());
+            }
+            out_of_line_slots_[ool_idx] = value;
         }
-        size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
-        if (ool_idx >= out_of_line_slots_.size()) {
-            out_of_line_slots_.resize(ool_idx + 1, TaggedValue::Empty());
+        if (AETHER_UNLIKELY(IsOld() && value.IsHeapObject())) {
+            RecordWriteBarrier(this, value);
         }
-        out_of_line_slots_[ool_idx] = value;
     }
 
     // Full property lookup and mutation with shape transitions
@@ -218,10 +224,22 @@ public:
     void SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id);
 
     JSObject* GetPrototype() const noexcept { return prototype_; }
-    void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
+    void SetPrototype(JSObject* proto) noexcept {
+        prototype_ = proto;
+        if (AETHER_UNLIKELY(IsOld() && proto != nullptr)) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(proto));
+        }
+    }
 
     size_t ObjectSize() const override { return sizeof(JSObject); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        if (prototype_ != nullptr) {
+            TaggedValue proto_val = TaggedValue::FromHeapObject(prototype_);
+            visitor(proto_val);
+            if (proto_val.IsHeapObject()) {
+                prototype_ = proto_val.As<JSObject>();
+            }
+        }
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
             if (!in_object_slots_[i].IsEmpty()) {
                 visitor(in_object_slots_[i]);
@@ -282,10 +300,16 @@ public:
             elements_.resize(index + 1, TaggedValue::Undefined());
         }
         elements_[index] = val;
+        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+            RecordWriteBarrier(this, val);
+        }
     }
 
     void Push(TaggedValue val) {
         elements_.push_back(val);
+        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+            RecordWriteBarrier(this, val);
+        }
     }
 
     TaggedValue Pop() {
@@ -514,6 +538,9 @@ public:
     void SetSlot(size_t index, TaggedValue val) {
         assert(index < slots_.size());
         slots_[index] = val;
+        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+            RecordWriteBarrier(this, val);
+        }
     }
 
     TaggedValue Get(uint8_t depth, uint16_t index) const {
@@ -530,13 +557,25 @@ public:
         for (uint8_t d = 0; d < depth && curr; ++d) {
             curr = curr->outer_;
         }
-        if (curr && index < curr->slots_.size()) curr->slots_[index] = val;
+        if (curr && index < curr->slots_.size()) {
+            curr->slots_[index] = val;
+            if (AETHER_UNLIKELY(curr->IsOld() && val.IsHeapObject())) {
+                RecordWriteBarrier(curr, val);
+            }
+        }
     }
 
     LexicalEnvironment(LexicalEnvironment&& other) noexcept = default;
 
     size_t ObjectSize() const override { return sizeof(LexicalEnvironment) + slots_.size() * sizeof(TaggedValue); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        if (outer_ != nullptr) {
+            TaggedValue outer_val = TaggedValue::FromHeapObject(outer_);
+            visitor(outer_val);
+            if (outer_val.IsHeapObject()) {
+                outer_ = outer_val.As<LexicalEnvironment>();
+            }
+        }
         for (auto& s : slots_) {
             if (!s.IsEmpty()) visitor(s);
         }
@@ -590,7 +629,22 @@ public:
     void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        if (environment_ != nullptr) {
+            TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
+            visitor(env_val);
+            if (env_val.IsHeapObject()) {
+                environment_ = env_val.As<LexicalEnvironment>();
+            }
+        }
+        if (prototype_ != nullptr) {
+            TaggedValue proto_val = TaggedValue::FromHeapObject(prototype_);
+            visitor(proto_val);
+            if (proto_val.IsHeapObject()) {
+                prototype_ = proto_val.As<JSObject>();
+            }
+        }
+    }
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSFunction(std::move(*this));

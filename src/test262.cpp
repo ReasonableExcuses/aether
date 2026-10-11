@@ -268,8 +268,26 @@ Test262Result Test262Harness::RunTest(std::string_view source, std::string_view 
         agent.EvaluateScriptWithEventLoop(prepared);
 
         if (meta.is_negative) {
-            result.kind = Test262ResultKind::Fail;
-            result.message = "Expected negative error (" + meta.negative_type + ") in phase " + meta.negative_phase + ", but script completed successfully.";
+            if (agent.GetInterpreter().HasPendingException()) {
+                TaggedValue exc = agent.GetInterpreter().PendingException();
+                std::string exc_str = exc.ToString();
+                if (exc.IsHeapObject() && exc.AsHeapObject()->IsJSObject()) {
+                    auto* obj = static_cast<JSObject*>(exc.AsHeapObject());
+                    TaggedValue name_prop = obj->GetNamedProperty("name");
+                    if (name_prop.IsHeapObject() && name_prop.AsHeapObject()->IsString()) {
+                        exc_str = static_cast<JSString*>(name_prop.AsHeapObject())->Value();
+                    }
+                }
+                if (exc_str.find(meta.negative_type) != std::string::npos) {
+                    result.kind = Test262ResultKind::Pass;
+                } else {
+                    result.kind = Test262ResultKind::Fail;
+                    result.message = "Wrong pending exception type: expected " + meta.negative_type + ", got: " + exc_str;
+                }
+            } else {
+                result.kind = Test262ResultKind::Fail;
+                result.message = "Expected negative error (" + meta.negative_type + ") in phase " + meta.negative_phase + ", but script completed successfully.";
+            }
         } else {
             if (agent.GetInterpreter().HasPendingException()) {
                 TaggedValue exc = agent.GetInterpreter().PendingException();
@@ -282,7 +300,7 @@ Test262Result Test262Harness::RunTest(std::string_view source, std::string_view 
     } catch (const std::exception& ex) {
         std::string err = ex.what();
         if (meta.is_negative) {
-            if (err.find(meta.negative_type) != std::string::npos || (meta.negative_type == "SyntaxError" && err.find("SyntaxError") != std::string::npos)) {
+            if (err.find(meta.negative_type) != std::string::npos) {
                 result.kind = Test262ResultKind::Pass;
             } else {
                 result.kind = Test262ResultKind::Fail;
@@ -328,6 +346,7 @@ std::vector<Test262Result> Test262Harness::RunTestDirectory(const std::filesyste
 
     for (const auto& entry : std::filesystem::recursive_directory_iterator(dir_path)) {
         if (entry.is_regular_file() && entry.path().extension() == ".js") {
+            std::cout << "    [Running] " << entry.path().filename().string() << std::endl;
             results.push_back(RunTestFile(entry.path()));
         }
     }

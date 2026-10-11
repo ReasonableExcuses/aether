@@ -95,6 +95,7 @@ private:
 class Realm {
 public:
     explicit Realm(Heap& heap);
+    ~Realm();
 
     static Realm* Current() noexcept { return s_current_realm_; }
     static void SetCurrent(Realm* realm) noexcept { s_current_realm_ = realm; }
@@ -117,6 +118,9 @@ private:
     void InitializeIntrinsics(Heap& heap);
 
     static inline thread_local Realm* s_current_realm_{nullptr};
+
+    Heap* heap_{nullptr};
+    std::vector<std::unique_ptr<TaggedValue>> root_values_;
 
     std::unique_ptr<Shape> root_shape_;
     uint32_t next_shape_id_{1};

@@ -126,7 +126,7 @@ def run_single_test(binary_path, test_path, harness_dir, temp_file_path):
     combined_output = (proc.stdout + "\n" + proc.stderr).strip()
 
     if meta["is_negative"]:
-        if proc.returncode != 0 and (meta["negative_type"] in combined_output or "SyntaxError" in combined_output):
+        if proc.returncode != 0 and meta["negative_type"] in combined_output:
             return True, "Passed (Expected negative error caught)", elapsed_ms
         elif proc.returncode == 0:
             return False, f"Expected negative {meta['negative_type']} but script completed with 0", elapsed_ms

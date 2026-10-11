@@ -136,10 +136,17 @@ void JSMap::Set(TaggedValue key, TaggedValue val) {
     for (auto& entry : entries_) {
         if (SameValueZero(entry.first, key)) {
             entry.second = val;
+            if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+                RecordWriteBarrier(this, val);
+            }
             return;
         }
     }
     entries_.emplace_back(key, val);
+    if (AETHER_UNLIKELY(IsOld())) {
+        if (key.IsHeapObject()) RecordWriteBarrier(this, key);
+        if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+    }
 }
 
 TaggedValue JSMap::Get(TaggedValue key) const {
@@ -178,6 +185,9 @@ void JSSet::Add(TaggedValue val) {
         }
     }
     values_.push_back(val);
+    if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+        RecordWriteBarrier(this, val);
+    }
 }
 
 bool JSSet::Has(TaggedValue val) const {

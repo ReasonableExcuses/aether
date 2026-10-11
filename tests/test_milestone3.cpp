@@ -161,6 +161,58 @@ void TestHighAllocationPressure() {
               << " Minor GCs without memory leaks or corruption.\n" << std::flush;
 }
 
+void TestOldToYoungRememberedSetSurvival() {
+    std::cout << "[Test 7] Verifying Old-to-Young Remembered Set & Cross-Generational References...\n" << std::flush;
+
+    IsolateHeap heap;
+    auto root_shape = std::make_unique<Shape>(0, nullptr, "", TaggedValue::Null());
+
+    HandleScope scope(heap);
+
+    // 1. Allocate an old generation object directly in Immix Old Space
+    JSObject* old_obj = heap.AllocateOld<JSObject>(root_shape.get());
+    assert(old_obj->IsOld());
+
+    // Root the old object so it survives collections
+    Handle<JSObject> old_handle = scope.CreateHandle<JSObject>(old_obj);
+
+    // 2. Allocate a young nursery object without a direct handle/root
+    JSObject* young_child = heap.Allocate<JSObject>(root_shape.get());
+    assert(!young_child->IsOld());
+    void* initial_young_addr = young_child;
+
+    // 3. Store young child in old object's prototype (triggers WriteBarrier)
+    old_handle->SetPrototype(young_child);
+    assert(old_handle->GetPrototype() == young_child);
+
+    // Verify card is marked dirty
+    uintptr_t base = heap.GetNursery().FromSpaceStart();
+    uintptr_t addr = reinterpret_cast<uintptr_t>(old_obj);
+    size_t card_index = (addr - base) >> kCardShift;
+    assert(heap.GetCardTable().IsDirty(card_index));
+
+    // 4. Trigger first Minor GC: young_child is ONLY reachable through old_obj!
+    heap.MinorGC();
+    assert(heap.MinorGCCount() == 1);
+
+    // The young child must have been evacuated to ToSpace, and old_handle's prototype slot updated!
+    JSObject* evacuated_child = old_handle->GetPrototype();
+    assert(evacuated_child != nullptr);
+    assert(evacuated_child != initial_young_addr); // Pointer was updated to new nursery location
+    assert(evacuated_child->IsJSObject());
+    assert(evacuated_child->GetAge() == 1);
+
+    // 5. Trigger second Minor GC: evacuated_child should tenure or survive another scavenge
+    heap.MinorGC();
+    assert(heap.MinorGCCount() == 2);
+
+    JSObject* surviving_child = old_handle->GetPrototype();
+    assert(surviving_child != nullptr);
+    assert(surviving_child->IsJSObject());
+
+    std::cout << "  -> Old-to-young remembered set scanned and updated slots across multiple Minor GCs successfully.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 3 Verification Test Suite          \n"
@@ -177,9 +229,11 @@ int main() {
     TestMajorGC();
     std::cout << "\n" << std::flush;
     TestHighAllocationPressure();
+    std::cout << "\n" << std::flush;
+    TestOldToYoungRememberedSetSurvival();
 
     std::cout << "\n========================================================\n"
-              << "   ALL MILESTONE 3 ARCHITECTURAL TESTS PASSED (6/6)     \n"
+              << "   ALL MILESTONE 3 ARCHITECTURAL TESTS PASSED (7/7)     \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

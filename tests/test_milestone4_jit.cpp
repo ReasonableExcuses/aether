@@ -3,12 +3,15 @@
 #include "aether/bytecode.h"
 #include "aether/assembler.h"
 #include "aether/baseline_jit.h"
+#include "aether/interpreter.h"
+#include "aether/heap_object.h"
 #include "aether/lexer.h"
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
 
 #include <iostream>
 #include <chrono>
+#include <limits>
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -180,6 +183,66 @@ void TestHighThroughputNativeExecution() {
     assert(result.AsSmi() == 3000000);
 }
 
+void TestBaselineJITTruthinessSemantics() {
+    std::cout << "[Test 5] Verifying Baseline JIT vs Interpreter Truthiness Semantics...\n" << std::flush;
+
+    const char* src = 
+        "function testBranch(val) {\n"
+        "    if (val) {\n"
+        "        return 100;\n"
+        "    }\n"
+        "    return 200;\n"
+        "}\n";
+
+    Lexer lexer(src);
+    Parser parser(lexer);
+    auto func_decl = parser.ParseStatement();
+
+    BytecodeEmitter emitter;
+    auto func_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+
+    auto jit_code = BaselineJIT::Compile(*func_bc);
+    assert(jit_code != nullptr);
+
+    Interpreter interp;
+
+    auto test_val = [&](TaggedValue v, int32_t expected) {
+        TaggedValue args[1] = { v };
+        TaggedValue jit_res = BaselineJIT::Invoke(*jit_code, args, 1);
+        TaggedValue interp_res = interp.Execute(*func_bc, { v });
+        assert(jit_res.IsSmi());
+        assert(interp_res.IsSmi());
+        assert(jit_res.AsSmi() == expected);
+        assert(interp_res.AsSmi() == expected);
+    };
+
+    // Falsy values: all must take the false branch and return 200
+    test_val(TaggedValue::Undefined(), 200);
+    test_val(TaggedValue::Null(), 200);
+    test_val(TaggedValue::False(), 200);
+    test_val(TaggedValue::FromSmi(0), 200);
+    test_val(TaggedValue::FromDouble(0.0), 200);
+    test_val(TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN()), 200);
+
+    // Create empty string
+    auto empty_str = std::make_unique<JSString>("");
+    test_val(TaggedValue::FromHeapObject(empty_str.get()), 200);
+
+    // Truthy values: all must take the true branch and return 100
+    test_val(TaggedValue::True(), 100);
+    test_val(TaggedValue::FromSmi(1), 100);
+    test_val(TaggedValue::FromSmi(-1), 100);
+    test_val(TaggedValue::FromDouble(3.14), 100);
+
+    auto non_empty_str = std::make_unique<JSString>("hello");
+    test_val(TaggedValue::FromHeapObject(non_empty_str.get()), 100);
+
+    auto obj = std::make_unique<JSObject>(nullptr);
+    test_val(TaggedValue::FromHeapObject(obj.get()), 100);
+
+    std::cout << "  -> All JS falsy and truthy values produce identical results across JIT and Interpreter.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 4 (Tier 1 Baseline JIT) Test Suite\n"
@@ -192,9 +255,11 @@ int main() {
     TestNativeParameterizedFunction();
     std::cout << "\n" << std::flush;
     TestHighThroughputNativeExecution();
+    std::cout << "\n" << std::flush;
+    TestBaselineJITTruthinessSemantics();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (4/4)             \n"
+              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (5/5)             \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

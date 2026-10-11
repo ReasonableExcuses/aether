@@ -1,5 +1,6 @@
 #include "aether/interpreter.h"
 #include "aether/baseline_jit.h"
+#include "aether/optimizing_jit.h"
 #include "aether/runtime.h"
 #include <cmath>
 
@@ -22,14 +23,28 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         return BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
     }
 
-    // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled
+    // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled; promote to Tier 2 when hot
     if (const ExecutableMemory* t1 = bytecode.GetTier1Code()) {
         bytecode.IncrementInvocationCount();
+        if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
+            auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
+            if (opt_code) {
+                bytecode.SetTier2Code(std::move(opt_code));
+                return BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            }
+        }
         return BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
     }
 
-    // 3. Increment invocation profile counter; promote to Tier 1 when hot
+    // 3. Increment invocation profile counter; promote to Tier 2 if hot enough, or Tier 1
     bytecode.IncrementInvocationCount();
+    if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
+        auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
+        if (opt_code) {
+            bytecode.SetTier2Code(std::move(opt_code));
+            return BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        }
+    }
     if (bytecode.InvocationCount() >= BaselineJIT::kInvocationThreshold && BaselineJIT::CanCompile(bytecode)) {
         auto jit_code = BaselineJIT::Compile(bytecode);
         if (jit_code) {
@@ -39,6 +54,28 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     }
 
     ExecutionFrame frame(bytecode, args, this_val, env);
+    struct RootGuard {
+        TaggedValue* acc_ptr;
+        ExecutionFrame& frame;
+        IsolateHeap* heap;
+        RootGuard(TaggedValue* a, ExecutionFrame& f) : acc_ptr(a), frame(f), heap(IsolateHeap::Current()) {
+            if (heap) {
+                heap->RegisterExtraRoot(acc_ptr);
+                for (auto& r : frame.GetRegisters()) {
+                    heap->RegisterExtraRoot(&r);
+                }
+            }
+        }
+        ~RootGuard() {
+            if (heap) {
+                heap->UnregisterExtraRoot(acc_ptr);
+                for (auto& r : frame.GetRegisters()) {
+                    heap->UnregisterExtraRoot(&r);
+                }
+            }
+        }
+    } root_guard(&acc_, frame);
+
     struct EnvGuard {
         Interpreter& interp;
         ExecutionFrame& frame;

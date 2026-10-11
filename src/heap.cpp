@@ -3,16 +3,34 @@
 
 namespace aether {
 
+static thread_local IsolateHeap* s_current_heap_{nullptr};
+
+IsolateHeap* IsolateHeap::Current() noexcept { return s_current_heap_; }
+void IsolateHeap::SetCurrent(IsolateHeap* heap) noexcept { s_current_heap_ = heap; }
+
+void RecordWriteBarrier(HeapObject* source, TaggedValue value) {
+    if (s_current_heap_) {
+        s_current_heap_->WriteBarrier(source, value);
+    }
+}
+
 IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
       card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
+    if (!s_current_heap_) {
+        s_current_heap_ = this;
+    }
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
     }
 }
 
-IsolateHeap::~IsolateHeap() = default;
+IsolateHeap::~IsolateHeap() {
+    if (s_current_heap_ == this) {
+        s_current_heap_ = nullptr;
+    }
+}
 
 void IsolateHeap::EvacuateObject(TaggedValue& slot) {
     if (!slot.IsHeapObject()) return;
@@ -79,7 +97,26 @@ void IsolateHeap::MinorGC() {
         }
     }
 
-    // 3. Cheney-style breadth-first traversal in To-space
+    // 3. Scan Remembered Set (Old-to-Young references recorded in CardTable)
+    for (auto it = remembered_old_objects_.begin(); it != remembered_old_objects_.end(); ) {
+        HeapObject* old_obj = *it;
+        bool has_young_reference = false;
+        old_obj->IteratePointers([this, &has_young_reference](TaggedValue& slot) {
+            if (slot.IsHeapObject() && slot.AsHeapObject()->IsYoung()) {
+                EvacuateObject(slot);
+                if (slot.IsHeapObject() && slot.AsHeapObject()->IsYoung()) {
+                    has_young_reference = true;
+                }
+            }
+        });
+        if (!has_young_reference) {
+            it = remembered_old_objects_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // 4. Cheney-style breadth-first traversal in To-space
     while (scan_ptr < to_space_bump_) {
         HeapObject* obj = reinterpret_cast<HeapObject*>(scan_ptr);
         size_t size = obj->ObjectSize();
@@ -93,14 +130,24 @@ void IsolateHeap::MinorGC() {
         scan_ptr += size;
     }
 
-    // 4. Flip semi-spaces
+    // 5. Flip semi-spaces and re-synchronize card table with remembered set
     nursery_.Flip();
     card_table_.Clear();
+    for (HeapObject* old_obj : remembered_old_objects_) {
+        card_table_.MarkCard(old_obj);
+    }
     minor_gc_count_++;
 }
 
 void IsolateHeap::MajorGC() {
+    // 0. Reset marks on objects from previous GC cycle
+    for (HeapObject* obj : previously_marked_objects_) {
+        obj->SetMarked(false);
+    }
+    previously_marked_objects_.clear();
+
     std::vector<HeapObject*> mark_stack;
+    std::vector<HeapObject*> marked_objects;
 
     // 1. Mark phase starting from HandleScope roots
     HandleScope* scope = top_scope_;
@@ -111,6 +158,7 @@ void IsolateHeap::MajorGC() {
                 if (!obj->IsMarked()) {
                     obj->SetMarked(true);
                     mark_stack.push_back(obj);
+                    marked_objects.push_back(obj);
                 }
             }
         }
@@ -123,6 +171,7 @@ void IsolateHeap::MajorGC() {
             if (!obj->IsMarked()) {
                 obj->SetMarked(true);
                 mark_stack.push_back(obj);
+                marked_objects.push_back(obj);
             }
         }
     }
@@ -136,12 +185,13 @@ void IsolateHeap::MajorGC() {
             old_gen_.MarkObject(curr);
         }
 
-        curr->IteratePointers([&mark_stack](TaggedValue& child) {
+        curr->IteratePointers([&mark_stack, &marked_objects](TaggedValue& child) {
             if (child.IsHeapObject()) {
                 HeapObject* child_obj = child.AsHeapObject();
                 if (!child_obj->IsMarked()) {
                     child_obj->SetMarked(true);
                     mark_stack.push_back(child_obj);
+                    marked_objects.push_back(child_obj);
                 }
             }
         });
@@ -149,6 +199,10 @@ void IsolateHeap::MajorGC() {
 
     // 2. Sweep phase in Old Generation Immix space
     old_gen_.Sweep();
+
+    // 3. Save marked objects so their mark bits can be reset before the next Major GC cycle
+    previously_marked_objects_ = std::move(marked_objects);
+
     major_gc_count_++;
 }
 
