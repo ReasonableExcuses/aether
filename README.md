@@ -530,6 +530,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone12_modern_syntax.cpp # Modern ECMAScript Syntax & Lowerings tests
 │   ├── test_milestone13_iteration_symbols_generators.cpp # Symbols, Iteration Protocols & Generators tests
 │   ├── test_milestone14_async_await.cpp # Async / Await & Microtask Coroutines tests
+│   ├── test_milestone15_proxy_reflect.cpp # Proxy & Reflect Meta-Object Protocol tests
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
     └── run_test262.py            # Automated CLI Test262 runner tool
@@ -564,7 +565,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 14 verification binaries
+# Run Milestone 1 through 15 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -579,6 +580,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone12_modern_syntax.exe
 .\build\Release\test_milestone13_iteration_symbols_generators.exe
 .\build\Release\test_milestone14_async_await.exe
+.\build\Release\test_milestone15_proxy_reflect.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe
