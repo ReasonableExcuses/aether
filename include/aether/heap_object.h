@@ -35,6 +35,7 @@ enum class HeapObjectType : uint16_t {
     JSTypedArray      = 0x10,
     JSDataView        = 0x11,
     JSGenerator       = 0x12,
+    JSProxy           = 0x13,
 };
 
 /**
@@ -58,16 +59,20 @@ public:
     AETHER_ALWAYS_INLINE bool IsJSObject() const noexcept {
         return type_ == HeapObjectType::JSObject ||
                type_ == HeapObjectType::JSArray  ||
+               type_ == HeapObjectType::JSNativeFunction ||
                type_ == HeapObjectType::JSMap    ||
                type_ == HeapObjectType::JSSet    ||
                type_ == HeapObjectType::JSPromise ||
                type_ == HeapObjectType::JSRegExp ||
                type_ == HeapObjectType::JSError  ||
-               type_ == HeapObjectType::JSNativeFunction ||
                type_ == HeapObjectType::JSArrayBuffer ||
                type_ == HeapObjectType::JSTypedArray ||
                type_ == HeapObjectType::JSDataView ||
-               type_ == HeapObjectType::JSGenerator;
+               type_ == HeapObjectType::JSGenerator ||
+               type_ == HeapObjectType::JSProxy;
+    }
+    AETHER_ALWAYS_INLINE bool IsECMAObject() const noexcept {
+        return IsJSObject() || IsFunction();
     }
     AETHER_ALWAYS_INLINE bool IsPlainObject() const noexcept { return type_ == HeapObjectType::JSObject; }
     AETHER_ALWAYS_INLINE bool IsString() const noexcept { return type_ == HeapObjectType::String; }
@@ -85,6 +90,7 @@ public:
     AETHER_ALWAYS_INLINE bool IsDataView() const noexcept { return type_ == HeapObjectType::JSDataView; }
     AETHER_ALWAYS_INLINE bool IsSymbol() const noexcept { return type_ == HeapObjectType::Symbol; }
     AETHER_ALWAYS_INLINE bool IsGeneratorObject() const noexcept { return type_ == HeapObjectType::JSGenerator; }
+    AETHER_ALWAYS_INLINE bool IsProxy() const noexcept { return type_ == HeapObjectType::JSProxy; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;
@@ -269,6 +275,9 @@ public:
     // Full property lookup and mutation with shape transitions
     TaggedValue GetNamedProperty(std::string_view key) const;
     void SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id);
+    bool HasNamedProperty(std::string_view key) const;
+    bool DeleteNamedProperty(std::string_view key);
+    std::vector<std::string> GetOwnPropertyNames() const;
 
     JSObject* GetPrototype() const noexcept { return prototype_; }
     void SetPrototype(JSObject* proto) noexcept {
@@ -840,6 +849,48 @@ public:
 private:
     std::string name_;
     std::string message_;
+};
+
+/**
+ * @brief Standard ECMAScript Proxy Object implementing Meta-Object Protocol (MOP).
+ */
+class JSProxy : public JSObject {
+public:
+    JSProxy(TaggedValue target, TaggedValue handler, Shape* shape = nullptr)
+        : JSObject(HeapObjectType::JSProxy, shape),
+          target_(target),
+          handler_(handler),
+          is_revoked_(false) {}
+    JSProxy(JSProxy&& other) noexcept = default;
+
+    AETHER_ALWAYS_INLINE TaggedValue GetTarget() const noexcept { return target_; }
+    AETHER_ALWAYS_INLINE void SetTarget(TaggedValue t) noexcept { target_ = t; }
+
+    AETHER_ALWAYS_INLINE TaggedValue GetHandler() const noexcept { return handler_; }
+    AETHER_ALWAYS_INLINE void SetHandler(TaggedValue h) noexcept { handler_ = h; }
+
+    AETHER_ALWAYS_INLINE bool IsRevoked() const noexcept { return is_revoked_; }
+    void Revoke() noexcept {
+        is_revoked_ = true;
+        target_ = TaggedValue::Null();
+        handler_ = TaggedValue::Null();
+    }
+
+    size_t ObjectSize() const override { return sizeof(JSProxy); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+        if (!target_.IsEmpty()) visitor(target_);
+        if (!handler_.IsEmpty()) visitor(handler_);
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        return new (dst) JSProxy(std::move(*this));
+    }
+
+private:
+    TaggedValue target_{TaggedValue::Null()};
+    TaggedValue handler_{TaggedValue::Null()};
+    bool is_revoked_{false};
 };
 
 } // namespace aether

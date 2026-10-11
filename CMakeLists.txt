@@ -82,3 +82,6 @@ target_link_libraries(test_milestone13_iteration_symbols_generators PRIVATE aeth
 
 add_executable(test_milestone14_async_await tests/test_milestone14_async_await.cpp)
 target_link_libraries(test_milestone14_async_await PRIVATE aether_core)
+
+add_executable(test_milestone15_proxy_reflect tests/test_milestone15_proxy_reflect.cpp)
+target_link_libraries(test_milestone15_proxy_reflect PRIVATE aether_core)

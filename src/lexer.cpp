@@ -36,6 +36,8 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::This:             return "This";
         case TokenKind::TypeOf:           return "typeof";
         case TokenKind::InstanceOf:       return "instanceof";
+        case TokenKind::In:               return "in";
+        case TokenKind::Delete:           return "delete";
         case TokenKind::OpenParen:         return "(";
         case TokenKind::CloseParen:        return ")";
         case TokenKind::OpenBrace:         return "{";
@@ -350,6 +352,8 @@ Token Lexer::ScanIdentifierOrKeyword() {
     else if (text == "this")      kind = TokenKind::This;
     else if (text == "typeof")    kind = TokenKind::TypeOf;
     else if (text == "instanceof") kind = TokenKind::InstanceOf;
+    else if (text == "in")         kind = TokenKind::In;
+    else if (text == "delete")     kind = TokenKind::Delete;
     else if (text == "true")      kind = TokenKind::True;
     else if (text == "false")     kind = TokenKind::False;
     else if (text == "null")      kind = TokenKind::Null;

@@ -42,6 +42,8 @@ enum class TokenKind {
     This,
     TypeOf,
     InstanceOf,
+    In,
+    Delete,
 
     // Operators & Punctuators
     OpenParen,          // (

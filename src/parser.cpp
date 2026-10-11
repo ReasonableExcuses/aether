@@ -73,6 +73,7 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::Greater:
         case TokenKind::GreaterEqual:
         case TokenKind::InstanceOf:
+        case TokenKind::In:
             return Precedence::Relational;
         case TokenKind::LessLess:
         case TokenKind::GreaterGreater:
@@ -304,10 +305,14 @@ std::unique_ptr<Stmt> Parser::ParseFor() {
         // Declaration specifier matched
     }
 
+    bool is_for_in = false;
     if (Check(TokenKind::Identifier)) {
         Token id_tok = Advance();
         if (Match(TokenKind::Of)) {
             is_for_of = true;
+            var_name = id_tok.text;
+        } else if (Match(TokenKind::In)) {
+            is_for_in = true;
             var_name = id_tok.text;
         }
     } else if (Match(TokenKind::OpenBracket)) {
@@ -324,9 +329,20 @@ std::unique_ptr<Stmt> Parser::ParseFor() {
         }
     }
 
-    if (is_for_of) {
-        auto iterable = ParseExpression();
-        Consume(TokenKind::CloseParen, "Expected ')' after for-of iterable");
+    if (is_for_in || is_for_of) {
+        std::unique_ptr<Expr> iterable;
+        if (is_for_in) {
+            auto target_obj = ParseExpression();
+            std::vector<std::unique_ptr<Expr>> args;
+            args.push_back(std::move(target_obj));
+            iterable = std::make_unique<CallExpr>(
+                std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>("Object"), "keys"),
+                std::move(args)
+            );
+        } else {
+            iterable = ParseExpression();
+        }
+        Consume(TokenKind::CloseParen, "Expected ')' after for header");
         auto body = ParseStatement();
 
         static uint32_t s_for_of_id = 0;
@@ -710,6 +726,8 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<UnaryExpr>(UnaryOp::BitwiseNot, ParseExpression(Precedence::Unary));
         case TokenKind::TypeOf:
             return std::make_unique<UnaryExpr>(UnaryOp::TypeOf, ParseExpression(Precedence::Unary));
+        case TokenKind::Delete:
+            return std::make_unique<UnaryExpr>(UnaryOp::Delete, ParseExpression(Precedence::Unary));
         case TokenKind::PlusPlus: {
             Token id_tok = Consume(TokenKind::Identifier, "Expected identifier after '++'");
             auto plus_one = std::make_unique<BinaryExpr>(
@@ -1086,6 +1104,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         case TokenKind::BarBar:             op = BinaryOp::LogicalOr; break;
         case TokenKind::QuestionQuestion:   op = BinaryOp::NullishCoalescing; break;
         case TokenKind::InstanceOf:         op = BinaryOp::InstanceOf; break;
+        case TokenKind::In:                 op = BinaryOp::In; break;
         default:
             throw std::runtime_error("Unhandled binary operator");
     }

@@ -34,6 +34,10 @@ bool TaggedValue::IsSymbol() const noexcept {
     return (raw_ & kTagMask) == kTagSymbol || (IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::Symbol);
 }
 
+bool TaggedValue::IsString() const noexcept {
+    return IsHeapObject() && AsHeapObject()->IsString();
+}
+
 bool TaggedValue::IsGeneratorObject() const noexcept {
     return IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::JSGenerator;
 }
@@ -79,6 +83,11 @@ std::string TaggedValue::ToString() const {
         if (obj->IsError()) {
             auto* err = static_cast<JSError*>(obj);
             return err->Name() + ": " + err->Message();
+        }
+        if (obj->IsProxy()) {
+            auto* p = static_cast<JSProxy*>(obj);
+            if (p->IsRevoked()) return "[object Object]";
+            return p->GetTarget().ToString();
         }
         if (obj->IsJSObject()) {
             return "[object Object]";

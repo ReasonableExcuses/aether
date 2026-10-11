@@ -118,6 +118,10 @@ public:
 
     bool HasPendingException() const noexcept { return has_pending_exception_; }
     TaggedValue PendingException() const noexcept { return pending_exception_; }
+    void SetPendingException(TaggedValue exc) noexcept {
+        has_pending_exception_ = true;
+        pending_exception_ = exc;
+    }
     void ClearPendingException() noexcept {
         has_pending_exception_ = false;
         pending_exception_ = TaggedValue::Undefined();

@@ -34,7 +34,8 @@ enum class BinaryOp {
     LogicalAnd,
     LogicalOr,
     NullishCoalescing,
-    InstanceOf
+    InstanceOf,
+    In
 };
 
 enum class UnaryOp {
@@ -42,7 +43,8 @@ enum class UnaryOp {
     Negate,
     BitwiseNot,
     Plus,
-    TypeOf
+    TypeOf,
+    Delete
 };
 
 class ASTNode {

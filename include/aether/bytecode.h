@@ -51,6 +51,7 @@ enum class Opcode : uint8_t {
     TestLessThanOrEqual,    // [Op, reg: u8]           acc = (acc <= Reg[reg])
     TestGreaterThanOrEqual, // [Op, reg: u8]           acc = (acc >= Reg[reg])
     TestInstanceOf,         // [Op, reg: u8]           acc = (acc instanceof Reg[reg])
+    TestIn,                 // [Op, reg: u8]           acc = (Reg[reg] in acc)
 
     // Control Flow
     Jump,               // [Op, offset: i32]           pc += offset
@@ -64,6 +65,8 @@ enum class Opcode : uint8_t {
     StaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  obj.name = acc
     LdaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        acc = obj[key]
     StaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        obj[key] = acc
+    DeleteNamed,        // [Op, obj: u8, name_idx: u16]             acc = delete obj.name
+    DeleteKeyed,        // [Op, obj: u8, key: u8]                   acc = delete obj[key]
 
     // Unary Operations
     LogicalNot,             // [Op]                    acc = !ToBoolean(acc)

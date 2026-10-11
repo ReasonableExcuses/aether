@@ -441,6 +441,40 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
 }
 
 void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
+    if (node->Op() == UnaryOp::Delete) {
+        if (auto* mem = dynamic_cast<PropertyAccessExpr*>(node->GetExpr())) {
+            mem->Object()->Accept(this);
+            uint8_t obj_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(obj_reg);
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(mem->Property())));
+            bytecode_->EmitOpcode(Opcode::DeleteNamed);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU16(name_idx);
+            FreeRegister(obj_reg);
+            return;
+        }
+        if (auto* idx = dynamic_cast<IndexAccessExpr*>(node->GetExpr())) {
+            idx->Object()->Accept(this);
+            uint8_t obj_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(obj_reg);
+            idx->Index()->Accept(this);
+            uint8_t key_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(key_reg);
+            bytecode_->EmitOpcode(Opcode::DeleteKeyed);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU8(key_reg);
+            FreeRegister(key_reg);
+            FreeRegister(obj_reg);
+            return;
+        }
+        node->GetExpr()->Accept(this);
+        bytecode_->EmitOpcode(Opcode::LdaTrue);
+        return;
+    }
+
     node->GetExpr()->Accept(this);
     switch (node->Op()) {
         case UnaryOp::LogicalNot:
@@ -457,6 +491,8 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
             break;
         case UnaryOp::TypeOf:
             bytecode_->EmitOpcode(Opcode::TypeOf);
+            break;
+        case UnaryOp::Delete:
             break;
     }
 }
@@ -934,6 +970,10 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             break;
         case BinaryOp::InstanceOf:
             bytecode_->EmitOpcode(Opcode::TestInstanceOf);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::In:
+            bytecode_->EmitOpcode(Opcode::TestIn);
             bytecode_->EmitU8(rhs_reg);
             break;
     }

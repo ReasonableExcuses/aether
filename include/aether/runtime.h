@@ -172,11 +172,37 @@ inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackT
 
 class EventLoop;
 class ModuleLoader;
+class JSProxy;
 
 /**
  * @brief Invokes a JavaScript or native function with the given receiver and argument list.
  */
 TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
+
+// Meta-Object Protocol (MOP) and Proxy Operations
+TaggedValue GetProperty(TaggedValue obj, std::string_view key, TaggedValue receiver = TaggedValue::Empty());
+bool SetProperty(TaggedValue obj, std::string_view key, TaggedValue val, TaggedValue receiver = TaggedValue::Empty(), uint32_t* next_shape_id = nullptr);
+bool HasProperty(TaggedValue obj, std::string_view key);
+bool DeleteProperty(TaggedValue obj, std::string_view key);
+TaggedValue GetPrototypeOf(TaggedValue obj);
+bool SetPrototypeOf(TaggedValue obj, TaggedValue proto);
+TaggedValue GetOwnKeys(TaggedValue obj);
+
+TaggedValue ProxyGet(JSProxy* proxy, std::string_view key, TaggedValue receiver);
+bool ProxySet(JSProxy* proxy, std::string_view key, TaggedValue value, TaggedValue receiver);
+bool ProxyHas(JSProxy* proxy, std::string_view key);
+bool ProxyDeleteProperty(JSProxy* proxy, std::string_view key);
+TaggedValue ProxyApply(JSProxy* proxy, TaggedValue this_val, const std::vector<TaggedValue>& args);
+TaggedValue ProxyConstruct(JSProxy* proxy, const std::vector<TaggedValue>& args, TaggedValue new_target = TaggedValue::Empty());
+TaggedValue ProxyGetPrototypeOf(JSProxy* proxy);
+bool ProxySetPrototypeOf(JSProxy* proxy, TaggedValue proto);
+TaggedValue ProxyOwnKeys(JSProxy* proxy);
+TaggedValue ProxyGetOwnPropertyDescriptor(JSProxy* proxy, std::string_view key);
+bool ProxyDefineProperty(JSProxy* proxy, std::string_view key, TaggedValue desc);
+bool ProxyIsExtensible(JSProxy* proxy);
+bool ProxyPreventExtensions(JSProxy* proxy);
+
+TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& args, TaggedValue new_target = TaggedValue::Empty());
 
 /**
  * @brief ECMAScript Agent encapsulating Isolate execution context and JIT runtime.

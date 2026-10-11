@@ -60,7 +60,10 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
     if (AETHER_LIKELY(shape != nullptr)) {
         const PropertyDescriptor* desc = shape->LookupProperty(key);
         if (desc != nullptr) {
-            return GetFastSlot(desc->slot_index, desc->is_in_object);
+            TaggedValue val = GetFastSlot(desc->slot_index, desc->is_in_object);
+            if (!val.IsEmpty()) {
+                return val;
+            }
         }
 
         // Check instance prototype if explicitly assigned
@@ -81,7 +84,10 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
                 if (p_shape != nullptr) {
                     const PropertyDescriptor* p_desc = p_shape->LookupProperty(key);
                     if (p_desc != nullptr) {
-                        return js_proto->GetFastSlot(p_desc->slot_index, p_desc->is_in_object);
+                        TaggedValue p_val = js_proto->GetFastSlot(p_desc->slot_index, p_desc->is_in_object);
+                        if (!p_val.IsEmpty()) {
+                            return p_val;
+                        }
                     }
                 }
                 proto = p_shape ? p_shape->Prototype() : TaggedValue::Null();
@@ -91,6 +97,97 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
         }
     }
     return TaggedValue::Undefined();
+}
+
+bool JSObject::HasNamedProperty(std::string_view key) const {
+    if (IsArray()) {
+        if (key == "length") return true;
+        if (IsAllDigits(key)) {
+            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+            return idx < static_cast<const JSArray*>(this)->Length();
+        }
+    } else if (IsMap()) {
+        if (key == "size") return true;
+    } else if (IsSet()) {
+        if (key == "size") return true;
+    }
+
+    Shape* shape = GetShape();
+    if (shape == nullptr && Realm::Current()) {
+        shape = Realm::Current()->GetRootShape();
+    }
+    if (shape != nullptr) {
+        const PropertyDescriptor* desc = shape->LookupProperty(key);
+        if (desc != nullptr) {
+            TaggedValue val = GetFastSlot(desc->slot_index, desc->is_in_object);
+            if (!val.IsEmpty()) return true;
+        }
+
+        if (prototype_ != nullptr && prototype_->HasNamedProperty(key)) {
+            return true;
+        }
+
+        TaggedValue proto = shape->Prototype();
+        while (proto.IsHeapObject()) {
+            HeapObject* p_obj = proto.AsHeapObject();
+            if (p_obj->IsJSObject()) {
+                JSObject* js_proto = static_cast<JSObject*>(p_obj);
+                Shape* p_shape = js_proto->GetShape();
+                if (p_shape != nullptr) {
+                    const PropertyDescriptor* p_desc = p_shape->LookupProperty(key);
+                    if (p_desc != nullptr) {
+                        TaggedValue p_val = js_proto->GetFastSlot(p_desc->slot_index, p_desc->is_in_object);
+                        if (!p_val.IsEmpty()) return true;
+                    }
+                }
+                proto = p_shape ? p_shape->Prototype() : TaggedValue::Null();
+            } else {
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+bool JSObject::DeleteNamedProperty(std::string_view key) {
+    if (IsArray() && IsAllDigits(key)) {
+        size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+        if (idx < static_cast<JSArray*>(this)->Length()) {
+            static_cast<JSArray*>(this)->SetElement(idx, TaggedValue::Undefined());
+            return true;
+        }
+    }
+    Shape* shape = GetShape();
+    if (shape != nullptr) {
+        const PropertyDescriptor* desc = shape->LookupProperty(key);
+        if (desc != nullptr) {
+            SetFastSlot(desc->slot_index, desc->is_in_object, TaggedValue::Empty());
+            return true;
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> JSObject::GetOwnPropertyNames() const {
+    std::vector<std::string> names;
+    if (IsArray()) {
+        const auto* arr = static_cast<const JSArray*>(this);
+        for (size_t i = 0; i < arr->Length(); ++i) {
+            names.push_back(std::to_string(i));
+        }
+        names.push_back("length");
+        return names;
+    }
+    Shape* shape = GetShape();
+    if (shape != nullptr) {
+        for (const auto& [name, desc] : shape->GetPropertyMap()) {
+            TaggedValue val = GetFastSlot(desc.slot_index, desc.is_in_object);
+            if (!val.IsEmpty()) {
+                names.push_back(name);
+            }
+        }
+    }
+    return names;
 }
 
 void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id) {

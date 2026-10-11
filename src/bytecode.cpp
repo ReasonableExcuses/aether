@@ -33,6 +33,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::TestLessThanOrEqual: return "TestLessThanOrEqual";
         case Opcode::TestGreaterThanOrEqual: return "TestGreaterThanOrEqual";
         case Opcode::TestInstanceOf:     return "TestInstanceOf";
+        case Opcode::TestIn:             return "TestIn";
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
@@ -42,6 +43,8 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::StaNamed:           return "StaNamed";
         case Opcode::LdaKeyed:           return "LdaKeyed";
         case Opcode::StaKeyed:           return "StaKeyed";
+        case Opcode::DeleteNamed:        return "DeleteNamed";
+        case Opcode::DeleteKeyed:        return "DeleteKeyed";
         case Opcode::LogicalNot:         return "LogicalNot";
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";

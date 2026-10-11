@@ -125,6 +125,7 @@ public:
     }
 
     bool IsSymbol() const noexcept;
+    bool IsString() const noexcept;
     bool IsGeneratorObject() const noexcept;
 
     AETHER_ALWAYS_INLINE bool IsTrue() const noexcept {

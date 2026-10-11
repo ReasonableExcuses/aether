@@ -486,9 +486,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 TaggedValue target_proto = TaggedValue::Undefined();
                 HeapObject* rhs_obj = rhs.AsHeapObject();
-                if (rhs_obj->IsJSObject()) {
-                    target_proto = static_cast<JSObject*>(rhs_obj)->GetNamedProperty("prototype");
-                } else if (rhs_obj->IsFunction()) {
+                if (rhs_obj->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(rhs_obj);
                     if (!fn->GetPrototype()) {
                         fn->SetPrototype(new JSObject(GetRootShape()));
@@ -496,6 +494,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     target_proto = TaggedValue::FromHeapObject(fn->GetPrototype());
                 } else if (rhs_obj->IsNativeFunction()) {
                     target_proto = static_cast<JSNativeFunction*>(rhs_obj)->GetNamedProperty("prototype");
+                } else if (rhs_obj->IsProxy()) {
+                    target_proto = GetProperty(rhs, "prototype");
+                } else if (rhs_obj->IsJSObject()) {
+                    target_proto = static_cast<JSObject*>(rhs_obj)->GetNamedProperty("prototype");
                 }
 
                 JSObject* curr = nullptr;
@@ -511,6 +513,43 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     curr = curr->GetPrototype();
                 }
                 acc_ = TaggedValue::FromBoolean(found);
+                break;
+            }
+            case Opcode::TestIn: {
+                uint8_t rhs_reg = *pc++;
+                TaggedValue rhs_val = frame.GetRegister(rhs_reg);
+                TaggedValue prop_val = acc_;
+
+                if (!rhs_val.IsHeapObject() || !rhs_val.AsHeapObject()->IsJSObject()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot use 'in' operator to search for '" + prop_val.ToString() + "' in non-object"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
+
+                std::string prop_name = prop_val.ToString();
+                bool res = HasProperty(rhs_val, prop_name);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                acc_ = TaggedValue::FromBoolean(res);
                 break;
             }
             case Opcode::Jump: {
@@ -563,6 +602,22 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (obj_val.AsHeapObject()->IsProxy()) {
+                    acc_ = ProxyGet(static_cast<JSProxy*>(obj_val.AsHeapObject()), prop_key, obj_val);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
 
                 if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
@@ -673,6 +728,22 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (obj_val.AsHeapObject()->IsProxy()) {
+                    ProxySet(static_cast<JSProxy*>(obj_val.AsHeapObject()), prop_key, acc_, obj_val);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
 
                 if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
@@ -824,12 +895,13 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (target_val.IsHeapObject() && target_val.AsHeapObject()->IsJSObject() &&
                     src_val.IsHeapObject() && src_val.AsHeapObject()->IsJSObject()) {
                     auto* target_obj = static_cast<JSObject*>(target_val.AsHeapObject());
-                    auto* source_obj = static_cast<JSObject*>(src_val.AsHeapObject());
-                    const Shape* s = source_obj->GetShape();
-                    if (s) {
-                        for (const auto& [prop_name, desc] : s->GetPropertyMap()) {
-                            TaggedValue val = source_obj->GetNamedProperty(prop_name);
-                            target_obj->SetNamedProperty(prop_name, val, next_shape_id_);
+                    TaggedValue keys_val = GetOwnKeys(src_val);
+                    if (keys_val.IsHeapObject() && keys_val.AsHeapObject()->IsArray()) {
+                        auto* k_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
+                        for (size_t i = 0; i < k_arr->Length(); ++i) {
+                            std::string k_str = k_arr->GetElement(i).ToString();
+                            TaggedValue val = GetProperty(src_val, k_str);
+                            target_obj->SetNamedProperty(k_str, val, next_shape_id_);
                         }
                     }
                 }
@@ -865,6 +937,33 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     break;
                 }
 
+                HeapObject* h_obj = obj_val.AsHeapObject();
+                if (h_obj->IsProxy()) {
+                    std::string key_str;
+                    if (key_val.IsSymbol()) {
+                        key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
+                    } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                    } else if (key_val.IsSmi()) {
+                        key_str = std::to_string(key_val.AsSmi());
+                    } else {
+                        key_str = key_val.ToString();
+                    }
+                    acc_ = ProxyGet(static_cast<JSProxy*>(h_obj), key_str, obj_val);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
+
                 if (key_val.IsSymbol()) {
                     auto* sym = static_cast<JSSymbol*>(key_val.AsHeapObject());
                     HeapObject* ho = obj_val.AsHeapObject();
@@ -882,7 +981,6 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     break;
                 }
 
-                HeapObject* h_obj = obj_val.AsHeapObject();
                 if (h_obj->IsArray()) {
                     auto* arr = static_cast<JSArray*>(h_obj);
                     if (key_val.IsSmi()) {
@@ -969,6 +1067,33 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue key_val = frame.GetRegister(key_reg);
 
                 if (obj_val.IsHeapObject()) {
+                    HeapObject* h_obj = obj_val.AsHeapObject();
+                    if (h_obj->IsProxy()) {
+                        std::string key_str;
+                        if (key_val.IsSymbol()) {
+                            key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
+                        } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                            key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        } else if (key_val.IsSmi()) {
+                            key_str = std::to_string(key_val.AsSmi());
+                        } else {
+                            key_str = key_val.ToString();
+                        }
+                        ProxySet(static_cast<JSProxy*>(h_obj), key_str, acc_, obj_val);
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                        }
+                        break;
+                    }
+
                     if (key_val.IsSymbol()) {
                         auto* sym = static_cast<JSSymbol*>(key_val.AsHeapObject());
                         HeapObject* ho = obj_val.AsHeapObject();
@@ -977,7 +1102,6 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         }
                         break;
                     }
-                    HeapObject* h_obj = obj_val.AsHeapObject();
                     if (h_obj->IsArray()) {
                         auto* arr = static_cast<JSArray*>(h_obj);
                         if (key_val.IsSmi()) {
@@ -1011,6 +1135,66 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         }
                     }
                 }
+                break;
+            }
+            case Opcode::DeleteNamed: {
+                uint8_t obj_reg = *pc++;
+                uint16_t name_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+
+                TaggedValue obj_val = frame.GetRegister(obj_reg);
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                bool success = DeleteProperty(obj_val, prop_key);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                acc_ = TaggedValue::FromBoolean(success);
+                break;
+            }
+            case Opcode::DeleteKeyed: {
+                uint8_t obj_reg = *pc++;
+                uint8_t key_reg = *pc++;
+
+                TaggedValue obj_val = frame.GetRegister(obj_reg);
+                TaggedValue key_val = frame.GetRegister(key_reg);
+
+                std::string key_str;
+                if (key_val.IsSymbol()) {
+                    key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
+                } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                    key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                } else if (key_val.IsSmi()) {
+                    key_str = std::to_string(key_val.AsSmi());
+                } else {
+                    key_str = key_val.ToString();
+                }
+
+                bool success = DeleteProperty(obj_val, key_str);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                acc_ = TaggedValue::FromBoolean(success);
                 break;
             }
             case Opcode::LdaThis: {
@@ -1067,7 +1251,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 (void)slot_id;
 
                 TaggedValue ctor_val = frame.GetRegister(ctor_reg);
-                if (!ctor_val.IsHeapObject() || !ctor_val.AsHeapObject()->IsFunction()) {
+                if (!ctor_val.IsHeapObject() || (!ctor_val.AsHeapObject()->IsFunction() && !ctor_val.AsHeapObject()->IsProxy())) {
                     TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "value is not a constructor"));
                     if (frame.HasExceptionHandler()) {
                         auto h = frame.PopExceptionHandler();
@@ -1088,9 +1272,36 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
                 }
 
+                if (ctor_val.AsHeapObject()->IsProxy()) {
+                    acc_ = ProxyConstruct(static_cast<JSProxy*>(ctor_val.AsHeapObject()), call_args);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
+
                 if (ctor_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(ctor_val.AsHeapObject());
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
                     break;
                 }
 
@@ -1133,7 +1344,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 TaggedValue callee_val = frame.GetRegister(callee_reg);
                 TaggedValue rec_this = frame.GetRegister(this_reg);
-                assert(callee_val.IsHeapObject() && callee_val.AsHeapObject()->IsFunction() && "Callee must be a Function");
+                assert(callee_val.IsHeapObject() && (callee_val.AsHeapObject()->IsFunction() || callee_val.AsHeapObject()->IsProxy()) && "Callee must be a Function or Proxy");
 
                 std::vector<TaggedValue> call_args;
                 call_args.reserve(arg_count);
@@ -1141,7 +1352,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
                 }
 
-                if (callee_val.AsHeapObject()->IsNativeFunction()) {
+                if (callee_val.AsHeapObject()->IsProxy()) {
+                    acc_ = ProxyApply(static_cast<JSProxy*>(callee_val.AsHeapObject()), rec_this, call_args);
+                } else if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
                     acc_ = native_fn->Invoke(rec_this, call_args);
                 } else {
@@ -1188,7 +1401,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 (void)slot_id;
 
                 TaggedValue callee_val = frame.GetRegister(callee_reg);
-                assert(callee_val.IsHeapObject() && callee_val.AsHeapObject()->IsFunction() && "Callee must be a Function");
+                assert(callee_val.IsHeapObject() && (callee_val.AsHeapObject()->IsFunction() || callee_val.AsHeapObject()->IsProxy()) && "Callee must be a Function or Proxy");
 
                 std::vector<TaggedValue> call_args;
                 call_args.reserve(arg_count);
@@ -1196,7 +1409,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     call_args.push_back(frame.GetRegister(static_cast<uint8_t>(args_start + i)));
                 }
 
-                if (callee_val.AsHeapObject()->IsNativeFunction()) {
+                if (callee_val.AsHeapObject()->IsProxy()) {
+                    acc_ = ProxyApply(static_cast<JSProxy*>(callee_val.AsHeapObject()), TaggedValue::Undefined(), call_args);
+                } else if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
                 } else {
