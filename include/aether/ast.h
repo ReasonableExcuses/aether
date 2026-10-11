@@ -348,6 +348,18 @@ private:
     bool is_delegate_{false};
 };
 
+class AwaitExpr : public Expr {
+public:
+    explicit AwaitExpr(std::unique_ptr<Expr> expr = nullptr)
+        : expr_(std::move(expr)) {}
+
+    Expr* GetExpr() const noexcept { return expr_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> expr_;
+};
+
 // Statements
 class Stmt : public ASTNode {};
 
@@ -452,6 +464,9 @@ public:
     bool IsGenerator() const noexcept { return is_generator_; }
     void SetGenerator(bool g) noexcept { is_generator_ = g; }
 
+    bool IsAsync() const noexcept { return is_async_; }
+    void SetAsync(bool a) noexcept { is_async_ = a; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
@@ -461,6 +476,7 @@ private:
     bool has_rest_{false};
     std::string rest_param_;
     bool is_generator_{false};
+    bool is_async_{false};
 };
 
 class FunctionExpr : public Expr {
@@ -479,6 +495,9 @@ public:
     bool IsGenerator() const noexcept { return is_generator_; }
     void SetGenerator(bool g) noexcept { is_generator_ = g; }
 
+    bool IsAsync() const noexcept { return is_async_; }
+    void SetAsync(bool a) noexcept { is_async_ = a; }
+
     void Accept(ASTVisitor* visitor) override;
 
 private:
@@ -488,6 +507,7 @@ private:
     bool has_rest_{false};
     std::string rest_param_;
     bool is_generator_{false};
+    bool is_async_{false};
 };
 
 class ReturnStmt : public Stmt {
@@ -582,6 +602,7 @@ public:
     virtual void VisitOptionalCall(OptionalCallExpr* node) = 0;
     virtual void VisitSpread(SpreadExpr* node) = 0;
     virtual void VisitYield(YieldExpr* node) = 0;
+    virtual void VisitAwait(AwaitExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -618,6 +639,7 @@ inline void OptionalIndexAccessExpr::Accept(ASTVisitor* v) { v->VisitOptionalInd
 inline void OptionalCallExpr::Accept(ASTVisitor* v) { v->VisitOptionalCall(this); }
 inline void SpreadExpr::Accept(ASTVisitor* v) { v->VisitSpread(this); }
 inline void YieldExpr::Accept(ASTVisitor* v) { v->VisitYield(this); }
+inline void AwaitExpr::Accept(ASTVisitor* v) { v->VisitAwait(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }

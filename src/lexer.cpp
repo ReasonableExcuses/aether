@@ -86,6 +86,8 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::Backtick:          return "`";
         case TokenKind::Of:                return "of";
         case TokenKind::Yield:             return "yield";
+        case TokenKind::Async:             return "async";
+        case TokenKind::Await:             return "await";
         default:                           return "<Unknown>";
     }
 }
@@ -354,6 +356,8 @@ Token Lexer::ScanIdentifierOrKeyword() {
     else if (text == "undefined") kind = TokenKind::Undefined;
     else if (text == "of")        kind = TokenKind::Of;
     else if (text == "yield")     kind = TokenKind::Yield;
+    else if (text == "async")     kind = TokenKind::Async;
+    else if (text == "await")     kind = TokenKind::Await;
 
     return Token{kind, std::string(text), 0, false, 0, loc};
 }

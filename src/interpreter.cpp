@@ -59,9 +59,10 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     return RunExecutionLoop(frame, bytecode.Code().data(), nullptr);
 }
 
-TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val) {
+TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection) {
     if (!gen) return TaggedValue::Undefined();
     if (gen->GetState() == JSGeneratorObject::State::Completed) {
+        if (gen->IsAsync()) return TaggedValue::Undefined();
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     }
     if (gen->GetState() == JSGeneratorObject::State::Executing) {
@@ -80,10 +81,28 @@ TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sen
     const uint8_t* start_pc = code_start;
     if (gen->PCOffset() > 0) {
         frame.GetRegisters() = gen->SavedRegisters();
+        for (const auto& sh : gen->SavedHandlers()) {
+            frame.PushExceptionHandler(code_start + sh.target_offset, sh.env);
+        }
         start_pc = code_start + gen->PCOffset();
         acc_ = sent_val;
     } else {
         acc_ = TaggedValue::Undefined();
+    }
+
+    if (is_rejection) {
+        if (frame.HasExceptionHandler()) {
+            auto h = frame.PopExceptionHandler();
+            start_pc = h.target_pc;
+            frame.SetEnvironment(h.env);
+            acc_ = sent_val;
+            has_pending_exception_ = false;
+        } else {
+            has_pending_exception_ = true;
+            pending_exception_ = sent_val;
+            gen->SetState(JSGeneratorObject::State::Completed);
+            return pending_exception_;
+        }
     }
 
     bool yielded = false;
@@ -94,12 +113,70 @@ TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sen
         return pending_exception_;
     }
 
+    if (gen->IsAsync()) {
+        if (yielded) {
+            return result;
+        } else {
+            gen->SetState(JSGeneratorObject::State::Completed);
+            return result;
+        }
+    }
+
     if (yielded) {
         return TaggedValue::FromHeapObject(CreateIterResult(result, false));
     } else {
         gen->SetState(JSGeneratorObject::State::Completed);
         return TaggedValue::FromHeapObject(CreateIterResult(result, true));
     }
+}
+
+void Interpreter::RunAsyncStep(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection) {
+    if (!gen) return;
+    JSPromise* outer_promise = gen->AsyncPromise();
+    ClearPendingException();
+
+    TaggedValue step_result = ResumeGenerator(gen, sent_val, is_rejection);
+
+    if (HasPendingException()) {
+        TaggedValue reason = PendingException();
+        ClearPendingException();
+        if (outer_promise) {
+            outer_promise->Reject(reason, CurrentMicrotaskQueue());
+        }
+        return;
+    }
+
+    if (gen->GetState() == JSGeneratorObject::State::Completed) {
+        if (outer_promise) {
+            outer_promise->Fulfill(step_result, CurrentMicrotaskQueue());
+        }
+        return;
+    }
+
+    JSPromise* awaited_promise = nullptr;
+    if (step_result.IsHeapObject() && step_result.AsHeapObject()->IsPromise()) {
+        awaited_promise = static_cast<JSPromise*>(step_result.AsHeapObject());
+    } else {
+        awaited_promise = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+            awaited_promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+        }
+        awaited_promise->Fulfill(step_result, CurrentMicrotaskQueue());
+    }
+
+    auto* on_fulfilled = AllocateRuntime<JSNativeFunction>("", [this, gen](const std::vector<TaggedValue>& args) {
+        TaggedValue v = args.empty() ? TaggedValue::Undefined() : args[0];
+        this->RunAsyncStep(gen, v, false);
+        return TaggedValue::Undefined();
+    });
+
+    auto* on_rejected = AllocateRuntime<JSNativeFunction>("", [this, gen](const std::vector<TaggedValue>& args) {
+        TaggedValue r = args.empty() ? TaggedValue::Undefined() : args[0];
+        this->RunAsyncStep(gen, r, true);
+        return TaggedValue::Undefined();
+    });
+
+    awaited_promise->AddReaction(TaggedValue::FromHeapObject(on_fulfilled), TaggedValue::FromHeapObject(on_rejected), nullptr, CurrentMicrotaskQueue());
 }
 
 TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded) {
@@ -951,6 +1028,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                                                frame.GetEnvironment());
                 closure->SetPrototype(proto_fn->GetPrototype());
                 closure->SetGenerator(proto_fn->IsGenerator());
+                closure->SetAsync(proto_fn->IsAsync());
                 acc_ = TaggedValue::FromHeapObject(closure);
                 break;
             }
@@ -1074,6 +1152,15 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else if (func->IsAsync()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        auto* promise = new JSPromise(GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+                            promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+                        }
+                        gen_obj->SetAsyncPromise(promise);
+                        RunAsyncStep(gen_obj, TaggedValue::Undefined(), false);
+                        acc_ = TaggedValue::FromHeapObject(promise);
                     } else {
                         acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
                     }
@@ -1120,6 +1207,15 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else if (func->IsAsync()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        auto* promise = new JSPromise(GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+                            promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+                        }
+                        gen_obj->SetAsyncPromise(promise);
+                        RunAsyncStep(gen_obj, TaggedValue::Undefined(), false);
+                        acc_ = TaggedValue::FromHeapObject(promise);
                     } else {
                         acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());
                     }
@@ -1166,6 +1262,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 break;
             }
+            case Opcode::Await:
             case Opcode::Yield: {
                 if (frame.GetGenerator()) {
                     auto* gen = frame.GetGenerator();
@@ -1173,6 +1270,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     gen->SetPCOffset(static_cast<uint32_t>(pc - code_start));
                     gen->SavedRegisters() = frame.GetRegisters();
                     gen->SetEnvironment(frame.GetEnvironment());
+                    gen->SavedHandlers().clear();
+                    for (const auto& h : frame.Handlers()) {
+                        gen->SavedHandlers().push_back({static_cast<uint32_t>(h.target_pc - code_start), h.env});
+                    }
                     gen->SetState(JSGeneratorObject::State::SuspendedYield);
                     if (out_yielded) *out_yielded = true;
                     return yielded_val;

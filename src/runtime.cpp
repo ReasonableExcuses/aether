@@ -19,12 +19,16 @@ static thread_local Agent* s_current_agent_{nullptr};
 Agent* Agent::Current() noexcept { return s_current_agent_; }
 void Agent::SetCurrent(Agent* agent) noexcept { s_current_agent_ = agent; }
 
-static MicrotaskQueue& CurrentMicrotaskQueue() {
+MicrotaskQueue& CurrentMicrotaskQueue() {
     static MicrotaskQueue s_fallback_queue;
     if (s_current_microtasks_) {
         return *s_current_microtasks_;
     }
     return s_fallback_queue;
+}
+
+void SetCurrentMicrotaskQueue(MicrotaskQueue* queue) {
+    s_current_microtasks_ = queue;
 }
 
 TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args) {
@@ -43,6 +47,19 @@ TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::ve
                 gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
             }
             return TaggedValue::FromHeapObject(gen_obj);
+        }
+        if (fn->IsAsync()) {
+            Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+            auto* gen_obj = AllocateRuntime<JSGeneratorObject>(fn, args, this_val, fn->GetEnvironment(), root);
+            auto* promise = AllocateRuntime<JSPromise>(root);
+            if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+                promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+            }
+            gen_obj->SetAsyncPromise(promise);
+            if (Interpreter::Current()) {
+                Interpreter::Current()->RunAsyncStep(gen_obj, TaggedValue::Undefined(), false);
+            }
+            return TaggedValue::FromHeapObject(promise);
         }
         if (Interpreter::Current()) {
             return Interpreter::Current()->Execute(*fn->GetBytecode(), args, this_val, fn->GetEnvironment());
@@ -867,6 +884,9 @@ static TaggedValue Promise_catch(TaggedValue this_val, const std::vector<TaggedV
 
 static TaggedValue Promise_resolve(const std::vector<TaggedValue>& args) {
     TaggedValue val = args.empty() ? TaggedValue::Undefined() : args[0];
+    if (val.IsHeapObject() && val.AsHeapObject()->IsPromise()) {
+        return val;
+    }
     auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
         p->SetPrototype(Realm::Current()->GetPromisePrototype());
@@ -937,6 +957,239 @@ static TaggedValue Promise_all(const std::vector<TaggedValue>& args) {
     }
 
     return TaggedValue::FromHeapObject(p);
+}
+
+static TaggedValue Promise_race(const std::vector<TaggedValue>& args) {
+    auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+        p->SetPrototype(Realm::Current()->GetPromisePrototype());
+    }
+
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
+    size_t count = input_arr->Length();
+
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue item = input_arr->GetElement(i);
+        if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
+            auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
+            auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p](const std::vector<TaggedValue>& f_args) {
+                p->Fulfill(f_args.empty() ? TaggedValue::Undefined() : f_args[0], CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            auto on_reject = AllocateRuntime<JSNativeFunction>("onReject", [p](const std::vector<TaggedValue>& r_args) {
+                p->Reject(r_args.empty() ? TaggedValue::Undefined() : r_args[0], CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            item_p->AddReaction(TaggedValue::FromHeapObject(on_fulfill), TaggedValue::FromHeapObject(on_reject), nullptr, CurrentMicrotaskQueue());
+        } else {
+            p->Fulfill(item, CurrentMicrotaskQueue());
+            break;
+        }
+    }
+
+    return TaggedValue::FromHeapObject(p);
+}
+
+static TaggedValue Promise_allSettled(const std::vector<TaggedValue>& args) {
+    auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+        p->SetPrototype(Realm::Current()->GetPromisePrototype());
+    }
+
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
+        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
+    size_t count = input_arr->Length();
+    if (count == 0) {
+        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    auto* results = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, count);
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        results->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+
+    auto remaining = std::make_shared<size_t>(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue item = input_arr->GetElement(i);
+        if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
+            auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
+            auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p, results, i, remaining](const std::vector<TaggedValue>& f_args) {
+                TaggedValue val = f_args.empty() ? TaggedValue::Undefined() : f_args[0];
+                auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+                uint32_t sid = 9100;
+                obj->SetNamedProperty("status", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("fulfilled")), sid);
+                obj->SetNamedProperty("value", val, sid);
+                results->SetElement(i, TaggedValue::FromHeapObject(obj));
+                (*remaining)--;
+                if (*remaining == 0) {
+                    p->Fulfill(TaggedValue::FromHeapObject(results), CurrentMicrotaskQueue());
+                }
+                return TaggedValue::Undefined();
+            });
+            auto on_reject = AllocateRuntime<JSNativeFunction>("onReject", [p, results, i, remaining](const std::vector<TaggedValue>& r_args) {
+                TaggedValue reason = r_args.empty() ? TaggedValue::Undefined() : r_args[0];
+                auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+                uint32_t sid = 9100;
+                obj->SetNamedProperty("status", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("rejected")), sid);
+                obj->SetNamedProperty("reason", reason, sid);
+                results->SetElement(i, TaggedValue::FromHeapObject(obj));
+                (*remaining)--;
+                if (*remaining == 0) {
+                    p->Fulfill(TaggedValue::FromHeapObject(results), CurrentMicrotaskQueue());
+                }
+                return TaggedValue::Undefined();
+            });
+            item_p->AddReaction(TaggedValue::FromHeapObject(on_fulfill), TaggedValue::FromHeapObject(on_reject), nullptr, CurrentMicrotaskQueue());
+        } else {
+            auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+            uint32_t sid = 9100;
+            obj->SetNamedProperty("status", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("fulfilled")), sid);
+            obj->SetNamedProperty("value", item, sid);
+            results->SetElement(i, TaggedValue::FromHeapObject(obj));
+            (*remaining)--;
+        }
+    }
+
+    if (*remaining == 0) {
+        p->Fulfill(TaggedValue::FromHeapObject(results), CurrentMicrotaskQueue());
+    }
+
+    return TaggedValue::FromHeapObject(p);
+}
+
+static TaggedValue Promise_any(const std::vector<TaggedValue>& args) {
+    auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+        p->SetPrototype(Realm::Current()->GetPromisePrototype());
+    }
+
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
+        p->Reject(TaggedValue::FromHeapObject(new JSError("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
+    size_t count = input_arr->Length();
+    if (count == 0) {
+        p->Reject(TaggedValue::FromHeapObject(new JSError("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    auto* errors = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, count);
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        errors->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+
+    auto remaining = std::make_shared<size_t>(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue item = input_arr->GetElement(i);
+        if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
+            auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
+            auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p](const std::vector<TaggedValue>& f_args) {
+                p->Fulfill(f_args.empty() ? TaggedValue::Undefined() : f_args[0], CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            auto on_reject = AllocateRuntime<JSNativeFunction>("onReject", [p, errors, i, remaining](const std::vector<TaggedValue>& r_args) {
+                errors->SetElement(i, r_args.empty() ? TaggedValue::Undefined() : r_args[0]);
+                (*remaining)--;
+                if (*remaining == 0) {
+                    auto* err = new JSError("AggregateError", "All promises were rejected");
+                    uint32_t sid = 9200;
+                    err->SetNamedProperty("errors", TaggedValue::FromHeapObject(errors), sid);
+                    p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
+                }
+                return TaggedValue::Undefined();
+            });
+            item_p->AddReaction(TaggedValue::FromHeapObject(on_fulfill), TaggedValue::FromHeapObject(on_reject), nullptr, CurrentMicrotaskQueue());
+        } else {
+            p->Fulfill(item, CurrentMicrotaskQueue());
+            return TaggedValue::FromHeapObject(p);
+        }
+    }
+
+    return TaggedValue::FromHeapObject(p);
+}
+
+static TaggedValue Promise_finally(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsPromise()) return TaggedValue::Undefined();
+    auto* p = static_cast<JSPromise*>(this_val.AsHeapObject());
+    TaggedValue callback = args.empty() ? TaggedValue::Undefined() : args[0];
+
+    auto* downstream = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+        downstream->SetPrototype(Realm::Current()->GetPromisePrototype());
+    }
+
+    if (!callback.IsHeapObject() || !callback.AsHeapObject()->IsFunction()) {
+        p->AddReaction(callback, callback, downstream, CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(downstream);
+    }
+
+    auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFinallyFulfill", [callback, downstream](const std::vector<TaggedValue>& f_args) {
+        TaggedValue val = f_args.empty() ? TaggedValue::Undefined() : f_args[0];
+        TaggedValue res = CallFunction(callback, TaggedValue::Undefined(), {});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            TaggedValue err = Interpreter::Current()->PendingException();
+            Interpreter::Current()->ClearPendingException();
+            downstream->Reject(err, CurrentMicrotaskQueue());
+            return TaggedValue::Undefined();
+        }
+        if (res.IsHeapObject() && res.AsHeapObject()->IsPromise()) {
+            auto* p_res = static_cast<JSPromise*>(res.AsHeapObject());
+            auto after_p = AllocateRuntime<JSNativeFunction>("", [downstream, val](const std::vector<TaggedValue>&) {
+                downstream->Fulfill(val, CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            auto after_err = AllocateRuntime<JSNativeFunction>("", [downstream](const std::vector<TaggedValue>& r_args) {
+                downstream->Reject(r_args.empty() ? TaggedValue::Undefined() : r_args[0], CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            p_res->AddReaction(TaggedValue::FromHeapObject(after_p), TaggedValue::FromHeapObject(after_err), nullptr, CurrentMicrotaskQueue());
+        } else {
+            downstream->Fulfill(val, CurrentMicrotaskQueue());
+        }
+        return TaggedValue::Undefined();
+    });
+
+    auto on_reject = AllocateRuntime<JSNativeFunction>("onFinallyReject", [callback, downstream](const std::vector<TaggedValue>& r_args) {
+        TaggedValue reason = r_args.empty() ? TaggedValue::Undefined() : r_args[0];
+        TaggedValue res = CallFunction(callback, TaggedValue::Undefined(), {});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            TaggedValue err = Interpreter::Current()->PendingException();
+            Interpreter::Current()->ClearPendingException();
+            downstream->Reject(err, CurrentMicrotaskQueue());
+            return TaggedValue::Undefined();
+        }
+        if (res.IsHeapObject() && res.AsHeapObject()->IsPromise()) {
+            auto* p_res = static_cast<JSPromise*>(res.AsHeapObject());
+            auto after_p = AllocateRuntime<JSNativeFunction>("", [downstream, reason](const std::vector<TaggedValue>&) {
+                downstream->Reject(reason, CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            auto after_err = AllocateRuntime<JSNativeFunction>("", [downstream](const std::vector<TaggedValue>& e_args) {
+                downstream->Reject(e_args.empty() ? TaggedValue::Undefined() : e_args[0], CurrentMicrotaskQueue());
+                return TaggedValue::Undefined();
+            });
+            p_res->AddReaction(TaggedValue::FromHeapObject(after_p), TaggedValue::FromHeapObject(after_err), nullptr, CurrentMicrotaskQueue());
+        } else {
+            downstream->Reject(reason, CurrentMicrotaskQueue());
+        }
+        return TaggedValue::Undefined();
+    });
+
+    p->AddReaction(TaggedValue::FromHeapObject(on_fulfill), TaggedValue::FromHeapObject(on_reject), nullptr, CurrentMicrotaskQueue());
+    return TaggedValue::FromHeapObject(downstream);
 }
 
 // RegExp Intrinsics
@@ -1946,10 +2199,14 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     // Promise Prototype & Constructor
     promise_prototype_->SetNamedProperty("then", TaggedValue::FromHeapObject(make_native("then", &Promise_then)), next_shape_id_);
     promise_prototype_->SetNamedProperty("catch", TaggedValue::FromHeapObject(make_native("catch", &Promise_catch)), next_shape_id_);
+    promise_prototype_->SetNamedProperty("finally", TaggedValue::FromHeapObject(make_native("finally", &Promise_finally)), next_shape_id_);
     auto* promise_ctor = make_native("Promise", &Promise_ctor);
     promise_ctor->SetNamedProperty("resolve", TaggedValue::FromHeapObject(make_native("resolve", &Promise_resolve)), next_shape_id_);
     promise_ctor->SetNamedProperty("reject", TaggedValue::FromHeapObject(make_native("reject", &Promise_reject)), next_shape_id_);
     promise_ctor->SetNamedProperty("all", TaggedValue::FromHeapObject(make_native("all", &Promise_all)), next_shape_id_);
+    promise_ctor->SetNamedProperty("race", TaggedValue::FromHeapObject(make_native("race", &Promise_race)), next_shape_id_);
+    promise_ctor->SetNamedProperty("allSettled", TaggedValue::FromHeapObject(make_native("allSettled", &Promise_allSettled)), next_shape_id_);
+    promise_ctor->SetNamedProperty("any", TaggedValue::FromHeapObject(make_native("any", &Promise_any)), next_shape_id_);
     promise_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(promise_prototype_), next_shape_id_);
 
     // RegExp Prototype & Constructor

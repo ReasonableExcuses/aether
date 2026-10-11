@@ -87,6 +87,9 @@ public:
     void VisitYield(YieldExpr* node) override {
         if (node->GetExpr()) node->GetExpr()->Accept(this);
     }
+    void VisitAwait(AwaitExpr* node) override {
+        if (node->GetExpr()) node->GetExpr()->Accept(this);
+    }
     void VisitExprStmt(ExprStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitVarDecl(VarDeclStmt* node) override {
         if (node->Initializer()) node->Initializer()->Accept(this);
@@ -1035,6 +1038,7 @@ void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
     // 1. Allocate function object placeholder and register for recursive lookups
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
     fn_obj->SetGenerator(node->IsGenerator());
+    fn_obj->SetAsync(node->IsAsync());
     functions_[node->Name()] = fn_obj;
 
     // 2. Compile child routine
@@ -1096,6 +1100,7 @@ void BytecodeEmitter::VisitNew(NewExpr* node) {
 void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
     fn_obj->SetGenerator(node->IsGenerator());
+    fn_obj->SetAsync(node->IsAsync());
 
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
@@ -1432,6 +1437,15 @@ void BytecodeEmitter::VisitYield(YieldExpr* node) {
         bytecode_->EmitOpcode(Opcode::LdaUndefined);
     }
     bytecode_->EmitOpcode(Opcode::Yield);
+}
+
+void BytecodeEmitter::VisitAwait(AwaitExpr* node) {
+    if (node->GetExpr()) {
+        node->GetExpr()->Accept(this);
+    } else {
+        bytecode_->EmitOpcode(Opcode::LdaUndefined);
+    }
+    bytecode_->EmitOpcode(Opcode::Await);
 }
 
 } // namespace aether

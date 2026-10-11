@@ -678,6 +678,9 @@ public:
     bool IsGenerator() const noexcept { return is_generator_; }
     void SetGenerator(bool g) noexcept { is_generator_ = g; }
 
+    bool IsAsync() const noexcept { return is_async_; }
+    void SetAsync(bool a) noexcept { is_async_ = a; }
+
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         if (environment_ != nullptr) {
@@ -707,6 +710,7 @@ private:
     LexicalEnvironment* environment_{nullptr};
     JSObject* prototype_{nullptr};
     bool is_generator_{false};
+    bool is_async_{false};
 };
 
 /**
@@ -719,6 +723,11 @@ public:
         SuspendedYield,
         Executing,
         Completed
+    };
+
+    struct SavedHandler {
+        uint32_t target_offset{0};
+        LexicalEnvironment* env{nullptr};
     };
 
     JSGeneratorObject(JSFunction* fn, std::vector<TaggedValue> args, TaggedValue this_val, LexicalEnvironment* env, Shape* shape = nullptr)
@@ -742,6 +751,12 @@ public:
     LexicalEnvironment* Environment() const noexcept { return environment_; }
     void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
 
+    bool IsAsync() const noexcept { return function_ && function_->IsAsync(); }
+    JSPromise* AsyncPromise() const noexcept { return async_promise_; }
+    void SetAsyncPromise(JSPromise* p) noexcept { async_promise_ = p; }
+    std::vector<SavedHandler>& SavedHandlers() noexcept { return saved_handlers_; }
+    const std::vector<SavedHandler>& SavedHandlers() const noexcept { return saved_handlers_; }
+
     size_t ObjectSize() const override {
         return sizeof(JSGeneratorObject) + saved_registers_.capacity() * sizeof(TaggedValue);
     }
@@ -757,6 +772,18 @@ public:
             TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
             visitor(env_val);
             if (env_val.IsHeapObject()) environment_ = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
+        }
+        if (async_promise_ != nullptr) {
+            TaggedValue prom_val = TaggedValue::FromHeapObject(async_promise_);
+            visitor(prom_val);
+            if (prom_val.IsHeapObject()) async_promise_ = static_cast<JSPromise*>(prom_val.AsHeapObject());
+        }
+        for (auto& sh : saved_handlers_) {
+            if (sh.env != nullptr) {
+                TaggedValue env_val = TaggedValue::FromHeapObject(sh.env);
+                visitor(env_val);
+                if (env_val.IsHeapObject()) sh.env = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
+            }
         }
         if (!this_val_.IsEmpty()) visitor(this_val_);
         for (auto& r : saved_registers_) {
@@ -779,24 +806,32 @@ private:
     std::vector<TaggedValue> saved_registers_;
     uint32_t pc_offset_{0};
     State state_{State::SuspendedStart};
+    JSPromise* async_promise_{nullptr};
+    std::vector<SavedHandler> saved_handlers_;
 };
 
 /**
  * @brief Standard ECMAScript Error Object.
  */
-class JSError : public HeapObject {
+class JSError : public JSObject {
 public:
     JSError(std::string_view name, std::string_view message, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::JSError, shape),
+        : JSObject(HeapObjectType::JSError, shape),
           name_(name),
-          message_(message) {}
+          message_(message) {
+        uint32_t sid = 8000;
+        SetNamedProperty("name", TaggedValue::FromHeapObject(new JSString(name_)), sid);
+        SetNamedProperty("message", TaggedValue::FromHeapObject(new JSString(message_)), sid);
+    }
     JSError(JSError&& other) noexcept = default;
 
     const std::string& Name() const noexcept { return name_; }
     const std::string& Message() const noexcept { return message_; }
 
     size_t ObjectSize() const override { return sizeof(JSError); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
+    }
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSError(std::move(*this));

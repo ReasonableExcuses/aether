@@ -109,8 +109,18 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
     if (Match(TokenKind::Var) || Match(TokenKind::Let) || Match(TokenKind::Const)) {
         return ParseVarDecl();
     }
+    if (Check(TokenKind::Async)) {
+        Lexer saved_lexer = lexer_;
+        Token saved_tok = current_token_;
+        Advance();
+        if (Check(TokenKind::Function)) {
+            return ParseFunctionDecl(/*is_async=*/true);
+        }
+        lexer_ = saved_lexer;
+        current_token_ = saved_tok;
+    }
     if (Check(TokenKind::Function)) {
-        return ParseFunctionDecl();
+        return ParseFunctionDecl(/*is_async=*/false);
     }
     if (Match(TokenKind::If)) {
         return ParseIf();
@@ -214,7 +224,7 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl() {
     return std::make_unique<VarDeclStmt>(name_tok.text, std::move(init));
 }
 
-std::unique_ptr<Stmt> Parser::ParseFunctionDecl() {
+std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
     Consume(TokenKind::Function, "Expected 'function'");
     bool is_generator = Match(TokenKind::Star);
     Token name_tok = Consume(TokenKind::Identifier, "Expected function name");
@@ -244,6 +254,9 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl() {
 
     std::unique_ptr<BlockStmt> body = ParseBlock();
     auto fn_decl = std::make_unique<FunctionDeclStmt>(name_tok.text, std::move(params), std::move(body));
+    if (is_async) {
+        fn_decl->SetAsync(true);
+    }
     if (is_generator) {
         fn_decl->SetGenerator(true);
     }
@@ -743,6 +756,121 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 expr = ParseExpression();
             }
             return std::make_unique<YieldExpr>(std::move(expr), is_delegate);
+        }
+        case TokenKind::Await: {
+            auto expr = ParseExpression(Precedence::Unary);
+            return std::make_unique<AwaitExpr>(std::move(expr));
+        }
+        case TokenKind::Async: {
+            if (Check(TokenKind::Function)) {
+                Advance();
+                bool is_generator = Match(TokenKind::Star);
+                std::string name = "";
+                if (Check(TokenKind::Identifier)) {
+                    name = Advance().text;
+                }
+                Consume(TokenKind::OpenParen, "Expected '(' after 'function'");
+                std::vector<std::string> params;
+                std::string rest_param = "";
+                if (!Check(TokenKind::CloseParen)) {
+                    if (Match(TokenKind::DotDotDot)) {
+                        Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                        rest_param = r.text;
+                    } else {
+                        Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                        params.push_back(p.text);
+                        while (Match(TokenKind::Comma)) {
+                            if (Match(TokenKind::DotDotDot)) {
+                                Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                                rest_param = r.text;
+                                break;
+                            }
+                            Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                            params.push_back(np.text);
+                        }
+                    }
+                }
+                Consume(TokenKind::CloseParen, "Expected ')' after parameters");
+                auto body = ParseBlock();
+                auto fn_expr = std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+                fn_expr->SetAsync(true);
+                if (is_generator) {
+                    fn_expr->SetGenerator(true);
+                }
+                if (!rest_param.empty()) {
+                    fn_expr->SetRest(rest_param);
+                }
+                return fn_expr;
+            }
+            if (Check(TokenKind::Arrow)) {
+                Advance();
+                std::vector<std::string> params = {"async"};
+                std::unique_ptr<BlockStmt> body;
+                if (Check(TokenKind::OpenBrace)) {
+                    body = ParseBlock();
+                } else {
+                    auto arrow_expr = ParseExpression();
+                    body = std::make_unique<BlockStmt>();
+                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                }
+                return std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+            }
+            if (Check(TokenKind::Identifier)) {
+                Token param_tok = Advance();
+                Consume(TokenKind::Arrow, "Expected '=>' after async parameter");
+                std::vector<std::string> params = {param_tok.text};
+                std::unique_ptr<BlockStmt> body;
+                if (Check(TokenKind::OpenBrace)) {
+                    body = ParseBlock();
+                } else {
+                    auto arrow_expr = ParseExpression();
+                    body = std::make_unique<BlockStmt>();
+                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                }
+                auto fn_expr = std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+                fn_expr->SetAsync(true);
+                return fn_expr;
+            }
+            if (Check(TokenKind::OpenParen)) {
+                Advance();
+                std::vector<std::string> params;
+                std::string rest_param = "";
+                if (!Check(TokenKind::CloseParen)) {
+                    if (Match(TokenKind::DotDotDot)) {
+                        Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                        rest_param = r.text;
+                    } else {
+                        Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                        params.push_back(p.text);
+                        while (Match(TokenKind::Comma)) {
+                            if (Match(TokenKind::DotDotDot)) {
+                                Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                                rest_param = r.text;
+                                break;
+                            }
+                            Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                            params.push_back(np.text);
+                        }
+                    }
+                }
+                Consume(TokenKind::CloseParen, "Expected ')' after async arrow parameters");
+                Consume(TokenKind::Arrow, "Expected '=>' after async arrow parameters");
+                std::unique_ptr<BlockStmt> body;
+                if (Check(TokenKind::OpenBrace)) {
+                    body = ParseBlock();
+                } else {
+                    auto arrow_expr = ParseExpression();
+                    body = std::make_unique<BlockStmt>();
+                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                }
+                auto fn_expr = std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+                fn_expr->SetAsync(true);
+                if (!rest_param.empty()) {
+                    fn_expr->SetRest(rest_param);
+                }
+                return fn_expr;
+            }
+            return std::make_unique<IdentifierExpr>("async");
         }
         case TokenKind::Function: {
             bool is_generator = Match(TokenKind::Star);

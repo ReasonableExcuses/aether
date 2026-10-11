@@ -4,14 +4,14 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-13%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-14%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-104%2F104%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-114%2F114%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -74,7 +74,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 ### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (13/13 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (14/14 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -92,12 +92,20 @@ Foundation Progress: [███████████████████�
 | **11** | Binary Buffers & TypedArrays | ArrayBuffer, DataView, Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/Uint32/Float32/Float64Array | Complete | `[==========] 100%` |
 | **12** | Modern Syntax & Lowerings | Nullish Coalescing (??), Optional Chaining (?.), Logical Assignments (&&=, \|\|=, ??=), Template Literals, Rest Params & Spread, Destructuring, Arrow Functions | Complete | `[==========] 100%` |
 | **13** | Iteration Protocols, Symbols & Generators | Symbols (`Symbol()`, descriptions, uniqueness, typeof `"symbol"`), Global Registry (`Symbol.for`, `Symbol.keyFor`), Well-Known Symbols (`Symbol.iterator`, etc.), Builtin Iterators (`values`, `keys`, `entries`), For-Of Loops with Destructuring, Generator Coroutines (`function*`, `yield`, `next`, `return`) | Complete | `[==========] 100%` |
+| **14** | Async / Await & Coroutines | `async function`, `async () =>`, `async (x) =>`, `await <expr>`, Coroutine Yield / Resume via Microtasks, Cross-await Exception Preservation & Rejection Dispatch, Complete Promise Combinators (`race`, `allSettled`, `any`, `finally`, idempotent `resolve`) | Complete | `[==========] 100%` |
 
 ---
 
 ### Phase 2: V8 Performance Supremacy Track (Active)
 ```
-V8 Supremacy Track:  [██████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 52% In Progress
+V8 Supremacy Track:  [██████████████████████████████████████░░░░░░░░░░░░] 75% In Progress
+```
+
+| Optimization Track | Engineering Objective | Deliverables | Target Status |
+| :--- | :--- | :--- | :--- |
+| **Track A: Advanced JIT Compiler** | Sub-millisecond code emission with peak unboxed loops | On-Stack Replacement (OSR), Loop Invariant Code Motion (LICM), Escape Analysis & Scalar Replacement, Poly-IC inline caches | In Progress |
+| **Track B: Ultra-Low-Pause GC** | Zero stop-the-world spikes under high allocation rates | Concurrent background marking thread, SIMD-accelerated card table scanning, Immix opportunistic compaction | In Progress |
+| **Track C: Standard Conformance** | Scale test coverage to commercial standards | Full ~45,000 official Test262 test suite runner, Proxy/Reflect, Async/Await generator state machines (Complete), Private class fields, TypedArrays | In Progress |░░░░░░░░░░░░░░░░░░░░░░░] 52% In Progress
 ```
 
 | Optimization Track | Engineering Objective | Deliverables | Target Status |
@@ -170,11 +178,14 @@ V8 Supremacy Track:  [███████████████████�
         - Symbol primitives, descriptions, global registry (Symbol.for, Symbol.keyFor)<br/>
         - Well-known symbols (Symbol.iterator, Symbol.toStringTag, Symbol.hasInstance, Symbol.toPrimitive)<br/>
         - Iteration protocols and for...of loops with scalar and destructuring bindings<br/>
-        - Generator Coroutines (function*, yield, next(val), return(val))
+        - Generator Coroutines (function*, yield, next(val), return(val))<br/>
+        - Async functions and async arrow functions (async function, async () =>, await <expr>)<br/>
+        - Microtask-driven coroutines with virtual frame suspension & resumption across await<br/>
+        - Cross-suspension exception handler preservation and rejection dispatch (try/catch across await)
       </td>
       <td>
         - Proxy and Reflect API<br/>
-        - Async functions and async generators<br/>
+        - Async generator functions (async function*)<br/>
         - Private class fields (<code>#field</code>)
       </td>
     </tr>
@@ -191,7 +202,7 @@ V8 Supremacy Track:  [███████████████████�
         - String prototypes (indexOf, slice, split, trim, etc.) and [Symbol.iterator]<br/>
         - JSON parser & serializer (parse, stringify)<br/>
         - Map and Set collections with keys(), values(), entries(), [Symbol.iterator]<br/>
-        - Promise/A+ microtask execution chain and RegExp<br/>
+        - Complete Promise combinators (Promise.all, Promise.race, Promise.allSettled, Promise.any, Promise.prototype.finally, idempotent Promise.resolve) and RegExp<br/>
         - Full Asynchronous Event Loop (setTimeout, setInterval, setImmediate)<br/>
         - performance.now high-resolution monotonic clock<br/>
         - ArrayBuffer, DataView, and 9 TypedArray constructors with full method & iterator suites
@@ -214,7 +225,7 @@ V8 Supremacy Track:  [███████████████████�
         - Official Test262 Conformance Test Suite harness (YAML frontmatter, $262 host object, assert/sta)<br/>
         - Strict negative error type validation in C++ and Python runners<br/>
         - Native C++ and Python CLI Test262 runners<br/>
-        - 104 test verification suites (84 core architectural + 20 curated Test262, 100% pass)
+        - 114 test verification suites (94 core architectural + 20 curated Test262, 100% pass)
       </td>
       <td>
         - ES Modules (import / export) static grammar<br/>
@@ -396,8 +407,11 @@ All engine components are verified by comprehensive architectural test suites co
 | `test_milestone9_event_loop` | Asynchronous Event Loop | Macrotask Timers (setTimeout/setInterval), setImmediate, Microtask Interleaving | **6 / 6 Passed** |
 | `test_milestone10_modules` | Full Ecosystem & Modules | CommonJS require/exports, Module Cache, Circular Graph, process Globals | **6 / 6 Passed** |
 | `test_milestone11_typed_arrays` | Binary Buffers & TypedArrays | ArrayBuffer, DataView, TypedArrays, Multi-view Sharing, Endianness, GC Retention | **7 / 7 Passed** |
+| `test_milestone12_modern_syntax` | Modern ECMAScript Syntax | Nullish Coalescing (??), Optional Chaining (?.), Logical Assignment, Template Strings, Rest/Spread, Destructuring | **9 / 9 Passed** |
+| `test_milestone13_iteration_symbols_generators` | Iteration & Generators | Symbols, Well-Known Symbols, Global Registry, Builtin Iterators, For-Of, Generator Coroutines | **10 / 10 Passed** |
+| `test_milestone14_async_await` | Async/Await & Microtask Coroutines | Async Functions, Async Arrow, Await Yield/Resume, Cross-Await Try/Catch, Combinators (race, allSettled, any, finally) | **10 / 10 Passed** |
 | `test_test262_harness` | Test262 Conformance Suite | YAML Frontmatter Parser, $262 Host Object, Strict Negative Error Validation | **4 / 4 Groups (20/20 Cases) Passed** |
-| **Total** | **Full System & Conformance Stack** | **Architectural & Official Test262 Conformance Tests** | **85 / 85 Passed** |
+| **Total** | **Full System & Conformance Stack** | **Architectural & Official Test262 Conformance Tests** | **114 / 114 Passed** |
 
 ### Execution Performance Metrics
 - **Native Parameterized Call `sumN(100)`**: Completed in 300 ns.
@@ -514,6 +528,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone11_typed_arrays.cpp # Binary Buffers, DataView & TypedArrays tests
 │   ├── test_milestone12_modern_syntax.cpp # Modern ECMAScript Syntax & Lowerings tests
 │   ├── test_milestone13_iteration_symbols_generators.cpp # Symbols, Iteration Protocols & Generators tests
+│   ├── test_milestone14_async_await.cpp # Async / Await & Microtask Coroutines tests
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
     └── run_test262.py            # Automated CLI Test262 runner tool
@@ -548,7 +563,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 13 verification binaries
+# Run Milestone 1 through 14 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -562,6 +577,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone11_typed_arrays.exe
 .\build\Release\test_milestone12_modern_syntax.exe
 .\build\Release\test_milestone13_iteration_symbols_generators.exe
+.\build\Release\test_milestone14_async_await.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe

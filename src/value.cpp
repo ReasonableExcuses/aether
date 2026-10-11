@@ -76,6 +76,10 @@ std::string TaggedValue::ToString() const {
         if (obj->GetType() == HeapObjectType::JSFunction) {
             return "[Function " + static_cast<JSFunction*>(obj)->Name() + "]";
         }
+        if (obj->IsError()) {
+            auto* err = static_cast<JSError*>(obj);
+            return err->Name() + ": " + err->Message();
+        }
         if (obj->IsJSObject()) {
             return "[object Object]";
         }

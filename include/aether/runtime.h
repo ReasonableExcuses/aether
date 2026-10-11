@@ -91,6 +91,9 @@ private:
     std::deque<std::function<void()>> queue_;
 };
 
+MicrotaskQueue& CurrentMicrotaskQueue();
+void SetCurrentMicrotaskQueue(MicrotaskQueue* queue);
+
 /**
  * @brief Execution Realm containing intrinsic objects and global lexical environment.
  */

@@ -49,6 +49,7 @@ public:
     void VisitOptionalCall(OptionalCallExpr* node) override;
     void VisitSpread(SpreadExpr* node) override;
     void VisitYield(YieldExpr* node) override;
+    void VisitAwait(AwaitExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;

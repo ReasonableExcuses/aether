@@ -66,6 +66,9 @@ public:
         return h;
     }
 
+    std::vector<ExceptionHandler>& Handlers() noexcept { return handlers_; }
+    const std::vector<ExceptionHandler>& Handlers() const noexcept { return handlers_; }
+
     const BytecodeArray& GetBytecode() const noexcept { return bytecode_; }
     const std::vector<TaggedValue>& Args() const noexcept { return args_; }
 
@@ -97,7 +100,12 @@ public:
     /**
      * @brief Resumes a suspended JSGeneratorObject with the given sent value.
      */
-    TaggedValue ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val);
+    TaggedValue ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection = false);
+
+    /**
+     * @brief Drives an async coroutine step upon microtask resolution or initial call.
+     */
+    void RunAsyncStep(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection = false);
 
     TypeFeedbackVector& GetFeedbackVector() noexcept { return feedback_; }
 

@@ -99,6 +99,8 @@ enum class TokenKind {
     Backtick,               // `
     Of,                     // of
     Yield,                  // yield
+    Async,                  // async
+    Await,                  // await
 };
 
 const char* TokenKindToString(TokenKind kind);

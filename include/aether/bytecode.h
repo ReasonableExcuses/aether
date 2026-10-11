@@ -96,6 +96,7 @@ enum class Opcode : uint8_t {
 
     // Execution & Control
     Yield,              // [Op]                        suspend and yield acc
+    Await,              // [Op]                        suspend async coroutine for await acc
     Return,             // [Op]                        return acc
     Halt,               // [Op]                        halt execution
     Count               // Total opcode count marker
