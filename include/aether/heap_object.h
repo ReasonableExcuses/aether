@@ -31,6 +31,9 @@ enum class HeapObjectType : uint16_t {
     JSSet             = 0x0C,
     JSPromise         = 0x0D,
     JSRegExp          = 0x0E,
+    JSArrayBuffer     = 0x0F,
+    JSTypedArray      = 0x10,
+    JSDataView        = 0x11,
 };
 
 /**
@@ -59,7 +62,10 @@ public:
                type_ == HeapObjectType::JSPromise ||
                type_ == HeapObjectType::JSRegExp ||
                type_ == HeapObjectType::JSError  ||
-               type_ == HeapObjectType::JSNativeFunction;
+               type_ == HeapObjectType::JSNativeFunction ||
+               type_ == HeapObjectType::JSArrayBuffer ||
+               type_ == HeapObjectType::JSTypedArray ||
+               type_ == HeapObjectType::JSDataView;
     }
     AETHER_ALWAYS_INLINE bool IsPlainObject() const noexcept { return type_ == HeapObjectType::JSObject; }
     AETHER_ALWAYS_INLINE bool IsString() const noexcept { return type_ == HeapObjectType::String; }
@@ -72,6 +78,9 @@ public:
     AETHER_ALWAYS_INLINE bool IsSet() const noexcept { return type_ == HeapObjectType::JSSet; }
     AETHER_ALWAYS_INLINE bool IsPromise() const noexcept { return type_ == HeapObjectType::JSPromise; }
     AETHER_ALWAYS_INLINE bool IsRegExp() const noexcept { return type_ == HeapObjectType::JSRegExp; }
+    AETHER_ALWAYS_INLINE bool IsArrayBuffer() const noexcept { return type_ == HeapObjectType::JSArrayBuffer; }
+    AETHER_ALWAYS_INLINE bool IsTypedArray() const noexcept { return type_ == HeapObjectType::JSTypedArray; }
+    AETHER_ALWAYS_INLINE bool IsDataView() const noexcept { return type_ == HeapObjectType::JSDataView; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;

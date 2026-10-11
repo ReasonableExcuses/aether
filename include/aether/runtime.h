@@ -113,6 +113,9 @@ public:
     JSObject* GetPromisePrototype() const noexcept { return promise_prototype_; }
     JSObject* GetRegExpPrototype() const noexcept { return regexp_prototype_; }
     JSObject* GetJSONObject() const noexcept { return json_object_; }
+    JSObject* GetArrayBufferPrototype() const noexcept { return array_buffer_prototype_; }
+    JSObject* GetTypedArrayPrototype() const noexcept { return typed_array_prototype_; }
+    JSObject* GetDataViewPrototype() const noexcept { return data_view_prototype_; }
 
 private:
     void InitializeIntrinsics(Heap& heap);
@@ -134,6 +137,9 @@ private:
     JSObject* set_prototype_{nullptr};
     JSObject* promise_prototype_{nullptr};
     JSObject* regexp_prototype_{nullptr};
+    JSObject* array_buffer_prototype_{nullptr};
+    JSObject* typed_array_prototype_{nullptr};
+    JSObject* data_view_prototype_{nullptr};
 };
 
 inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape)

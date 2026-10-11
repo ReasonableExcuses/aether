@@ -4,6 +4,7 @@
 #include "aether/lexer.h"
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
+#include "aether/typed_array.h"
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -1022,6 +1023,378 @@ static TaggedValue Performance_now(const std::vector<TaggedValue>&) {
     return TaggedValue::FromDouble(0.0);
 }
 
+// ArrayBuffer Methods
+static TaggedValue ArrayBuffer_slice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArrayBuffer()) return TaggedValue::Undefined();
+    auto* ab = static_cast<JSArrayBuffer*>(this_val.AsHeapObject());
+    int64_t begin = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
+    int64_t end = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : static_cast<int64_t>(ab->ByteLength());
+    auto* new_ab = ab->Slice(begin, end, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        new_ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    return TaggedValue::FromHeapObject(new_ab);
+}
+
+static TaggedValue ArrayBuffer_isView(const std::vector<TaggedValue>& args) {
+    if (args.empty() || !args[0].IsHeapObject()) return TaggedValue::FromBoolean(false);
+    auto* ho = args[0].AsHeapObject();
+    return TaggedValue::FromBoolean(ho->IsTypedArray() || ho->IsDataView());
+}
+
+// TypedArray Methods
+static TaggedValue TypedArray_subarray(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return TaggedValue::Undefined();
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t begin = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
+    int64_t end = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : static_cast<int64_t>(ta->Length());
+    auto* sub = ta->Subarray(begin, end, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (ta->GetPrototype()) {
+        sub->SetPrototype(ta->GetPrototype());
+    }
+    return TaggedValue::FromHeapObject(sub);
+}
+
+static TaggedValue TypedArray_set(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::Undefined();
+    }
+    auto* dst = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    size_t target_offset = 0;
+    if (args.size() > 1 && args[1].IsNumber()) {
+        double off = args[1].AsNumber();
+        if (off > 0) target_offset = static_cast<size_t>(off);
+    }
+    TaggedValue src_val = args[0];
+    if (src_val.IsHeapObject()) {
+        auto* src_ho = src_val.AsHeapObject();
+        if (src_ho->IsTypedArray()) {
+            auto* src_ta = static_cast<JSTypedArray*>(src_ho);
+            size_t count = std::min(src_ta->Length(), dst->Length() > target_offset ? dst->Length() - target_offset : 0);
+            for (size_t i = 0; i < count; ++i) {
+                dst->SetElement(target_offset + i, src_ta->GetElement(i));
+            }
+        } else if (src_ho->IsArray()) {
+            auto* src_arr = static_cast<JSArray*>(src_ho);
+            size_t count = std::min(src_arr->Length(), dst->Length() > target_offset ? dst->Length() - target_offset : 0);
+            for (size_t i = 0; i < count; ++i) {
+                dst->SetElement(target_offset + i, src_arr->GetElement(i));
+            }
+        }
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue TypedArray_slice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return TaggedValue::Undefined();
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    int64_t begin = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
+    int64_t end = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : len;
+    int64_t rel_begin = begin < 0 ? std::max<int64_t>(len + begin, 0) : std::min<int64_t>(begin, len);
+    int64_t rel_end = end < 0 ? std::max<int64_t>(len + end, 0) : std::min<int64_t>(end, len);
+    size_t new_len = static_cast<size_t>(std::max<int64_t>(rel_end - rel_begin, 0));
+
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    auto* ab = AllocateRuntime<JSArrayBuffer>(new_len * ta->BytesPerElement(), root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, new_len, root_shape);
+    if (ta->GetPrototype()) {
+        new_ta->SetPrototype(ta->GetPrototype());
+    }
+    for (size_t i = 0; i < new_len; ++i) {
+        new_ta->SetElement(i, ta->GetElement(rel_begin + i));
+    }
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_fill(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) return this_val;
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue val = args[0];
+    int64_t len = static_cast<int64_t>(ta->Length());
+    int64_t start = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : 0;
+    int64_t end = args.size() > 2 ? (args[2].IsSmi() ? args[2].AsSmi() : static_cast<int64_t>(args[2].AsNumber())) : len;
+    if (start < 0) start = std::max<int64_t>(0, len + start);
+    else start = std::min<int64_t>(len, start);
+    if (end < 0) end = std::max<int64_t>(0, len + end);
+    else end = std::min<int64_t>(len, end);
+    for (int64_t i = start; i < end; ++i) {
+        ta->SetElement(static_cast<size_t>(i), val);
+    }
+    return this_val;
+}
+
+static TaggedValue TypedArray_indexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::FromSmi(-1);
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue target = args[0];
+    size_t from = 0;
+    if (args.size() > 1 && args[1].IsNumber()) {
+        double d = args[1].AsNumber();
+        if (d > 0) from = static_cast<size_t>(d);
+    }
+    for (size_t i = from; i < ta->Length(); ++i) {
+        TaggedValue elem = ta->GetElement(i);
+        if (elem.IsNumber() && target.IsNumber() && elem.AsNumber() == target.AsNumber()) {
+            return TaggedValue::FromSmi(static_cast<int32_t>(i));
+        }
+    }
+    return TaggedValue::FromSmi(-1);
+}
+
+static TaggedValue TypedArray_includes(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    TaggedValue idx = TypedArray_indexOf(this_val, args);
+    return TaggedValue::FromBoolean(idx.AsSmi() >= 0);
+}
+
+static TaggedValue TypedArray_reverse(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return this_val;
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    size_t n = ta->Length();
+    for (size_t i = 0; i < n / 2; ++i) {
+        TaggedValue tmp = ta->GetElement(i);
+        ta->SetElement(i, ta->GetElement(n - 1 - i));
+        ta->SetElement(n - 1 - i, tmp);
+    }
+    return this_val;
+}
+
+static TaggedValue TypedArray_join(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return TaggedValue::Undefined();
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    std::string sep = args.size() > 0 ? args[0].ToString() : ",";
+    std::string res;
+    for (size_t i = 0; i < ta->Length(); ++i) {
+        if (i > 0) res += sep;
+        res += ta->GetElement(i).ToString();
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
+}
+
+static TaggedValue TypedArray_forEach(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue cb = args[0];
+    for (size_t i = 0; i < ta->Length(); ++i) {
+        CallFunction(cb, this_val, {ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue TypedArray_map(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue cb = args[0];
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    auto* ab = AllocateRuntime<JSArrayBuffer>(ta->Length() * ta->BytesPerElement(), root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, ta->Length(), root_shape);
+    if (ta->GetPrototype()) {
+        new_ta->SetPrototype(ta->GetPrototype());
+    }
+    for (size_t i = 0; i < ta->Length(); ++i) {
+        TaggedValue res = CallFunction(cb, this_val, {ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        new_ta->SetElement(i, res);
+    }
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_filter(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue cb = args[0];
+    std::vector<TaggedValue> kept;
+    for (size_t i = 0; i < ta->Length(); ++i) {
+        TaggedValue el = ta->GetElement(i);
+        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        if (res.ToBoolean()) {
+            kept.push_back(el);
+        }
+    }
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    auto* ab = AllocateRuntime<JSArrayBuffer>(kept.size() * ta->BytesPerElement(), root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, kept.size(), root_shape);
+    if (ta->GetPrototype()) {
+        new_ta->SetPrototype(ta->GetPrototype());
+    }
+    for (size_t i = 0; i < kept.size(); ++i) {
+        new_ta->SetElement(i, kept[i]);
+    }
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_reduce(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    if (ta->Length() == 0 && args.size() < 2) return TaggedValue::Undefined();
+    TaggedValue cb = args[0];
+    size_t i = 0;
+    TaggedValue accum;
+    if (args.size() > 1) {
+        accum = args[1];
+    } else {
+        accum = ta->GetElement(0);
+        i = 1;
+    }
+    for (; i < ta->Length(); ++i) {
+        accum = CallFunction(cb, this_val, {accum, ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    }
+    return accum;
+}
+
+// DataView Methods
+static TaggedValue DataView_getInt8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetInt8(offset)));
+}
+static TaggedValue DataView_setInt8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    int8_t val = args[1].IsNumber() ? static_cast<int8_t>(args[1].AsNumber()) : 0;
+    dv->SetInt8(offset, val);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getUint8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetUint8(offset)));
+}
+static TaggedValue DataView_setUint8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    uint8_t val = args[1].IsNumber() ? static_cast<uint8_t>(args[1].AsNumber()) : 0;
+    dv->SetUint8(offset, val);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getInt16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetInt16(offset, le)));
+}
+static TaggedValue DataView_setInt16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    int16_t val = args[1].IsNumber() ? static_cast<int16_t>(args[1].AsNumber()) : 0;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetInt16(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getUint16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetUint16(offset, le)));
+}
+static TaggedValue DataView_setUint16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    uint16_t val = args[1].IsNumber() ? static_cast<uint16_t>(args[1].AsNumber()) : 0;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetUint16(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getInt32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromSmi(dv->GetInt32(offset, le));
+}
+static TaggedValue DataView_setInt32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    int32_t val = args[1].IsNumber() ? static_cast<int32_t>(args[1].AsNumber()) : 0;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetInt32(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getUint32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    uint32_t u = dv->GetUint32(offset, le);
+    if (u <= 0x3FFFFFFF) return TaggedValue::FromSmi(static_cast<int32_t>(u));
+    return TaggedValue::FromDouble(static_cast<double>(u));
+}
+static TaggedValue DataView_setUint32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    uint32_t val = args[1].IsNumber() ? static_cast<uint32_t>(args[1].AsNumber()) : 0;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetUint32(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getFloat32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromDouble(static_cast<double>(dv->GetFloat32(offset, le)));
+}
+static TaggedValue DataView_setFloat32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    float val = args[1].IsNumber() ? static_cast<float>(args[1].AsNumber()) : 0.0f;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetFloat32(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getFloat64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromDouble(dv->GetFloat64(offset, le));
+}
+static TaggedValue DataView_setFloat64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    size_t offset = args[0].IsNumber() ? static_cast<size_t>(args[0].AsNumber()) : 0;
+    double val = args[1].IsNumber() ? args[1].AsNumber() : 0.0;
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetFloat64(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
 Realm::Realm(Heap& heap) {
     heap_ = &heap;
     s_current_realm_ = this;
@@ -1079,6 +1452,9 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     set_prototype_ = make_old_obj();
     promise_prototype_ = make_old_obj();
     regexp_prototype_ = make_old_obj();
+    array_buffer_prototype_ = make_old_obj();
+    typed_array_prototype_ = make_old_obj();
+    data_view_prototype_ = make_old_obj();
 
     // Register Math functions
     math_object_->SetNamedProperty("abs", TaggedValue::FromHeapObject(make_native("abs", &Math_abs)), next_shape_id_);
@@ -1273,6 +1649,187 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         if (args[0].IsDouble()) return TaggedValue::FromBoolean(std::isfinite(args[0].AsDouble()));
         return TaggedValue::FromBoolean(false);
     })), next_shape_id_);
+
+    // ArrayBuffer Prototype & Constructor
+    array_buffer_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &ArrayBuffer_slice)), next_shape_id_);
+    auto* array_buffer_ctor = make_native("ArrayBuffer", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        size_t byte_length = 0;
+        if (!args.empty() && args[0].IsNumber()) {
+            double d = args[0].AsNumber();
+            if (d > 0) byte_length = static_cast<size_t>(d);
+        }
+        auto* ab = AllocateRuntime<JSArrayBuffer>(byte_length, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+            ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+        }
+        return TaggedValue::FromHeapObject(ab);
+    });
+    array_buffer_ctor->SetNamedProperty("isView", TaggedValue::FromHeapObject(make_native("isView", &ArrayBuffer_isView)), next_shape_id_);
+    array_buffer_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(array_buffer_prototype_), next_shape_id_);
+    global_object_->SetNamedProperty("ArrayBuffer", TaggedValue::FromHeapObject(array_buffer_ctor), next_shape_id_);
+
+    // DataView Prototype & Constructor
+    data_view_prototype_->SetNamedProperty("getInt8", TaggedValue::FromHeapObject(make_native("getInt8", &DataView_getInt8)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setInt8", TaggedValue::FromHeapObject(make_native("setInt8", &DataView_setInt8)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getUint8", TaggedValue::FromHeapObject(make_native("getUint8", &DataView_getUint8)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setUint8", TaggedValue::FromHeapObject(make_native("setUint8", &DataView_setUint8)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getInt16", TaggedValue::FromHeapObject(make_native("getInt16", &DataView_getInt16)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setInt16", TaggedValue::FromHeapObject(make_native("setInt16", &DataView_setInt16)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getUint16", TaggedValue::FromHeapObject(make_native("getUint16", &DataView_getUint16)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setUint16", TaggedValue::FromHeapObject(make_native("setUint16", &DataView_setUint16)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getInt32", TaggedValue::FromHeapObject(make_native("getInt32", &DataView_getInt32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setInt32", TaggedValue::FromHeapObject(make_native("setInt32", &DataView_setInt32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getUint32", TaggedValue::FromHeapObject(make_native("getUint32", &DataView_getUint32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setUint32", TaggedValue::FromHeapObject(make_native("setUint32", &DataView_setUint32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getFloat32", TaggedValue::FromHeapObject(make_native("getFloat32", &DataView_getFloat32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setFloat32", TaggedValue::FromHeapObject(make_native("setFloat32", &DataView_setFloat32)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getFloat64", TaggedValue::FromHeapObject(make_native("getFloat64", &DataView_getFloat64)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setFloat64", TaggedValue::FromHeapObject(make_native("setFloat64", &DataView_setFloat64)), next_shape_id_);
+
+    auto* data_view_ctor = make_native("DataView", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArrayBuffer()) {
+            return TaggedValue::Undefined();
+        }
+        auto* ab = static_cast<JSArrayBuffer*>(args[0].AsHeapObject());
+        size_t byte_offset = 0;
+        if (args.size() > 1 && args[1].IsNumber()) {
+            double bo_d = args[1].AsNumber();
+            if (bo_d > 0) byte_offset = static_cast<size_t>(bo_d);
+        }
+        size_t byte_length = ab->ByteLength() >= byte_offset ? ab->ByteLength() - byte_offset : 0;
+        if (args.size() > 2 && args[2].IsNumber()) {
+            double bl_d = args[2].AsNumber();
+            if (bl_d >= 0) byte_length = static_cast<size_t>(bl_d);
+        }
+        auto* dv = AllocateRuntime<JSDataView>(ab, byte_offset, byte_length, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetDataViewPrototype()) {
+            dv->SetPrototype(Realm::Current()->GetDataViewPrototype());
+        }
+        return TaggedValue::FromHeapObject(dv);
+    });
+    data_view_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(data_view_prototype_), next_shape_id_);
+    global_object_->SetNamedProperty("DataView", TaggedValue::FromHeapObject(data_view_ctor), next_shape_id_);
+
+    // TypedArray Shared Prototype
+    typed_array_prototype_->SetNamedProperty("set", TaggedValue::FromHeapObject(make_native("set", &TypedArray_set)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("subarray", TaggedValue::FromHeapObject(make_native("subarray", &TypedArray_subarray)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &TypedArray_slice)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("fill", TaggedValue::FromHeapObject(make_native("fill", &TypedArray_fill)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("indexOf", TaggedValue::FromHeapObject(make_native("indexOf", &TypedArray_indexOf)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &TypedArray_includes)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("join", TaggedValue::FromHeapObject(make_native("join", &TypedArray_join)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("reverse", TaggedValue::FromHeapObject(make_native("reverse", &TypedArray_reverse)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("forEach", TaggedValue::FromHeapObject(make_native("forEach", &TypedArray_forEach)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("map", TaggedValue::FromHeapObject(make_native("map", &TypedArray_map)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &TypedArray_filter)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &TypedArray_reduce)), next_shape_id_);
+
+    auto make_typed_array_ctor = [&](TypedArrayKind kind, std::string_view name) -> JSNativeFunction* {
+        auto* proto = make_old_obj();
+        proto->SetPrototype(typed_array_prototype_);
+        size_t elem_size = TypedArrayElementSize(kind);
+        proto->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
+
+        auto* ctor = make_native(name, [this, kind, elem_size, proto](const std::vector<TaggedValue>& args) -> TaggedValue {
+            Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+            if (args.empty()) {
+                auto* ab = AllocateRuntime<JSArrayBuffer>(0, root_shape);
+                if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+                    ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+                }
+                auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, 0, root_shape);
+                ta->SetPrototype(proto);
+                return TaggedValue::FromHeapObject(ta);
+            }
+
+            TaggedValue first = args[0];
+            if (first.IsNumber()) {
+                double len_d = first.AsNumber();
+                size_t len = len_d > 0.0 ? static_cast<size_t>(len_d) : 0;
+                auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+                if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+                    ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+                }
+                auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, len, root_shape);
+                ta->SetPrototype(proto);
+                return TaggedValue::FromHeapObject(ta);
+            }
+
+            if (first.IsHeapObject()) {
+                HeapObject* ho = first.AsHeapObject();
+                if (ho->IsArrayBuffer()) {
+                    auto* ab = static_cast<JSArrayBuffer*>(ho);
+                    size_t byte_offset = 0;
+                    if (args.size() > 1 && args[1].IsNumber()) {
+                        double bo_d = args[1].AsNumber();
+                        if (bo_d > 0) byte_offset = static_cast<size_t>(bo_d);
+                    }
+                    size_t length = 0;
+                    if (args.size() > 2 && args[2].IsNumber()) {
+                        double l_d = args[2].AsNumber();
+                        if (l_d > 0) length = static_cast<size_t>(l_d);
+                    } else {
+                        if (ab->ByteLength() >= byte_offset) {
+                            length = (ab->ByteLength() - byte_offset) / elem_size;
+                        }
+                    }
+                    auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, byte_offset, length, root_shape);
+                    ta->SetPrototype(proto);
+                    return TaggedValue::FromHeapObject(ta);
+                }
+
+                if (ho->IsTypedArray()) {
+                    auto* src_ta = static_cast<JSTypedArray*>(ho);
+                    size_t len = src_ta->Length();
+                    auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+                    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+                        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+                    }
+                    auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, len, root_shape);
+                    ta->SetPrototype(proto);
+                    for (size_t i = 0; i < len; ++i) {
+                        ta->SetElement(i, src_ta->GetElement(i));
+                    }
+                    return TaggedValue::FromHeapObject(ta);
+                }
+
+                if (ho->IsArray()) {
+                    auto* src_arr = static_cast<JSArray*>(ho);
+                    size_t len = src_arr->Length();
+                    auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+                    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+                        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+                    }
+                    auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, len, root_shape);
+                    ta->SetPrototype(proto);
+                    for (size_t i = 0; i < len; ++i) {
+                        ta->SetElement(i, src_arr->GetElement(i));
+                    }
+                    return TaggedValue::FromHeapObject(ta);
+                }
+            }
+
+            auto* ab = AllocateRuntime<JSArrayBuffer>(0, root_shape);
+            auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, 0, root_shape);
+            ta->SetPrototype(proto);
+            return TaggedValue::FromHeapObject(ta);
+        });
+
+        ctor->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
+        ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
+        global_object_->SetNamedProperty(name, TaggedValue::FromHeapObject(ctor), next_shape_id_);
+        return ctor;
+    };
+
+    make_typed_array_ctor(TypedArrayKind::Int8, "Int8Array");
+    make_typed_array_ctor(TypedArrayKind::Uint8, "Uint8Array");
+    make_typed_array_ctor(TypedArrayKind::Uint8Clamped, "Uint8ClampedArray");
+    make_typed_array_ctor(TypedArrayKind::Int16, "Int16Array");
+    make_typed_array_ctor(TypedArrayKind::Uint16, "Uint16Array");
+    make_typed_array_ctor(TypedArrayKind::Int32, "Int32Array");
+    make_typed_array_ctor(TypedArrayKind::Uint32, "Uint32Array");
+    make_typed_array_ctor(TypedArrayKind::Float32, "Float32Array");
+    make_typed_array_ctor(TypedArrayKind::Float64, "Float64Array");
 
     // $262 host object
     auto* host262 = make_old_obj();

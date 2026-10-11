@@ -65,6 +65,9 @@ target_link_libraries(test_milestone9_event_loop PRIVATE aether_core)
 add_executable(test_milestone10_modules tests/test_milestone10_modules.cpp)
 target_link_libraries(test_milestone10_modules PRIVATE aether_core)
 
+add_executable(test_milestone11_typed_arrays tests/test_milestone11_typed_arrays.cpp)
+target_link_libraries(test_milestone11_typed_arrays PRIVATE aether_core)
+
 add_executable(test_test262_harness tests/test_test262_harness.cpp)
 target_link_libraries(test_test262_harness PRIVATE aether_core)
 

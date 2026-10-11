@@ -2,6 +2,7 @@
 #include "aether/baseline_jit.h"
 #include "aether/optimizing_jit.h"
 #include "aether/runtime.h"
+#include "aether/typed_array.h"
 #include <cmath>
 
 namespace aether {
@@ -448,6 +449,54 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     break;
                 }
 
+                if (obj_val.AsHeapObject()->IsTypedArray()) {
+                    auto* t_arr = static_cast<JSTypedArray*>(obj_val.AsHeapObject());
+                    if (prop_key == "length") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->Length()));
+                        break;
+                    }
+                    if (prop_key == "byteLength") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->ByteLength()));
+                        break;
+                    }
+                    if (prop_key == "byteOffset") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->ByteOffset()));
+                        break;
+                    }
+                    if (prop_key == "buffer") {
+                        acc_ = t_arr->Buffer() ? TaggedValue::FromHeapObject(t_arr->Buffer()) : TaggedValue::Undefined();
+                        break;
+                    }
+                    if (prop_key == "BYTES_PER_ELEMENT") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->BytesPerElement()));
+                        break;
+                    }
+                }
+
+                if (obj_val.AsHeapObject()->IsArrayBuffer()) {
+                    auto* ab = static_cast<JSArrayBuffer*>(obj_val.AsHeapObject());
+                    if (prop_key == "byteLength") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(ab->ByteLength()));
+                        break;
+                    }
+                }
+
+                if (obj_val.AsHeapObject()->IsDataView()) {
+                    auto* dv = static_cast<JSDataView*>(obj_val.AsHeapObject());
+                    if (prop_key == "byteLength") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(dv->ByteLength()));
+                        break;
+                    }
+                    if (prop_key == "byteOffset") {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(dv->ByteOffset()));
+                        break;
+                    }
+                    if (prop_key == "buffer") {
+                        acc_ = dv->Buffer() ? TaggedValue::FromHeapObject(dv->Buffer()) : TaggedValue::Undefined();
+                        break;
+                    }
+                }
+
                 assert(obj_val.AsHeapObject()->IsJSObject());
                 JSObject* js_obj = static_cast<JSObject*>(obj_val.AsHeapObject());
 
@@ -637,6 +686,32 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                     } else {
                         acc_ = TaggedValue::Undefined();
                     }
+                } else if (h_obj->IsTypedArray()) {
+                    auto* t_arr = static_cast<JSTypedArray*>(h_obj);
+                    if (key_val.IsSmi()) {
+                        int32_t idx = key_val.AsSmi();
+                        acc_ = idx >= 0 ? t_arr->GetElement(static_cast<size_t>(idx)) : TaggedValue::Undefined();
+                    } else if (key_val.IsNumber()) {
+                        double d = key_val.AsNumber();
+                        acc_ = (d >= 0.0 && std::floor(d) == d) ? t_arr->GetElement(static_cast<size_t>(d)) : TaggedValue::Undefined();
+                    } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        std::string_view k = static_cast<JSString*>(key_val.AsHeapObject())->View();
+                        if (k == "length") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->Length()));
+                        } else if (k == "byteLength") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->ByteLength()));
+                        } else if (k == "byteOffset") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->ByteOffset()));
+                        } else if (k == "buffer") {
+                            acc_ = t_arr->Buffer() ? TaggedValue::FromHeapObject(t_arr->Buffer()) : TaggedValue::Undefined();
+                        } else if (k == "BYTES_PER_ELEMENT") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->BytesPerElement()));
+                        } else {
+                            acc_ = t_arr->GetNamedProperty(k);
+                        }
+                    } else {
+                        acc_ = TaggedValue::Undefined();
+                    }
                 } else if (h_obj->IsJSObject()) {
                     auto* js_obj = static_cast<JSObject*>(h_obj);
                     if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
@@ -673,6 +748,17 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
                             if (d >= 0.0 && std::floor(d) == d) arr->SetElement(static_cast<size_t>(d), acc_);
                         } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
                             arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                        }
+                    } else if (h_obj->IsTypedArray()) {
+                        auto* t_arr = static_cast<JSTypedArray*>(h_obj);
+                        if (key_val.IsSmi()) {
+                            int32_t idx = key_val.AsSmi();
+                            if (idx >= 0) t_arr->SetElement(static_cast<size_t>(idx), acc_);
+                        } else if (key_val.IsNumber()) {
+                            double d = key_val.AsNumber();
+                            if (d >= 0.0 && std::floor(d) == d) t_arr->SetElement(static_cast<size_t>(d), acc_);
+                        } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                            t_arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
                         }
                     } else if (h_obj->IsJSObject()) {
                         auto* js_obj = static_cast<JSObject*>(h_obj);
