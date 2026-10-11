@@ -148,6 +148,7 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
     size_t stack_frame_size = 56 + (max_node_id + 16) * 8;
     if (stack_frame_size % 16 != 0) stack_frame_size += 8;
     masm.Prologue(stack_frame_size);
+    masm.MovRegReg(X86Reg::RBX, X86Reg::RCX);
 
     auto GetNodeOffset = [](uint32_t id) -> int32_t {
         return -(56 + static_cast<int32_t>((id + 1) * 8));
@@ -172,7 +173,9 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
 
             case NodeOp::Parameter: {
                 uint32_t idx = node->ParameterIndex();
-                masm.MovMemToReg(X86Reg::RAX, X86Reg::RCX, static_cast<int32_t>(idx * 8));
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBX, static_cast<int32_t>(idx * 8));
+                // Validate incoming parameter is a Smi
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
                 // Extract unboxed 32-bit payload
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
@@ -204,7 +207,21 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
             }
 
             case NodeOp::CheckSmi: {
-                // Speculative Type Guard: verified during lowering
+                // Speculative Type Guard: verify guarded inputs are Smis
+                for (size_t i = 2; i < node->Inputs().size(); ++i) {
+                    Node* in = node->Input(i);
+                    if (!in) continue;
+                    if (in->Op() == NodeOp::ConstantUndefined ||
+                        in->Op() == NodeOp::ConstantNull ||
+                        in->Op() == NodeOp::ConstantBool ||
+                        in->Op() == NodeOp::ConstantFloat64) {
+                        masm.Jmp(deopt_bailout_label);
+                    } else if (in->Op() == NodeOp::Parameter) {
+                        uint32_t idx = in->ParameterIndex();
+                        masm.MovMemToReg(X86Reg::RAX, X86Reg::RBX, static_cast<int32_t>(idx * 8));
+                        masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                    }
+                }
                 break;
             }
 
@@ -212,6 +229,7 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.AddRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
@@ -220,6 +238,7 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.SubRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
@@ -228,6 +247,7 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.ImulRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
@@ -235,8 +255,18 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
             case NodeOp::Int32Div: {
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.CmpRegImm32(X86Reg::RCX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.CmpRegImm32(X86Reg::RCX, -1);
+                JITLabel not_min_div;
+                masm.Jcc(Condition::NotEqual, not_min_div);
+                masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.Bind(not_min_div);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::NotEqual, deopt_bailout_label);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }
@@ -244,6 +274,8 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
             case NodeOp::Int32Mod: {
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.CmpRegImm32(X86Reg::RCX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RDX);
@@ -515,7 +547,7 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
 
     // Deoptimization Bailout Stub
     masm.Bind(deopt_bailout_label);
-    masm.MovRegImm64(X86Reg::RAX, TaggedValue::Undefined().RawBits());
+    masm.MovRegImm64(X86Reg::RAX, TaggedValue::Empty().RawBits());
     masm.Epilogue();
 
     return std::make_unique<ExecutableMemory>(masm.Code());

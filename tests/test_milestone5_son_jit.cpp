@@ -266,6 +266,45 @@ void TestUnsupportedBytecodeGating() {
     std::cout << "  -> Unsupported bytecode successfully gated and excluded from Tier 2 compilation.\n" << std::flush;
 }
 
+void TestTier2TypeGuardsAndOverflowDeopt() {
+    std::cout << "[Test 8] Verifying Tier 2 Type Guards and Overflow Deoptimization Fallback...\n" << std::flush;
+
+    const char* src =
+        "function addNums(a, b) {\n"
+        "    return a + b;\n"
+        "}\n";
+
+    Lexer lexer(src);
+    Parser parser(lexer);
+    auto func_decl = parser.ParseStatement();
+
+    BytecodeEmitter emitter;
+    auto func_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+    assert(func_bc != nullptr);
+
+    Interpreter interp;
+
+    // Promote all the way to Tier 2
+    for (uint32_t i = 0; i < OptimizingJIT::kInvocationThreshold + 5; ++i) {
+        interp.Execute(*func_bc, { TaggedValue::FromSmi(10), TaggedValue::FromSmi(20) });
+    }
+    assert(func_bc->GetTier2Code() != nullptr);
+
+    // 1. Smi inputs execute directly in Tier 2
+    TaggedValue res1 = interp.Execute(*func_bc, { TaggedValue::FromSmi(30), TaggedValue::FromSmi(40) });
+    assert(res1.IsSmi() && res1.AsSmi() == 70);
+
+    // 2. Non-Smi inputs trigger Tier 2 CheckSmi / Parameter deopt to interpreter
+    TaggedValue res_double = interp.Execute(*func_bc, { TaggedValue::FromDouble(1.5), TaggedValue::FromDouble(2.5) });
+    assert(res_double.IsDouble() && res_double.AsDouble() == 4.0);
+
+    // 3. Overflow triggers Tier 2 JO deopt to interpreter
+    TaggedValue res_overflow = interp.Execute(*func_bc, { TaggedValue::FromSmi(2147483647), TaggedValue::FromSmi(1) });
+    assert(res_overflow.IsDouble() && res_overflow.AsDouble() == 2147483648.0);
+
+    std::cout << "  -> Tier 2 CheckSmi guards, overflow checks, and deoptimization fallback verified.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 5 (Tier 2 Sea-of-Nodes JIT) Tests  \n"
@@ -284,9 +323,11 @@ int main() {
     TestTier2AutomaticPromotion();
     std::cout << "\n" << std::flush;
     TestUnsupportedBytecodeGating();
+    std::cout << "\n" << std::flush;
+    TestTier2TypeGuardsAndOverflowDeopt();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (7/7)         \n"
+              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (8/8)         \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

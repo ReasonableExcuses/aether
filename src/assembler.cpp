@@ -249,6 +249,20 @@ void MacroAssembler::Movsxd(X86Reg dst, X86Reg src) {
     EmitModRM(0b11, dst, src);
 }
 
+void MacroAssembler::ShrRegImm8(X86Reg dst, uint8_t imm) {
+    EmitRex(true, static_cast<X86Reg>(0), dst);
+    Emit8(0xC1); // shr r/m64, imm8
+    EmitModRM(0b11, static_cast<X86Reg>(5), dst);
+    Emit8(imm);
+}
+
+void MacroAssembler::TestSmiAndBranchIfNot(X86Reg reg, JITLabel& label) {
+    MovRegReg(X86Reg::R11, reg);
+    ShrRegImm8(X86Reg::R11, 48);
+    CmpRegImm32(X86Reg::R11, 0x7FF9);
+    Jcc(Condition::NotEqual, label);
+}
+
 void MacroAssembler::CmpRegReg(X86Reg r1, X86Reg r2) {
     EmitRex(true, r2, r1);
     Emit8(0x39); // cmp r/m64, r64

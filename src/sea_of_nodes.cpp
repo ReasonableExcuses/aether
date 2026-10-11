@@ -441,6 +441,14 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
             case Opcode::Div: {
                 uint8_t reg = code[pc++];
                 pc += 2;
+
+                Node* guard = graph_->NewNode(NodeOp::CheckSmi);
+                guard->AddInput(cur_control_);
+                guard->AddInput(cur_effect_);
+                guard->AddInput(acc_);
+                guard->AddInput(registers_[reg]);
+                cur_effect_ = guard;
+
                 Node* div_node = graph_->NewNode(NodeOp::Int32Div);
                 div_node->AddInput(acc_);
                 div_node->AddInput(registers_[reg]);
@@ -450,6 +458,14 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
             case Opcode::Mod: {
                 uint8_t reg = code[pc++];
                 pc += 2;
+
+                Node* guard = graph_->NewNode(NodeOp::CheckSmi);
+                guard->AddInput(cur_control_);
+                guard->AddInput(cur_effect_);
+                guard->AddInput(acc_);
+                guard->AddInput(registers_[reg]);
+                cur_effect_ = guard;
+
                 Node* mod_node = graph_->NewNode(NodeOp::Int32Mod);
                 mod_node->AddInput(acc_);
                 mod_node->AddInput(registers_[reg]);

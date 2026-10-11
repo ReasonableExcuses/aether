@@ -21,7 +21,8 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
 
     // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
     if (const ExecutableMemory* t2 = bytecode.GetTier2Code()) {
-        return BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        TaggedValue res = BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        if (!res.IsEmpty()) return res;
     }
 
     // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled; promote to Tier 2 when hot
@@ -31,10 +32,12 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
             auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
             if (opt_code) {
                 bytecode.SetTier2Code(std::move(opt_code));
-                return BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+                TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+                if (!res.IsEmpty()) return res;
             }
         }
-        return BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        TaggedValue res = BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        if (!res.IsEmpty()) return res;
     }
 
     // 3. Increment invocation profile counter; promote to Tier 2 if hot enough, or Tier 1
@@ -43,14 +46,16 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
         if (opt_code) {
             bytecode.SetTier2Code(std::move(opt_code));
-            return BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            if (!res.IsEmpty()) return res;
         }
     }
     if (bytecode.InvocationCount() >= BaselineJIT::kInvocationThreshold && BaselineJIT::CanCompile(bytecode)) {
         auto jit_code = BaselineJIT::Compile(bytecode);
         if (jit_code) {
             bytecode.SetTier1Code(std::move(jit_code));
-            return BaselineJIT::Invoke(*bytecode.GetTier1Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier1Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            if (!res.IsEmpty()) return res;
         }
     }
 

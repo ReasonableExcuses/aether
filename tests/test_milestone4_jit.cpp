@@ -243,6 +243,72 @@ void TestBaselineJITTruthinessSemantics() {
     std::cout << "  -> All JS falsy and truthy values produce identical results across JIT and Interpreter.\n" << std::flush;
 }
 
+void TestBaselineJITTypeGuardsAndOverflow() {
+    std::cout << "[Test 6] Verifying Baseline JIT Type Guards and Overflow Deoptimization Fallback...\n" << std::flush;
+
+    const char* src =
+        "function addNums(a, b) {\n"
+        "    return a + b;\n"
+        "}\n";
+
+    Lexer lexer(src);
+    Parser parser(lexer);
+    auto func_decl = parser.ParseStatement();
+
+    BytecodeEmitter emitter;
+    auto func_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+    assert(func_bc != nullptr);
+
+    Interpreter interp;
+
+    // Trigger Tier 1 compilation
+    for (uint32_t i = 0; i < BaselineJIT::kInvocationThreshold + 5; ++i) {
+        interp.Execute(*func_bc, { TaggedValue::FromSmi(10), TaggedValue::FromSmi(20) });
+    }
+    assert(func_bc->GetTier1Code() != nullptr);
+
+    // 1. Valid Smis execute directly
+    TaggedValue res1 = interp.Execute(*func_bc, { TaggedValue::FromSmi(15), TaggedValue::FromSmi(25) });
+    assert(res1.IsSmi() && res1.AsSmi() == 40);
+
+    // 2. Non-Smi operands trigger deoptimization and fall back cleanly to interpreter
+    TaggedValue res_double = interp.Execute(*func_bc, { TaggedValue::FromDouble(2.5), TaggedValue::FromDouble(3.5) });
+    assert(res_double.IsDouble() && res_double.AsDouble() == 6.0);
+
+    // 3. Overflow triggers deoptimization and falls back to interpreter double addition
+    TaggedValue max_smi = TaggedValue::FromSmi(2147483647);
+    TaggedValue one = TaggedValue::FromSmi(1);
+    TaggedValue res_overflow = interp.Execute(*func_bc, { max_smi, one });
+    assert(res_overflow.IsDouble() && res_overflow.AsDouble() == 2147483648.0);
+
+    // 4. Non-integer division and division by zero
+    const char* div_src =
+        "function divNums(a, b) {\n"
+        "    return a / b;\n"
+        "}\n";
+    Lexer lexer_div(div_src);
+    Parser parser_div(lexer_div);
+    auto div_decl = parser_div.ParseStatement();
+    auto div_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(div_decl.get()));
+    for (uint32_t i = 0; i < BaselineJIT::kInvocationThreshold + 5; ++i) {
+        interp.Execute(*div_bc, { TaggedValue::FromSmi(20), TaggedValue::FromSmi(4) });
+    }
+    assert(div_bc->GetTier1Code() != nullptr);
+
+    TaggedValue res_div_exact = interp.Execute(*div_bc, { TaggedValue::FromSmi(20), TaggedValue::FromSmi(4) });
+    assert(res_div_exact.IsSmi() && res_div_exact.AsSmi() == 5);
+
+    // Non-integer division deopts to float
+    TaggedValue res_div_float = interp.Execute(*div_bc, { TaggedValue::FromSmi(5), TaggedValue::FromSmi(2) });
+    assert(res_div_float.IsDouble() && res_div_float.AsDouble() == 2.5);
+
+    // Division by zero deopts to Infinity
+    TaggedValue res_div_zero = interp.Execute(*div_bc, { TaggedValue::FromSmi(1), TaggedValue::FromSmi(0) });
+    assert(res_div_zero.IsDouble() && std::isinf(res_div_zero.AsDouble()));
+
+    std::cout << "  -> Baseline JIT type guards, overflow checks, and deoptimization fallback verified.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 4 (Tier 1 Baseline JIT) Test Suite\n"
@@ -257,9 +323,11 @@ int main() {
     TestHighThroughputNativeExecution();
     std::cout << "\n" << std::flush;
     TestBaselineJITTruthinessSemantics();
+    std::cout << "\n" << std::flush;
+    TestBaselineJITTypeGuardsAndOverflow();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (5/5)             \n"
+              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (6/6)             \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

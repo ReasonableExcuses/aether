@@ -80,6 +80,7 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
 
     // Label per bytecode offset
     std::vector<JITLabel> labels(bytecode.Code().size() + 1);
+    JITLabel deopt_bailout_label;
 
     size_t pc = 0;
     const auto& code = bytecode.Code();
@@ -142,9 +143,12 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 uint8_t reg = code[pc++];
                 pc += 2; // slot
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
-                masm.AddRegReg(X86Reg::RDX, X86Reg::R8);
+                masm.AddRegReg32(X86Reg::RDX, X86Reg::R8);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -154,9 +158,12 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 uint8_t reg = code[pc++];
                 pc += 2;
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
-                masm.SubRegReg(X86Reg::RDX, X86Reg::R8);
+                masm.SubRegReg32(X86Reg::RDX, X86Reg::R8);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -166,9 +173,12 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 uint8_t reg = code[pc++];
                 pc += 2;
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
-                masm.ImulRegReg(X86Reg::RDX, X86Reg::R8);
+                masm.ImulRegReg32(X86Reg::RDX, X86Reg::R8);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -178,10 +188,22 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 uint8_t reg = code[pc++];
                 pc += 2;
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
-                masm.Movsxd(X86Reg::RCX, X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                JITLabel not_min;
+                masm.Jcc(Condition::NotEqual, not_min);
+                masm.CmpRegImm32(X86Reg::RDX, -1);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.Bind(not_min);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::NotEqual, deopt_bailout_label);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -191,8 +213,12 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 uint8_t reg = code[pc++];
                 pc += 2;
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
-                masm.Movsxd(X86Reg::RCX, X86Reg::RCX);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
@@ -203,6 +229,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::BitwiseAnd: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.AndRegReg(X86Reg::RAX, X86Reg::RCX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -211,12 +239,16 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::BitwiseOr: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
                 break;
             }
             case Opcode::BitwiseXor: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.XorRegReg(X86Reg::RAX, X86Reg::RCX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -225,6 +257,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::TestLessThan: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
                 masm.CmpRegReg(X86Reg::RDX, X86Reg::R8);
@@ -241,6 +275,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::TestLessThanOrEqual: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
                 masm.CmpRegReg(X86Reg::RDX, X86Reg::R8);
@@ -257,6 +293,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::TestGreaterThan: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
                 masm.CmpRegReg(X86Reg::RDX, X86Reg::R8);
@@ -273,6 +311,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::TestGreaterThanOrEqual: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
                 masm.CmpRegReg(X86Reg::RDX, X86Reg::R8);
@@ -290,6 +330,8 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::TestStrictEqual: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
                 masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
                 JITLabel is_true;
                 JITLabel done;
@@ -375,6 +417,12 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
     }
 
     masm.Epilogue();
+
+    // Deoptimization Bailout Stub
+    masm.Bind(deopt_bailout_label);
+    masm.MovRegImm64(X86Reg::RAX, TaggedValue::Empty().RawBits());
+    masm.Epilogue();
+
     return std::make_unique<ExecutableMemory>(masm.Code());
 }
 

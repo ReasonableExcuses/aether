@@ -29,6 +29,8 @@ enum class X86Reg : uint8_t {
 };
 
 enum class Condition : uint8_t {
+    Overflow            = 0x80, // jo
+    NotOverflow         = 0x81, // jno
     Equal               = 0x84, // je
     NotEqual            = 0x85, // jne
     Less                = 0x8C, // jl
@@ -102,6 +104,8 @@ public:
 
     // Smi Unboxing & Fast Arithmetic (32-bit sign extension)
     void Movsxd(X86Reg dst, X86Reg src);
+    void ShrRegImm8(X86Reg dst, uint8_t imm);
+    void TestSmiAndBranchIfNot(X86Reg reg, JITLabel& label);
 
     // Comparisons
     void CmpRegReg(X86Reg r1, X86Reg r2);
