@@ -130,7 +130,8 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
         return ParseWhile();
     }
     if (Match(TokenKind::For)) {
-        return ParseFor();
+        bool is_for_await = Match(TokenKind::Await);
+        return ParseFor(is_for_await);
     }
     if (Match(TokenKind::Return)) {
         return ParseReturn();
@@ -289,7 +290,7 @@ std::unique_ptr<Stmt> Parser::ParseWhile() {
     return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
 }
 
-std::unique_ptr<Stmt> Parser::ParseFor() {
+std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
     Consume(TokenKind::OpenParen, "Expected '(' after 'for'");
 
     // Speculative lookahead for "for ( [let|var|const]? (id | [a, b]) of iterable )"
@@ -330,6 +331,9 @@ std::unique_ptr<Stmt> Parser::ParseFor() {
     }
 
     if (is_for_in || is_for_of) {
+        if (is_for_await && is_for_in) {
+            throw std::runtime_error("SyntaxError: for-in loop cannot be used with 'await'");
+        }
         std::unique_ptr<Expr> iterable;
         if (is_for_in) {
             auto target_obj = ParseExpression();
@@ -346,33 +350,71 @@ std::unique_ptr<Stmt> Parser::ParseFor() {
         auto body = ParseStatement();
 
         static uint32_t s_for_of_id = 0;
-        std::string iter_var = "$iter_" + std::to_string(++s_for_of_id);
+        std::string target_var = "$target_" + std::to_string(++s_for_of_id);
+        std::string iter_var = "$iter_" + std::to_string(s_for_of_id);
         std::string step_var = "$step_" + std::to_string(s_for_of_id);
 
         auto outer_block = std::make_unique<BlockStmt>();
+        outer_block->AddStatement(std::make_unique<VarDeclStmt>(target_var, std::move(iterable)));
 
-        // $iter = iterable[Symbol.iterator]()
-        auto get_sym_iter = std::make_unique<PropertyAccessExpr>(
-            std::make_unique<IdentifierExpr>("Symbol"),
-            "iterator"
-        );
-        auto get_iter_fn = std::make_unique<IndexAccessExpr>(
-            std::move(iterable),
-            std::move(get_sym_iter)
-        );
-        auto call_iter = std::make_unique<CallExpr>(
-            std::move(get_iter_fn),
-            std::vector<std::unique_ptr<Expr>>{}
-        );
-        outer_block->AddStatement(std::make_unique<VarDeclStmt>(iter_var, std::move(call_iter)));
+        if (is_for_await) {
+            // ($target[Symbol.asyncIterator] !== undefined ? $target[Symbol.asyncIterator]() : $target[Symbol.iterator]())
+            auto get_async_method = std::make_unique<IndexAccessExpr>(
+                std::make_unique<IdentifierExpr>(target_var),
+                std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>("Symbol"), "asyncIterator")
+            );
+            auto cond_has_async = std::make_unique<BinaryExpr>(
+                BinaryOp::StrictNotEqual,
+                std::move(get_async_method),
+                std::make_unique<LiteralExpr>(TaggedValue::Undefined())
+            );
+            auto call_async = std::make_unique<CallExpr>(
+                std::make_unique<IndexAccessExpr>(
+                    std::make_unique<IdentifierExpr>(target_var),
+                    std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>("Symbol"), "asyncIterator")
+                ),
+                std::vector<std::unique_ptr<Expr>>{}
+            );
+            auto call_sync = std::make_unique<CallExpr>(
+                std::make_unique<IndexAccessExpr>(
+                    std::make_unique<IdentifierExpr>(target_var),
+                    std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>("Symbol"), "iterator")
+                ),
+                std::vector<std::unique_ptr<Expr>>{}
+            );
+            auto iter_init = std::make_unique<ConditionalExpr>(
+                std::move(cond_has_async),
+                std::move(call_async),
+                std::move(call_sync)
+            );
+            outer_block->AddStatement(std::make_unique<VarDeclStmt>(iter_var, std::move(iter_init)));
+        } else {
+            auto get_sym_iter = std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>("Symbol"),
+                "iterator"
+            );
+            auto get_iter_fn = std::make_unique<IndexAccessExpr>(
+                std::make_unique<IdentifierExpr>(target_var),
+                std::move(get_sym_iter)
+            );
+            auto call_iter = std::make_unique<CallExpr>(
+                std::move(get_iter_fn),
+                std::vector<std::unique_ptr<Expr>>{}
+            );
+            outer_block->AddStatement(std::make_unique<VarDeclStmt>(iter_var, std::move(call_iter)));
+        }
 
-        // $step = $iter.next()
-        auto call_next = [iter_var]() {
+        // $step = (await)? $iter.next()
+        auto call_next = [iter_var, is_for_await]() -> std::unique_ptr<Expr> {
             auto get_next_fn = std::make_unique<PropertyAccessExpr>(
                 std::make_unique<IdentifierExpr>(iter_var),
                 "next"
             );
-            return std::make_unique<CallExpr>(std::move(get_next_fn), std::vector<std::unique_ptr<Expr>>{});
+            auto call_expr = std::make_unique<CallExpr>(std::move(get_next_fn), std::vector<std::unique_ptr<Expr>>{});
+            if (is_for_await) {
+                return std::make_unique<AwaitExpr>(std::move(call_expr));
+            }
+            return call_expr;
         };
         outer_block->AddStatement(std::make_unique<VarDeclStmt>(step_var, call_next()));
 
@@ -410,12 +452,16 @@ std::unique_ptr<Stmt> Parser::ParseFor() {
 
         loop_body->AddStatement(std::move(body));
 
-        // update: $step = $iter.next()
+        // update: $step = (await)? $iter.next()
         auto update_step = std::make_unique<AssignExpr>(step_var, call_next());
         loop_body->AddStatement(std::make_unique<ExprStmt>(std::move(update_step)));
 
         outer_block->AddStatement(std::make_unique<WhileStmt>(std::move(cond), std::move(loop_body)));
         return outer_block;
+    }
+
+    if (is_for_await) {
+        throw std::runtime_error("SyntaxError: for-await loop requires 'of' iteration");
     }
 
     // Standard for loop
@@ -662,8 +708,30 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return expr;
         }
         case TokenKind::OpenBrace: {
-            // Object literal: { key: val, [expr]: val, ...spread }
+            // Object literal: { key: val, [expr]: val, name() {}, [expr]() {}, ...spread }
             std::vector<ObjectLiteralExpr::Property> props;
+            auto parse_method_params = [this](std::vector<std::string>& params, std::string& rest_param) {
+                if (!Check(TokenKind::CloseParen)) {
+                    if (Match(TokenKind::DotDotDot)) {
+                        Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                        rest_param = r.text;
+                    } else {
+                        Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                        params.push_back(p.text);
+                        while (Match(TokenKind::Comma)) {
+                            if (Match(TokenKind::DotDotDot)) {
+                                Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                                rest_param = r.text;
+                                break;
+                            }
+                            Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                            params.push_back(np.text);
+                        }
+                    }
+                }
+                Consume(TokenKind::CloseParen, "Expected ')' after parameters");
+            };
+
             if (!Check(TokenKind::CloseBrace)) {
                 do {
                     if (Match(TokenKind::DotDotDot)) {
@@ -678,6 +746,20 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                     if (Match(TokenKind::OpenBracket)) {
                         auto computed_key = ParseExpression();
                         Consume(TokenKind::CloseBracket, "Expected ']' after computed property key");
+                        if (Match(TokenKind::OpenParen)) {
+                            std::vector<std::string> params;
+                            std::string rest_param;
+                            parse_method_params(params, rest_param);
+                            auto body = ParseBlock();
+                            auto fn_expr = std::make_unique<FunctionExpr>("", std::move(params), std::move(body));
+                            if (!rest_param.empty()) fn_expr->SetRest(rest_param);
+                            props.push_back(ObjectLiteralExpr::Property{
+                                .key = "",
+                                .computed_key = std::move(computed_key),
+                                .value = std::move(fn_expr)
+                            });
+                            continue;
+                        }
                         Consume(TokenKind::Colon, "Expected ':' after computed property key");
                         auto val = ParseExpression();
                         props.push_back(ObjectLiteralExpr::Property{
@@ -691,13 +773,38 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                     if (key_tok.kind != TokenKind::Identifier && key_tok.kind != TokenKind::String && key_tok.kind != TokenKind::Number) {
                         throw std::runtime_error("Expected property key in object literal");
                     }
-                    Consume(TokenKind::Colon, "Expected ':' after property key");
-                    auto val = ParseExpression();
-                    props.push_back(ObjectLiteralExpr::Property{
-                        .key = key_tok.text,
-                        .computed_key = nullptr,
-                        .value = std::move(val)
-                    });
+                    if (Match(TokenKind::OpenParen)) {
+                        std::vector<std::string> params;
+                        std::string rest_param;
+                        parse_method_params(params, rest_param);
+                        auto body = ParseBlock();
+                        auto fn_expr = std::make_unique<FunctionExpr>(key_tok.text, std::move(params), std::move(body));
+                        if (!rest_param.empty()) fn_expr->SetRest(rest_param);
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = key_tok.text,
+                            .computed_key = nullptr,
+                            .value = std::move(fn_expr)
+                        });
+                        continue;
+                    }
+                    if (Match(TokenKind::Colon)) {
+                        auto val = ParseExpression();
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = key_tok.text,
+                            .computed_key = nullptr,
+                            .value = std::move(val)
+                        });
+                        continue;
+                    }
+                    if (key_tok.kind == TokenKind::Identifier) {
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = key_tok.text,
+                            .computed_key = nullptr,
+                            .value = std::make_unique<IdentifierExpr>(key_tok.text)
+                        });
+                        continue;
+                    }
+                    throw std::runtime_error("Expected ':' after property key");
                 } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
             }
             Consume(TokenKind::CloseBrace, "Expected '}' after object literal");

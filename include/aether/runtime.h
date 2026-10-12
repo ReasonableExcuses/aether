@@ -122,7 +122,9 @@ public:
     JSObject* GetTypedArrayPrototype() const noexcept { return typed_array_prototype_; }
     JSObject* GetDataViewPrototype() const noexcept { return data_view_prototype_; }
     JSObject* GetGeneratorPrototype() const noexcept { return generator_prototype_; }
+    JSObject* GetAsyncGeneratorPrototype() const noexcept { return async_generator_prototype_; }
     TaggedValue GetSymbolIterator() const noexcept { return symbol_iterator_; }
+    TaggedValue GetSymbolAsyncIterator() const noexcept { return symbol_asyncIterator_; }
     TaggedValue GetSymbolToStringTag() const noexcept { return symbol_toStringTag_; }
     TaggedValue GetSymbolHasInstance() const noexcept { return symbol_hasInstance_; }
     TaggedValue GetSymbolToPrimitive() const noexcept { return symbol_toPrimitive_; }
@@ -151,7 +153,9 @@ private:
     JSObject* typed_array_prototype_{nullptr};
     JSObject* data_view_prototype_{nullptr};
     JSObject* generator_prototype_{nullptr};
+    JSObject* async_generator_prototype_{nullptr};
     TaggedValue symbol_iterator_{TaggedValue::Undefined()};
+    TaggedValue symbol_asyncIterator_{TaggedValue::Undefined()};
     TaggedValue symbol_toStringTag_{TaggedValue::Undefined()};
     TaggedValue symbol_hasInstance_{TaggedValue::Undefined()};
     TaggedValue symbol_toPrimitive_{TaggedValue::Undefined()};

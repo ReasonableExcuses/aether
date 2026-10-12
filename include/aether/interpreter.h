@@ -100,12 +100,18 @@ public:
     /**
      * @brief Resumes a suspended JSGeneratorObject with the given sent value.
      */
-    TaggedValue ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection = false);
+    TaggedValue ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection = false, bool* out_is_await = nullptr);
 
     /**
      * @brief Drives an async coroutine step upon microtask resolution or initial call.
      */
     void RunAsyncStep(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection = false);
+
+    /**
+     * @brief Drives an async generator coroutine step upon microtask resolution or next() call.
+     */
+    void RunAsyncGeneratorStep(JSGeneratorObject* gen);
+    void ExecuteAsyncGeneratorRequest(JSGeneratorObject* gen, TaggedValue resume_val = TaggedValue(), bool is_rejection = false);
 
     TypeFeedbackVector& GetFeedbackVector() noexcept { return feedback_; }
 
@@ -142,7 +148,7 @@ private:
     TaggedValue pending_exception_{TaggedValue::Undefined()};
     LexicalEnvironment* last_environment_{nullptr};
 
-    TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr);
+    TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr, bool* out_is_await = nullptr);
 };
 
 } // namespace aether

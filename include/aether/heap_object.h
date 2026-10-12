@@ -59,6 +59,7 @@ public:
     AETHER_ALWAYS_INLINE bool IsJSObject() const noexcept {
         return type_ == HeapObjectType::JSObject ||
                type_ == HeapObjectType::JSArray  ||
+               type_ == HeapObjectType::JSFunction ||
                type_ == HeapObjectType::JSNativeFunction ||
                type_ == HeapObjectType::JSMap    ||
                type_ == HeapObjectType::JSSet    ||
@@ -649,22 +650,29 @@ private:
 /**
  * @brief Managed JavaScript Function object holding compiled bytecode and lexical closure scope.
  */
-class JSFunction : public HeapObject {
+class JSFunction : public JSObject {
 public:
     JSFunction(std::string_view name, std::shared_ptr<const BytecodeArray> bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::JSFunction, shape),
+        : JSObject(HeapObjectType::JSFunction, shape),
           name_(name),
           bytecode_shared_(std::move(bytecode)),
           bytecode_(bytecode_shared_.get()),
           environment_(env) {}
 
     JSFunction(std::string_view name, const BytecodeArray* bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::JSFunction, shape),
+        : JSObject(HeapObjectType::JSFunction, shape),
           name_(name),
           bytecode_(bytecode),
           environment_(env) {}
 
-    JSFunction(JSFunction&& other) noexcept = default;
+    JSFunction(JSFunction&& other) noexcept
+        : JSObject(std::move(other)),
+          name_(std::move(other.name_)),
+          bytecode_shared_(std::move(other.bytecode_shared_)),
+          bytecode_(other.bytecode_),
+          environment_(other.environment_),
+          is_generator_(other.is_generator_),
+          is_async_(other.is_async_) {}
 
     const std::string& Name() const noexcept { return name_; }
     const BytecodeArray* GetBytecode() const noexcept { return bytecode_; }
@@ -681,29 +689,22 @@ public:
     LexicalEnvironment* GetEnvironment() const noexcept { return environment_; }
     void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
 
-    JSObject* GetPrototype() const noexcept { return prototype_; }
-    void SetPrototype(JSObject* proto) noexcept { prototype_ = proto; }
-
     bool IsGenerator() const noexcept { return is_generator_; }
     void SetGenerator(bool g) noexcept { is_generator_ = g; }
 
     bool IsAsync() const noexcept { return is_async_; }
     void SetAsync(bool a) noexcept { is_async_ = a; }
 
+    bool IsAsyncGenerator() const noexcept { return is_async_ && is_generator_; }
+
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSObject::IteratePointers(visitor);
         if (environment_ != nullptr) {
             TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
             visitor(env_val);
             if (env_val.IsHeapObject()) {
                 environment_ = env_val.As<LexicalEnvironment>();
-            }
-        }
-        if (prototype_ != nullptr) {
-            TaggedValue proto_val = TaggedValue::FromHeapObject(prototype_);
-            visitor(proto_val);
-            if (proto_val.IsHeapObject()) {
-                prototype_ = proto_val.As<JSObject>();
             }
         }
     }
@@ -717,7 +718,6 @@ private:
     std::shared_ptr<const BytecodeArray> bytecode_shared_{nullptr};
     const BytecodeArray* bytecode_{nullptr};
     LexicalEnvironment* environment_{nullptr};
-    JSObject* prototype_{nullptr};
     bool is_generator_{false};
     bool is_async_{false};
 };
@@ -737,6 +737,13 @@ public:
     struct SavedHandler {
         uint32_t target_offset{0};
         LexicalEnvironment* env{nullptr};
+    };
+
+    struct AsyncRequest {
+        enum class Type : uint8_t { Next, Return, Throw };
+        Type type{Type::Next};
+        TaggedValue value{TaggedValue::Undefined()};
+        JSPromise* promise{nullptr};
     };
 
     JSGeneratorObject(JSFunction* fn, std::vector<TaggedValue> args, TaggedValue this_val, LexicalEnvironment* env, Shape* shape = nullptr)
@@ -761,10 +768,19 @@ public:
     void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
 
     bool IsAsync() const noexcept { return function_ && function_->IsAsync(); }
+    bool IsGenerator() const noexcept { return function_ && function_->IsGenerator(); }
+    bool IsAsyncGenerator() const noexcept { return function_ && function_->IsAsync() && function_->IsGenerator(); }
+
     JSPromise* AsyncPromise() const noexcept { return async_promise_; }
     void SetAsyncPromise(JSPromise* p) noexcept { async_promise_ = p; }
     std::vector<SavedHandler>& SavedHandlers() noexcept { return saved_handlers_; }
     const std::vector<SavedHandler>& SavedHandlers() const noexcept { return saved_handlers_; }
+
+    std::vector<AsyncRequest>& AsyncQueue() noexcept { return async_queue_; }
+    const std::vector<AsyncRequest>& AsyncQueue() const noexcept { return async_queue_; }
+
+    bool IsRunningAsync() const noexcept { return is_running_async_; }
+    void SetRunningAsync(bool r) noexcept { is_running_async_ = r; }
 
     size_t ObjectSize() const override {
         return sizeof(JSGeneratorObject) + saved_registers_.capacity() * sizeof(TaggedValue);
@@ -794,6 +810,14 @@ public:
                 if (env_val.IsHeapObject()) sh.env = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
             }
         }
+        for (auto& req : async_queue_) {
+            if (!req.value.IsEmpty()) visitor(req.value);
+            if (req.promise != nullptr) {
+                TaggedValue prom_val = TaggedValue::FromHeapObject(req.promise);
+                visitor(prom_val);
+                if (prom_val.IsHeapObject()) req.promise = static_cast<JSPromise*>(prom_val.AsHeapObject());
+            }
+        }
         if (!this_val_.IsEmpty()) visitor(this_val_);
         for (auto& r : saved_registers_) {
             if (!r.IsEmpty()) visitor(r);
@@ -817,6 +841,8 @@ private:
     State state_{State::SuspendedStart};
     JSPromise* async_promise_{nullptr};
     std::vector<SavedHandler> saved_handlers_;
+    std::vector<AsyncRequest> async_queue_;
+    bool is_running_async_{false};
 };
 
 /**

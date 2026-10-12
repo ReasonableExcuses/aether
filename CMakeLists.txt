@@ -34,6 +34,8 @@ set(AETHER_SOURCES
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
+target_compile_options(aether_core PRIVATE /Zi)
+
 
 add_executable(test_milestone1 tests/test_milestone1.cpp)
 target_link_libraries(test_milestone1 PRIVATE aether_core)
@@ -70,6 +72,7 @@ target_link_libraries(test_milestone11_typed_arrays PRIVATE aether_core)
 
 add_executable(test_test262_harness tests/test_test262_harness.cpp)
 target_link_libraries(test_test262_harness PRIVATE aether_core)
+target_link_options(test_test262_harness PRIVATE /DEBUG)
 
 add_executable(test_milestone12_modern_syntax tests/test_milestone12_modern_syntax.cpp)
 target_link_libraries(test_milestone12_modern_syntax PRIVATE aether_core)
@@ -85,3 +88,6 @@ target_link_libraries(test_milestone14_async_await PRIVATE aether_core)
 
 add_executable(test_milestone15_proxy_reflect tests/test_milestone15_proxy_reflect.cpp)
 target_link_libraries(test_milestone15_proxy_reflect PRIVATE aether_core)
+
+add_executable(test_milestone16_async_iterators tests/test_milestone16_async_iterators.cpp)
+target_link_libraries(test_milestone16_async_iterators PRIVATE aether_core)

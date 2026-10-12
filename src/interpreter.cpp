@@ -64,7 +64,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     return RunExecutionLoop(frame, bytecode.Code().data(), nullptr);
 }
 
-TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection) {
+TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection, bool* out_is_await) {
     if (!gen) return TaggedValue::Undefined();
     if (gen->GetState() == JSGeneratorObject::State::Completed) {
         if (gen->IsAsync()) return TaggedValue::Undefined();
@@ -111,7 +111,7 @@ TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sen
     }
 
     bool yielded = false;
-    TaggedValue result = RunExecutionLoop(frame, start_pc, &yielded);
+    TaggedValue result = RunExecutionLoop(frame, start_pc, &yielded, out_is_await);
 
     if (has_pending_exception_) {
         gen->SetState(JSGeneratorObject::State::Completed);
@@ -184,7 +184,107 @@ void Interpreter::RunAsyncStep(JSGeneratorObject* gen, TaggedValue sent_val, boo
     awaited_promise->AddReaction(TaggedValue::FromHeapObject(on_fulfilled), TaggedValue::FromHeapObject(on_rejected), nullptr, CurrentMicrotaskQueue());
 }
 
-TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded) {
+void Interpreter::RunAsyncGeneratorStep(JSGeneratorObject* gen) {
+    if (!gen) return;
+    if (gen->IsRunningAsync()) return;
+    if (gen->AsyncQueue().empty()) return;
+
+    gen->SetRunningAsync(true);
+    ExecuteAsyncGeneratorRequest(gen);
+}
+
+void Interpreter::ExecuteAsyncGeneratorRequest(JSGeneratorObject* gen, TaggedValue resume_val, bool is_rejection) {
+    if (!gen || gen->AsyncQueue().empty()) {
+        if (gen) gen->SetRunningAsync(false);
+        return;
+    }
+
+    auto& req = gen->AsyncQueue().front();
+    JSPromise* promise = req.promise;
+
+    if (gen->GetState() == JSGeneratorObject::State::Completed) {
+        TaggedValue res_val = req.type == JSGeneratorObject::AsyncRequest::Type::Return
+            ? req.value : TaggedValue::Undefined();
+        if (req.type == JSGeneratorObject::AsyncRequest::Type::Throw) {
+            if (promise) promise->Reject(req.value, CurrentMicrotaskQueue());
+        } else {
+            if (promise) promise->Fulfill(TaggedValue::FromHeapObject(CreateIterResult(res_val, true)), CurrentMicrotaskQueue());
+        }
+        gen->AsyncQueue().erase(gen->AsyncQueue().begin());
+        gen->SetRunningAsync(false);
+        RunAsyncGeneratorStep(gen);
+        return;
+    }
+
+    if (req.type == JSGeneratorObject::AsyncRequest::Type::Return) {
+        gen->SetState(JSGeneratorObject::State::Completed);
+        if (promise) promise->Fulfill(TaggedValue::FromHeapObject(CreateIterResult(req.value, true)), CurrentMicrotaskQueue());
+        gen->AsyncQueue().erase(gen->AsyncQueue().begin());
+        gen->SetRunningAsync(false);
+        RunAsyncGeneratorStep(gen);
+        return;
+    }
+
+    TaggedValue sent_val = resume_val.IsEmpty() ? req.value : resume_val;
+    bool rejection = is_rejection || (resume_val.IsEmpty() && req.type == JSGeneratorObject::AsyncRequest::Type::Throw);
+
+    ClearPendingException();
+    bool was_await = false;
+    TaggedValue step_result = ResumeGenerator(gen, sent_val, rejection, &was_await);
+
+    if (HasPendingException()) {
+        TaggedValue reason = PendingException();
+        ClearPendingException();
+        gen->SetState(JSGeneratorObject::State::Completed);
+        if (promise) promise->Reject(reason, CurrentMicrotaskQueue());
+        gen->AsyncQueue().erase(gen->AsyncQueue().begin());
+        gen->SetRunningAsync(false);
+        RunAsyncGeneratorStep(gen);
+        return;
+    }
+
+    if (gen->GetState() == JSGeneratorObject::State::Completed) {
+        if (promise) promise->Fulfill(TaggedValue::FromHeapObject(CreateIterResult(step_result, true)), CurrentMicrotaskQueue());
+        gen->AsyncQueue().erase(gen->AsyncQueue().begin());
+        gen->SetRunningAsync(false);
+        RunAsyncGeneratorStep(gen);
+        return;
+    }
+
+    if (was_await) {
+        JSPromise* awaited_promise = nullptr;
+        if (step_result.IsHeapObject() && step_result.AsHeapObject()->IsPromise()) {
+            awaited_promise = static_cast<JSPromise*>(step_result.AsHeapObject());
+        } else {
+            awaited_promise = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+            if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+                awaited_promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+            }
+            awaited_promise->Fulfill(step_result, CurrentMicrotaskQueue());
+        }
+
+        auto* on_fulfilled = AllocateRuntime<JSNativeFunction>("", [this, gen](const std::vector<TaggedValue>& args) {
+            TaggedValue v = args.empty() ? TaggedValue::Undefined() : args[0];
+            this->ExecuteAsyncGeneratorRequest(gen, v, false);
+            return TaggedValue::Undefined();
+        });
+
+        auto* on_rejected = AllocateRuntime<JSNativeFunction>("", [this, gen](const std::vector<TaggedValue>& args) {
+            TaggedValue r = args.empty() ? TaggedValue::Undefined() : args[0];
+            this->ExecuteAsyncGeneratorRequest(gen, r, true);
+            return TaggedValue::Undefined();
+        });
+
+        awaited_promise->AddReaction(TaggedValue::FromHeapObject(on_fulfilled), TaggedValue::FromHeapObject(on_rejected), nullptr, CurrentMicrotaskQueue());
+    } else {
+        if (promise) promise->Fulfill(TaggedValue::FromHeapObject(CreateIterResult(step_result, false)), CurrentMicrotaskQueue());
+        gen->AsyncQueue().erase(gen->AsyncQueue().begin());
+        gen->SetRunningAsync(false);
+        RunAsyncGeneratorStep(gen);
+    }
+}
+
+TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded, bool* out_is_await) {
     const BytecodeArray& bytecode = frame.GetBytecode();
     struct RootGuard {
         TaggedValue* acc_ptr;
@@ -1349,7 +1449,19 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 TaggedValue callee_val = frame.GetRegister(callee_reg);
                 TaggedValue rec_this = frame.GetRegister(this_reg);
-                assert(callee_val.IsHeapObject() && (callee_val.AsHeapObject()->IsFunction() || callee_val.AsHeapObject()->IsProxy()) && "Callee must be a Function or Proxy");
+                if (!callee_val.IsHeapObject() || (!callee_val.AsHeapObject()->IsFunction() && !callee_val.AsHeapObject()->IsProxy())) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "callee is not a function")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
 
                 std::vector<TaggedValue> call_args;
                 call_args.reserve(arg_count);
@@ -1364,7 +1476,13 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = native_fn->Invoke(rec_this, call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
-                    if (func->IsGenerator()) {
+                    if (func->IsAsyncGenerator()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetAsyncGeneratorPrototype()) {
+                            gen_obj->SetPrototype(Realm::Current()->GetAsyncGeneratorPrototype());
+                        }
+                        acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else if (func->IsGenerator()) {
                         auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
@@ -1406,7 +1524,19 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 (void)slot_id;
 
                 TaggedValue callee_val = frame.GetRegister(callee_reg);
-                assert(callee_val.IsHeapObject() && (callee_val.AsHeapObject()->IsFunction() || callee_val.AsHeapObject()->IsProxy()) && "Callee must be a Function or Proxy");
+                if (!callee_val.IsHeapObject() || (!callee_val.AsHeapObject()->IsFunction() && !callee_val.AsHeapObject()->IsProxy())) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "callee is not a function")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
 
                 std::vector<TaggedValue> call_args;
                 call_args.reserve(arg_count);
@@ -1421,7 +1551,13 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
-                    if (func->IsGenerator()) {
+                    if (func->IsAsyncGenerator()) {
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        if (Realm::Current() && Realm::Current()->GetAsyncGeneratorPrototype()) {
+                            gen_obj->SetPrototype(Realm::Current()->GetAsyncGeneratorPrototype());
+                        }
+                        acc_ = TaggedValue::FromHeapObject(gen_obj);
+                    } else if (func->IsGenerator()) {
                         auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
@@ -1482,7 +1618,25 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 break;
             }
-            case Opcode::Await:
+            case Opcode::Await: {
+                if (frame.GetGenerator()) {
+                    auto* gen = frame.GetGenerator();
+                    TaggedValue yielded_val = acc_;
+                    gen->SetPCOffset(static_cast<uint32_t>(pc - code_start));
+                    gen->SavedRegisters() = frame.GetRegisters();
+                    gen->SetEnvironment(frame.GetEnvironment());
+                    gen->SavedHandlers().clear();
+                    for (const auto& h : frame.Handlers()) {
+                        gen->SavedHandlers().push_back({static_cast<uint32_t>(h.target_pc - code_start), h.env});
+                    }
+                    gen->SetState(JSGeneratorObject::State::SuspendedYield);
+                    if (out_yielded) *out_yielded = true;
+                    if (out_is_await) *out_is_await = true;
+                    return yielded_val;
+                }
+                acc_ = TaggedValue::Undefined();
+                break;
+            }
             case Opcode::Yield: {
                 if (frame.GetGenerator()) {
                     auto* gen = frame.GetGenerator();
@@ -1496,6 +1650,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     }
                     gen->SetState(JSGeneratorObject::State::SuspendedYield);
                     if (out_yielded) *out_yielded = true;
+                    if (out_is_await) *out_is_await = false;
                     return yielded_val;
                 }
                 acc_ = TaggedValue::Undefined();

@@ -161,6 +161,13 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
                         context_slots_[v->Name()] = slot;
                     }
                 }
+            } else if (auto* f = dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+                if (scanner.identifiers_in_nested_functions.count(f->Name())) {
+                    if (!context_slots_.count(f->Name())) {
+                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                        context_slots_[f->Name()] = slot;
+                    }
+                }
             }
         }
     } else if (auto* prog = dynamic_cast<Program*>(body)) {
@@ -172,6 +179,13 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
                         context_slots_[v->Name()] = slot;
                     }
                 }
+            } else if (auto* f = dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+                if (scanner.identifiers_in_nested_functions.count(f->Name())) {
+                    if (!context_slots_.count(f->Name())) {
+                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                        context_slots_[f->Name()] = slot;
+                    }
+                }
             }
         }
     }
@@ -180,6 +194,9 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
 BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view name) {
     if (name == "this") {
         return VarResolution{VarResolution::ThisVar, 0, 0, 0, nullptr};
+    }
+    if (name == "undefined") {
+        return VarResolution{VarResolution::GlobalValue, 0, 0, 0, nullptr, TaggedValue::Undefined()};
     }
     auto cs_it = context_slots_.find(std::string(name));
     if (cs_it != context_slots_.end()) {
@@ -431,6 +448,10 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         return;
     }
     if (res.kind == VarResolution::GlobalValue) {
+        if (res.global_val.IsUndefined()) {
+            bytecode_->EmitOpcode(Opcode::LdaUndefined);
+            return;
+        }
         uint16_t const_idx = bytecode_->AddConstant(res.global_val);
         bytecode_->EmitOpcode(Opcode::LdaConstant);
         bytecode_->EmitU16(const_idx);
@@ -1095,18 +1116,27 @@ void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
 
     // 4. Register in current scope and emit constant load / closure creation
     uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(fn_obj));
-    uint8_t fn_reg = AllocateRegister();
-    scope_[node->Name()] = fn_reg;
-
-    if (parent_emitter_ != nullptr) {
+    auto cs_it = context_slots_.find(node->Name());
+    if (cs_it != context_slots_.end()) {
         bytecode_->EmitOpcode(Opcode::CreateClosure);
         bytecode_->EmitU16(const_idx);
+        bytecode_->EmitOpcode(Opcode::StaContextSlot);
+        bytecode_->EmitU8(0);
+        bytecode_->EmitU16(cs_it->second);
     } else {
-        bytecode_->EmitOpcode(Opcode::LdaConstant);
-        bytecode_->EmitU16(const_idx);
+        uint8_t fn_reg = AllocateRegister();
+        scope_[node->Name()] = fn_reg;
+
+        if (parent_emitter_ != nullptr || !context_slots_.empty()) {
+            bytecode_->EmitOpcode(Opcode::CreateClosure);
+            bytecode_->EmitU16(const_idx);
+        } else {
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(const_idx);
+        }
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(fn_reg);
     }
-    bytecode_->EmitOpcode(Opcode::Star);
-    bytecode_->EmitU8(fn_reg);
 }
 
 void BytecodeEmitter::VisitNew(NewExpr* node) {

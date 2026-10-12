@@ -43,6 +43,14 @@ TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::ve
     }
     if (h_obj->IsFunction()) {
         auto* fn = static_cast<JSFunction*>(h_obj);
+        if (fn->IsAsyncGenerator()) {
+            Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+            auto* gen_obj = AllocateRuntime<JSGeneratorObject>(fn, args, this_val, fn->GetEnvironment(), root);
+            if (Realm::Current() && Realm::Current()->GetAsyncGeneratorPrototype()) {
+                gen_obj->SetPrototype(Realm::Current()->GetAsyncGeneratorPrototype());
+            }
+            return TaggedValue::FromHeapObject(gen_obj);
+        }
         if (fn->IsGenerator()) {
             Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
             auto* gen_obj = AllocateRuntime<JSGeneratorObject>(fn, args, this_val, fn->GetEnvironment(), root);
@@ -2533,6 +2541,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     typed_array_prototype_ = make_old_obj();
     data_view_prototype_ = make_old_obj();
     generator_prototype_ = make_old_obj();
+    async_generator_prototype_ = make_old_obj();
 
     // Well-Known Symbols
     static uint32_t s_symbol_counter = 1000;
@@ -2543,11 +2552,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     };
 
     auto* sym_iterator = make_symbol("@@iterator");
+    auto* sym_asyncIterator = make_symbol("@@asyncIterator");
     auto* sym_toStringTag = make_symbol("@@toStringTag");
     auto* sym_hasInstance = make_symbol("@@hasInstance");
     auto* sym_toPrimitive = make_symbol("@@toPrimitive");
 
     symbol_iterator_ = TaggedValue::FromHeapObject(sym_iterator);
+    symbol_asyncIterator_ = TaggedValue::FromHeapObject(sym_asyncIterator);
     symbol_toStringTag_ = TaggedValue::FromHeapObject(sym_toStringTag);
     symbol_hasInstance_ = TaggedValue::FromHeapObject(sym_hasInstance);
     symbol_toPrimitive_ = TaggedValue::FromHeapObject(sym_toPrimitive);
@@ -2555,6 +2566,10 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     auto sym_iter_root = std::make_unique<TaggedValue>(symbol_iterator_);
     heap.RegisterExtraRoot(sym_iter_root.get());
     root_values_.push_back(std::move(sym_iter_root));
+
+    auto sym_async_iter_root = std::make_unique<TaggedValue>(symbol_asyncIterator_);
+    heap.RegisterExtraRoot(sym_async_iter_root.get());
+    root_values_.push_back(std::move(sym_async_iter_root));
 
     auto sym_tag_root = std::make_unique<TaggedValue>(symbol_toStringTag_);
     heap.RegisterExtraRoot(sym_tag_root.get());
@@ -2591,10 +2606,85 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return TaggedValue::FromHeapObject(CreateIterResult(ret_val, true));
     })), next_shape_id_);
 
+    generator_prototype_->SetNamedProperty("throw", TaggedValue::FromHeapObject(make_native("throw", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            return TaggedValue::Undefined();
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        TaggedValue err_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        if (Interpreter::Current()) {
+            return Interpreter::Current()->ResumeGenerator(gen, err_val, true);
+        }
+        return TaggedValue::Undefined();
+    })), next_shape_id_);
+
     auto* gen_iter_self = make_native("[Symbol.iterator]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
         return this_val;
     });
     generator_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(gen_iter_self), next_shape_id_);
+
+    // AsyncGenerator Prototype
+    auto make_promise = [this]() -> JSPromise* {
+        Shape* root = GetRootShape();
+        auto* p = AllocateRuntime<JSPromise>(root);
+        if (GetPromisePrototype()) {
+            p->SetPrototype(GetPromisePrototype());
+        }
+        return p;
+    };
+
+    async_generator_prototype_->SetNamedProperty("next", TaggedValue::FromHeapObject(make_native("next", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            auto* p = make_promise();
+            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.next called on incompatible receiver")), CurrentMicrotaskQueue());
+            return TaggedValue::FromHeapObject(p);
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        auto* p = make_promise();
+        TaggedValue sent_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Next, sent_val, p});
+        if (Interpreter::Current()) {
+            Interpreter::Current()->RunAsyncGeneratorStep(gen);
+        }
+        return TaggedValue::FromHeapObject(p);
+    })), next_shape_id_);
+
+    async_generator_prototype_->SetNamedProperty("return", TaggedValue::FromHeapObject(make_native("return", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            auto* p = make_promise();
+            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.return called on incompatible receiver")), CurrentMicrotaskQueue());
+            return TaggedValue::FromHeapObject(p);
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        auto* p = make_promise();
+        TaggedValue ret_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Return, ret_val, p});
+        if (Interpreter::Current()) {
+            Interpreter::Current()->RunAsyncGeneratorStep(gen);
+        }
+        return TaggedValue::FromHeapObject(p);
+    })), next_shape_id_);
+
+    async_generator_prototype_->SetNamedProperty("throw", TaggedValue::FromHeapObject(make_native("throw", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
+            auto* p = make_promise();
+            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.throw called on incompatible receiver")), CurrentMicrotaskQueue());
+            return TaggedValue::FromHeapObject(p);
+        }
+        auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
+        auto* p = make_promise();
+        TaggedValue err_val = args.empty() ? TaggedValue::Undefined() : args[0];
+        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Throw, err_val, p});
+        if (Interpreter::Current()) {
+            Interpreter::Current()->RunAsyncGeneratorStep(gen);
+        }
+        return TaggedValue::FromHeapObject(p);
+    })), next_shape_id_);
+
+    auto* async_gen_iter_self = make_native("[Symbol.asyncIterator]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        return this_val;
+    });
+    async_generator_prototype_->SetNamedProperty("@@asyncIterator", TaggedValue::FromHeapObject(async_gen_iter_self), next_shape_id_);
 
     // Register Math functions
     math_object_->SetNamedProperty("abs", TaggedValue::FromHeapObject(make_native("abs", &Math_abs)), next_shape_id_);
@@ -3044,6 +3134,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     });
 
     symbol_ctor->SetNamedProperty("iterator", symbol_iterator_, next_shape_id_);
+    symbol_ctor->SetNamedProperty("asyncIterator", symbol_asyncIterator_, next_shape_id_);
     symbol_ctor->SetNamedProperty("toStringTag", symbol_toStringTag_, next_shape_id_);
     symbol_ctor->SetNamedProperty("hasInstance", symbol_hasInstance_, next_shape_id_);
     symbol_ctor->SetNamedProperty("toPrimitive", symbol_toPrimitive_, next_shape_id_);
