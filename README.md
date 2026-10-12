@@ -4,14 +4,14 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-16%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-17%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-134%2F134%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-144%2F144%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -74,7 +74,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 #### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (15/15 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (17/17 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -94,6 +94,8 @@ Foundation Progress: [███████████████████�
 | **13** | Iteration Protocols, Symbols & Generators | Symbols (`Symbol()`, descriptions, uniqueness, typeof `"symbol"`), Global Registry (`Symbol.for`, `Symbol.keyFor`), Well-Known Symbols (`Symbol.iterator`, etc.), Builtin Iterators (`values`, `keys`, `entries`), For-Of Loops with Destructuring, Generator Coroutines (`function*`, `yield`, `next`, `return`) | Complete | `[==========] 100%` |
 | **14** | Async / Await & Coroutines | `async function`, `async () =>`, `async (x) =>`, `await <expr>`, Coroutine Yield / Resume via Microtasks, Cross-await Exception Preservation & Rejection Dispatch, Complete Promise Combinators (`race`, `allSettled`, `any`, `finally`, idempotent `resolve`) | Complete | `[==========] 100%` |
 | **15** | Proxy & Reflect MOP | `JSProxy` heap object, 13 standard Proxy traps (`get`, `set`, `has`, `deleteProperty`, `apply`, `construct`, `getPrototypeOf`, `setPrototypeOf`, `ownKeys`, `getOwnPropertyDescriptor`, `defineProperty`, `isExtensible`, `preventExtensions`), `Proxy` constructor & `Proxy.revocable()`, global `Reflect` API (all 13 methods), relational `in` operator, unary `delete` operator, Object reflection methods | Complete | `[==========] 100%` |
+| **16** | Async Iterators & Generators | `Symbol.asyncIterator`, `async function*`, `AsyncGeneratorPrototype` (next, return, throw), Sequential FIFO AsyncQueue, `for await...of` desugaring, custom async iterables | Complete | `[==========] 100%` |
+| **17** | ECMAScript 2024 Modules (ESM) | Static `import`/`export` (named, default, namespace), Re-exports, Read-only bindings, Live bindings via environment access, Top-Level Await (TLA), Dynamic `import()`, CommonJS <-> ESM interop | Complete | `[==========] 100%` |
 
 ---
 
@@ -412,8 +414,9 @@ All engine components are verified by comprehensive architectural test suites co
 | `test_milestone14_async_await` | Async/Await & Microtask Coroutines | Async Functions, Async Arrow, Await Yield/Resume, Cross-Await Try/Catch, Combinators (race, allSettled, any, finally) | **10 / 10 Passed** |
 | `test_milestone15_proxy_reflect` | Proxy & Reflect MOP | 13 Proxy Traps, Revocable Proxies, Reflect API (13 methods), in/delete Operators, Object Reflection | **10 / 10 Passed** |
 | `test_milestone16_async_iterators` | Async Iterators & Generators | Symbol.asyncIterator, async function*, Sequential FIFO Queue Draining, for await...of, Custom Async Iterables, Sync Fallback | **10 / 10 Passed** |
+| `test_milestone17_esm` | ECMAScript 2024 Modules (ESM) | Static named/default/namespace import & export, Re-exports, Read-only bindings, Live bindings, Top-Level Await, Dynamic import(), CommonJS interop | **10 / 10 Passed** |
 | `test_test262_harness` | Test262 Conformance Suite | YAML Frontmatter Parser, $262 Host Object, Strict Negative Error Validation | **4 / 4 Groups (20/20 Cases) Passed** |
-| **Total** | **Full System & Conformance Stack** | **Architectural & Official Test262 Conformance Tests** | **134 / 134 Passed** |
+| **Total** | **Full System & Conformance Stack** | **Architectural & Official Test262 Conformance Tests** | **144 / 144 Passed** |
 
 ### Execution Performance Metrics
 - **Native Parameterized Call `sumN(100)`**: Completed in 300 ns.
@@ -533,6 +536,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone14_async_await.cpp # Async / Await & Microtask Coroutines tests
 │   ├── test_milestone15_proxy_reflect.cpp # Proxy & Reflect Meta-Object Protocol tests
 │   ├── test_milestone16_async_iterators.cpp # Async Iterators, Async Generators & for await...of tests
+│   ├── test_milestone17_esm.cpp       # ECMAScript 2024 Modules (ESM) tests
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
     └── run_test262.py            # Automated CLI Test262 runner tool
@@ -567,7 +571,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 16 verification binaries
+# Run Milestone 1 through 17 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -584,6 +588,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone14_async_await.exe
 .\build\Release\test_milestone15_proxy_reflect.exe
 .\build\Release\test_milestone16_async_iterators.exe
+.\build\Release\test_milestone17_esm.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe

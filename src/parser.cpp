@@ -145,6 +145,21 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
     if (Match(TokenKind::Class)) {
         return ParseClassDecl();
     }
+    if (Check(TokenKind::Import)) {
+        Lexer saved_lexer = lexer_;
+        Token saved_tok = current_token_;
+        Advance();
+        bool is_expr = Check(TokenKind::OpenParen) || Check(TokenKind::Dot);
+        lexer_ = saved_lexer;
+        current_token_ = saved_tok;
+        if (is_expr) {
+            return ParseExprStmt();
+        }
+        return ParseImportDecl();
+    }
+    if (Check(TokenKind::Export)) {
+        return ParseExportDecl();
+    }
     if (Check(TokenKind::OpenBrace)) {
         return ParseBlock();
     }
@@ -572,6 +587,186 @@ std::unique_ptr<Stmt> Parser::ParseExprStmt() {
     auto expr = ParseExpression();
     Match(TokenKind::Semicolon);
     return std::make_unique<ExprStmt>(std::move(expr));
+}
+
+bool Parser::MatchContextualKeyword(std::string_view kw) {
+    if (Check(TokenKind::Identifier) && current_token_.text == kw) {
+        Advance();
+        return true;
+    }
+    return false;
+}
+
+std::unique_ptr<Stmt> Parser::ParseImportDecl() {
+    Consume(TokenKind::Import, "Expected 'import'");
+
+    // Form 1: import "module-name";
+    if (Check(TokenKind::String)) {
+        Token spec_tok = Advance();
+        Match(TokenKind::Semicolon);
+        return std::make_unique<ImportDeclStmt>(spec_tok.text, "", "", std::vector<ImportSpecifier>{});
+    }
+
+    std::string default_import;
+    std::string namespace_import;
+    std::vector<ImportSpecifier> named_imports;
+
+    // Form 2: import defaultExport ...
+    if (Check(TokenKind::Identifier)) {
+        Token def_tok = Advance();
+        default_import = def_tok.text;
+        if (Match(TokenKind::Comma)) {
+            if (Match(TokenKind::Star)) {
+                if (!MatchContextualKeyword("as")) {
+                    Consume(TokenKind::Identifier, "Expected 'as' after '*'");
+                }
+                Token ns_tok = Consume(TokenKind::Identifier, "Expected namespace identifier");
+                namespace_import = ns_tok.text;
+            } else if (Match(TokenKind::OpenBrace)) {
+                if (!Check(TokenKind::CloseBrace)) {
+                    do {
+                        Token orig = Advance();
+                        std::string imported_name = orig.text;
+                        std::string local_name = imported_name;
+                        if (MatchContextualKeyword("as")) {
+                            Token alias = Consume(TokenKind::Identifier, "Expected alias identifier");
+                            local_name = alias.text;
+                        }
+                        named_imports.push_back(ImportSpecifier{imported_name, local_name});
+                    } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+                }
+                Consume(TokenKind::CloseBrace, "Expected '}' in import declaration");
+            }
+        }
+    } else if (Match(TokenKind::Star)) {
+        // Form 3: import * as ns from "module";
+        if (!MatchContextualKeyword("as")) {
+            Consume(TokenKind::Identifier, "Expected 'as' after '*'");
+        }
+        Token ns_tok = Consume(TokenKind::Identifier, "Expected namespace identifier");
+        namespace_import = ns_tok.text;
+    } else if (Match(TokenKind::OpenBrace)) {
+        // Form 4: import { a, b as c } from "module";
+        if (!Check(TokenKind::CloseBrace)) {
+            do {
+                Token orig = Advance();
+                std::string imported_name = orig.text;
+                std::string local_name = imported_name;
+                if (MatchContextualKeyword("as")) {
+                    Token alias = Consume(TokenKind::Identifier, "Expected alias identifier");
+                    local_name = alias.text;
+                }
+                named_imports.push_back(ImportSpecifier{imported_name, local_name});
+            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+        }
+        Consume(TokenKind::CloseBrace, "Expected '}' in import declaration");
+    }
+
+    if (!MatchContextualKeyword("from")) {
+        Consume(TokenKind::Identifier, "Expected 'from' in import statement");
+    }
+    Token spec_tok = Consume(TokenKind::String, "Expected module specifier string after 'from'");
+    Match(TokenKind::Semicolon);
+
+    return std::make_unique<ImportDeclStmt>(spec_tok.text, default_import, namespace_import, std::move(named_imports));
+}
+
+std::unique_ptr<Stmt> Parser::ParseExportDecl() {
+    Consume(TokenKind::Export, "Expected 'export'");
+
+    // Form 1: export default ...
+    if (Match(TokenKind::Default)) {
+        if (Check(TokenKind::Async)) {
+            Lexer saved_lexer = lexer_;
+            Token saved_tok = current_token_;
+            Advance();
+            if (Check(TokenKind::Function)) {
+                auto fn_decl = ParseFunctionDecl(/*is_async=*/true);
+                return std::make_unique<ExportDeclStmt>(/*is_default=*/true, std::move(fn_decl), nullptr, std::vector<ExportSpecifier>{});
+            }
+            lexer_ = saved_lexer;
+            current_token_ = saved_tok;
+        }
+        if (Check(TokenKind::Function)) {
+            auto fn_decl = ParseFunctionDecl(/*is_async=*/false);
+            return std::make_unique<ExportDeclStmt>(/*is_default=*/true, std::move(fn_decl), nullptr, std::vector<ExportSpecifier>{});
+        }
+        if (Check(TokenKind::Class)) {
+            Advance();
+            auto cls_decl = ParseClassDecl();
+            return std::make_unique<ExportDeclStmt>(/*is_default=*/true, std::move(cls_decl), nullptr, std::vector<ExportSpecifier>{});
+        }
+        auto expr = ParseExpression();
+        Match(TokenKind::Semicolon);
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/true, nullptr, std::move(expr), std::vector<ExportSpecifier>{});
+    }
+
+    // Form 2: export * from "mod" OR export * as ns from "mod"
+    if (Match(TokenKind::Star)) {
+        std::string export_all_as;
+        if (MatchContextualKeyword("as")) {
+            Token as_tok = Consume(TokenKind::Identifier, "Expected identifier after 'as'");
+            export_all_as = as_tok.text;
+        }
+        if (!MatchContextualKeyword("from")) {
+            Consume(TokenKind::Identifier, "Expected 'from' after export *");
+        }
+        Token spec_tok = Consume(TokenKind::String, "Expected module specifier");
+        Match(TokenKind::Semicolon);
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/false, nullptr, nullptr, std::vector<ExportSpecifier>{}, spec_tok.text, /*is_export_all=*/true, export_all_as);
+    }
+
+    // Form 3: export { a, b as c } [from "mod"]
+    if (Match(TokenKind::OpenBrace)) {
+        std::vector<ExportSpecifier> named_exports;
+        if (!Check(TokenKind::CloseBrace)) {
+            do {
+                Token orig = Advance();
+                std::string local_name = orig.text;
+                std::string export_name = local_name;
+                if (MatchContextualKeyword("as")) {
+                    Token as_tok = Advance();
+                    export_name = as_tok.text;
+                }
+                named_exports.push_back(ExportSpecifier{local_name, export_name});
+            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+        }
+        Consume(TokenKind::CloseBrace, "Expected '}' in export clause");
+        std::string from_spec;
+        if (MatchContextualKeyword("from")) {
+            Token spec_tok = Consume(TokenKind::String, "Expected module specifier after 'from'");
+            from_spec = spec_tok.text;
+        }
+        Match(TokenKind::Semicolon);
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/false, nullptr, nullptr, std::move(named_exports), from_spec);
+    }
+
+    // Form 4: export var/let/const/function/class
+    if (Match(TokenKind::Var) || Match(TokenKind::Let) || Match(TokenKind::Const)) {
+        auto var_decl = ParseVarDecl();
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/false, std::move(var_decl), nullptr, std::vector<ExportSpecifier>{});
+    }
+    if (Check(TokenKind::Async)) {
+        Lexer saved_lexer = lexer_;
+        Token saved_tok = current_token_;
+        Advance();
+        if (Check(TokenKind::Function)) {
+            auto fn_decl = ParseFunctionDecl(/*is_async=*/true);
+            return std::make_unique<ExportDeclStmt>(/*is_default=*/false, std::move(fn_decl), nullptr, std::vector<ExportSpecifier>{});
+        }
+        lexer_ = saved_lexer;
+        current_token_ = saved_tok;
+    }
+    if (Check(TokenKind::Function)) {
+        auto fn_decl = ParseFunctionDecl(/*is_async=*/false);
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/false, std::move(fn_decl), nullptr, std::vector<ExportSpecifier>{});
+    }
+    if (Match(TokenKind::Class)) {
+        auto cls_decl = ParseClassDecl();
+        return std::make_unique<ExportDeclStmt>(/*is_default=*/false, std::move(cls_decl), nullptr, std::vector<ExportSpecifier>{});
+    }
+
+    throw std::runtime_error("SyntaxError: Unexpected export syntax at line " + std::to_string(current_token_.location.line));
 }
 
 std::unique_ptr<Expr> Parser::ParseExpression(Precedence precedence) {
@@ -1034,6 +1229,21 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 fn_expr->SetRest(rest_param);
             }
             return fn_expr;
+        }
+        case TokenKind::Import: {
+            if (Match(TokenKind::OpenParen)) {
+                auto spec_expr = ParseExpression();
+                Consume(TokenKind::CloseParen, "Expected ')' after dynamic import() specifier");
+                return std::make_unique<DynamicImportExpr>(std::move(spec_expr));
+            }
+            if (Match(TokenKind::Dot)) {
+                Token meta_tok = Consume(TokenKind::Identifier, "Expected 'meta' after 'import.'");
+                if (meta_tok.text != "meta") {
+                    throw std::runtime_error("SyntaxError: Expected 'meta' after 'import.'");
+                }
+                return std::make_unique<ImportMetaExpr>();
+            }
+            throw std::runtime_error("SyntaxError: Unexpected token 'import' in expression position");
         }
         default:
             throw std::runtime_error(std::string("SyntaxError: Unexpected token '") + tok.text + 

@@ -3222,6 +3222,20 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     global_object_->SetNamedProperty("SyntaxError", TaggedValue::FromHeapObject(make_error_ctor("SyntaxError")), next_shape_id_);
     global_object_->SetNamedProperty("Test262Error", TaggedValue::FromHeapObject(make_error_ctor("Test262Error")), next_shape_id_);
 
+    // __aether_dynamic_import intrinsic
+    global_object_->SetNamedProperty("__aether_dynamic_import", TaggedValue::FromHeapObject(make_native("__aether_dynamic_import", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty()) return TaggedValue::Undefined();
+        std::string spec = args[0].ToString();
+        auto* loader = ModuleLoader::Current();
+        if (!loader && Agent::Current()) {
+            loader = &Agent::Current()->GetModuleLoader();
+        }
+        if (!loader) {
+            throw std::runtime_error("ModuleLoader is not available for dynamic import");
+        }
+        return loader->ImportDynamic(spec);
+    })), next_shape_id_);
+
     // isNaN and isFinite
     global_object_->SetNamedProperty("isNaN", TaggedValue::FromHeapObject(make_native("isNaN", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty()) return TaggedValue::FromBoolean(true);
@@ -3578,6 +3592,41 @@ TaggedValue Agent::EvaluateScript(std::string_view source) {
         }
     }
 
+    return result;
+}
+
+TaggedValue Agent::EvaluateModule(std::string_view source, std::string_view specifier) {
+    s_current_agent_ = this;
+    IsolateHeap::SetCurrent(heap_.get());
+    s_current_microtasks_ = &microtasks_;
+    Realm::SetCurrent(realm_.get());
+    Interpreter::SetCurrent(&interpreter_);
+    EventLoop::SetCurrent(event_loop_.get());
+    ModuleLoader::SetCurrent(module_loader_.get());
+
+    module_loader_->RegisterVirtualModule(specifier, source);
+    auto mod = module_loader_->LoadModule(specifier);
+    module_loader_->LinkModule(mod.get());
+    TaggedValue result = module_loader_->EvaluateModule(mod.get());
+    microtasks_.PerformMicrotaskCheckpoint();
+    return result;
+}
+
+TaggedValue Agent::EvaluateModuleWithEventLoop(std::string_view source, std::string_view specifier) {
+    s_current_agent_ = this;
+    IsolateHeap::SetCurrent(heap_.get());
+    s_current_microtasks_ = &microtasks_;
+    Realm::SetCurrent(realm_.get());
+    Interpreter::SetCurrent(&interpreter_);
+    EventLoop::SetCurrent(event_loop_.get());
+    ModuleLoader::SetCurrent(module_loader_.get());
+
+    module_loader_->RegisterVirtualModule(specifier, source);
+    auto mod = module_loader_->LoadModule(specifier);
+    module_loader_->LinkModule(mod.get());
+    TaggedValue result = module_loader_->EvaluateModule(mod.get());
+    microtasks_.PerformMicrotaskCheckpoint();
+    event_loop_->Run(*this);
     return result;
 }
 

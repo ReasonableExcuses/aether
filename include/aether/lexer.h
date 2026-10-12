@@ -103,6 +103,9 @@ enum class TokenKind {
     Yield,                  // yield
     Async,                  // async
     Await,                  // await
+    Import,                 // import
+    Export,                 // export
+    Default,                // default
 };
 
 const char* TokenKindToString(TokenKind kind);

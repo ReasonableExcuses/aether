@@ -1,5 +1,6 @@
 #include "aether/bytecode_emitter.h"
 #include "aether/runtime.h"
+#include "aether/module.h"
 
 namespace aether {
 
@@ -132,6 +133,15 @@ public:
     void VisitReturn(ReturnStmt* node) override {
         if (node->Value()) node->Value()->Accept(this);
     }
+    void VisitImportMeta(ImportMetaExpr*) override {}
+    void VisitDynamicImport(DynamicImportExpr* node) override {
+        if (node->Specifier()) node->Specifier()->Accept(this);
+    }
+    void VisitImportDecl(ImportDeclStmt*) override {}
+    void VisitExportDecl(ExportDeclStmt* node) override {
+        if (node->Declaration()) node->Declaration()->Accept(this);
+        if (node->DefaultExpr()) node->DefaultExpr()->Accept(this);
+    }
     void VisitProgram(Program* node) override {
         for (const auto& s : node->Statements()) s->Accept(this);
     }
@@ -218,6 +228,29 @@ BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view
         }
         parent = parent->parent_emitter_;
     }
+
+    // Check if active module has this imported or local binding
+    void* mod_ptr = current_module_;
+    BytecodeEmitter* cur = this;
+    while (!mod_ptr && cur->parent_emitter_) {
+        cur = cur->parent_emitter_;
+        mod_ptr = cur->current_module_;
+    }
+    if (mod_ptr) {
+        auto* mod = reinterpret_cast<SourceTextModuleRecord*>(mod_ptr);
+        auto imp_it = mod->ResolvedImports().find(std::string(name));
+        if (imp_it != mod->ResolvedImports().end()) {
+            if (imp_it->second.is_namespace) {
+                return VarResolution{VarResolution::ImportedBinding, 0, 0, 0, nullptr, TaggedValue::Undefined(), imp_it->second.namespace_obj, ""};
+            } else {
+                return VarResolution{VarResolution::ImportedBinding, 0, 0, 0, nullptr, TaggedValue::Undefined(), imp_it->second.target_env, imp_it->second.target_property};
+            }
+        }
+        if (mod->ModuleVariables().count(std::string(name))) {
+            return VarResolution{VarResolution::ModuleLocal, 0, 0, 0, nullptr, TaggedValue::Undefined(), mod->GetEnvironment(), std::string(name)};
+        }
+    }
+
     JSFunction* fn = LookupFunction(name);
     if (fn != nullptr) {
         return VarResolution{VarResolution::GlobalOrFunction, 0, 0, 0, fn, TaggedValue::Undefined()};
@@ -457,6 +490,47 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         bytecode_->EmitU16(const_idx);
         return;
     }
+    if (res.kind == VarResolution::ImportedBinding) {
+        if (res.property_name.empty()) {
+            uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(const_idx);
+            return;
+        } else {
+            uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+            uint8_t obj_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(obj_const);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(obj_reg);
+
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+            uint16_t slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::LdaNamed);
+            bytecode_->EmitU8(obj_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+            FreeRegister(obj_reg);
+            return;
+        }
+    }
+    if (res.kind == VarResolution::ModuleLocal) {
+        uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+        uint8_t obj_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(obj_const);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(obj_reg);
+
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+        FreeRegister(obj_reg);
+        return;
+    }
 
     assert(false && "Undeclared identifier in scope");
 }
@@ -521,6 +595,9 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
 void BytecodeEmitter::VisitAssign(AssignExpr* node) {
     node->Value()->Accept(this);
     auto res = ResolveVariable(node->Target());
+    if (res.kind == VarResolution::ImportedBinding) {
+        throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Target() + "'");
+    }
     if (res.kind == VarResolution::LocalReg) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(res.reg);
@@ -530,6 +607,32 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         bytecode_->EmitOpcode(Opcode::StaContextSlot);
         bytecode_->EmitU8(res.depth);
         bytecode_->EmitU16(res.slot);
+        return;
+    }
+    if (res.kind == VarResolution::ModuleLocal) {
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+
+        uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+        uint8_t env_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(obj_const);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(env_reg);
+
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+        uint16_t slot = next_feedback_slot_++;
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(env_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+
+        FreeRegister(env_reg);
+        FreeRegister(val_reg);
         return;
     }
     assert(false && "Assignment to undeclared variable");
@@ -1008,6 +1111,47 @@ void BytecodeEmitter::VisitExprStmt(ExprStmt* node) {
 }
 
 void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
+    void* mod_ptr = current_module_;
+    BytecodeEmitter* cur = this;
+    while (!mod_ptr && cur->parent_emitter_) {
+        cur = cur->parent_emitter_;
+        mod_ptr = cur->current_module_;
+    }
+    if (mod_ptr) {
+        auto* mod = reinterpret_cast<SourceTextModuleRecord*>(mod_ptr);
+        if (mod->ModuleVariables().count(node->Name())) {
+            if (node->Initializer()) {
+                node->Initializer()->Accept(this);
+            } else {
+                bytecode_->EmitOpcode(Opcode::LdaUndefined);
+            }
+            uint8_t val_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(val_reg);
+
+            uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(mod->GetEnvironment()));
+            uint8_t env_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(obj_const);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(env_reg);
+
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+            uint16_t slot = next_feedback_slot_++;
+
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(val_reg);
+            bytecode_->EmitOpcode(Opcode::StaNamed);
+            bytecode_->EmitU8(env_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+
+            FreeRegister(env_reg);
+            FreeRegister(val_reg);
+            return;
+        }
+    }
+
     auto cs_it = context_slots_.find(node->Name());
     if (cs_it != context_slots_.end()) {
         if (node->Initializer()) {
@@ -1516,6 +1660,119 @@ void BytecodeEmitter::VisitAwait(AwaitExpr* node) {
         bytecode_->EmitOpcode(Opcode::LdaUndefined);
     }
     bytecode_->EmitOpcode(Opcode::Await);
+}
+
+void BytecodeEmitter::VisitImportMeta(ImportMetaExpr*) {
+    void* mod_ptr = current_module_;
+    BytecodeEmitter* cur = this;
+    while (!mod_ptr && cur->parent_emitter_) {
+        cur = cur->parent_emitter_;
+        mod_ptr = cur->current_module_;
+    }
+    JSObject* meta_obj = nullptr;
+    if (mod_ptr) {
+        auto* mod = reinterpret_cast<SourceTextModuleRecord*>(mod_ptr);
+        meta_obj = mod->GetImportMeta(Realm::Current());
+    }
+    if (!meta_obj && Realm::Current()) {
+        meta_obj = new JSObject(Realm::Current()->GetRootShape());
+    }
+    uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(meta_obj));
+    bytecode_->EmitOpcode(Opcode::LdaConstant);
+    bytecode_->EmitU16(const_idx);
+}
+
+void BytecodeEmitter::VisitDynamicImport(DynamicImportExpr* node) {
+    node->Specifier()->Accept(this);
+    uint8_t spec_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(spec_reg);
+
+    uint8_t global_reg = AllocateRegister();
+    uint16_t fn_name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString("__aether_dynamic_import")));
+    uint16_t slot1 = next_feedback_slot_++;
+    uint16_t slot2 = next_feedback_slot_++;
+
+    uint16_t glob_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(Realm::Current()->GetGlobalObject()));
+    bytecode_->EmitOpcode(Opcode::LdaConstant);
+    bytecode_->EmitU16(glob_const);
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(global_reg);
+
+    uint8_t callee_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::LdaNamed);
+    bytecode_->EmitU8(global_reg);
+    bytecode_->EmitU16(fn_name_idx);
+    bytecode_->EmitU16(slot1);
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(callee_reg);
+
+    bytecode_->EmitOpcode(Opcode::Call);
+    bytecode_->EmitU8(callee_reg);
+    bytecode_->EmitU8(spec_reg);
+    bytecode_->EmitU8(1);
+    bytecode_->EmitU16(slot2);
+
+    FreeRegister(callee_reg);
+    FreeRegister(global_reg);
+    FreeRegister(spec_reg);
+}
+
+void BytecodeEmitter::VisitImportDecl(ImportDeclStmt*) {
+    // Declarative bindings resolved during ModuleLink
+}
+
+void BytecodeEmitter::VisitExportDecl(ExportDeclStmt* node) {
+    if (node->IsDefault()) {
+        if (node->Declaration()) {
+            node->Declaration()->Accept(this);
+            void* mod_ptr = current_module_;
+            if (mod_ptr) {
+                auto* mod = reinterpret_cast<SourceTextModuleRecord*>(mod_ptr);
+                if (auto* fn_decl = dynamic_cast<FunctionDeclStmt*>(node->Declaration())) {
+                    JSFunction* fn = LookupFunction(fn_decl->Name());
+                    if (fn) {
+                        uint32_t dummy_id = 9999;
+                        mod->GetEnvironment()->SetNamedProperty("default", TaggedValue::FromHeapObject(fn), dummy_id);
+                    }
+                }
+            }
+        } else if (node->DefaultExpr()) {
+            node->DefaultExpr()->Accept(this);
+            void* mod_ptr = current_module_;
+            if (mod_ptr) {
+                auto* mod = reinterpret_cast<SourceTextModuleRecord*>(mod_ptr);
+                uint8_t val_reg = AllocateRegister();
+                bytecode_->EmitOpcode(Opcode::Star);
+                bytecode_->EmitU8(val_reg);
+
+                uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(mod->GetEnvironment()));
+                uint8_t env_reg = AllocateRegister();
+                bytecode_->EmitOpcode(Opcode::LdaConstant);
+                bytecode_->EmitU16(obj_const);
+                bytecode_->EmitOpcode(Opcode::Star);
+                bytecode_->EmitU8(env_reg);
+
+                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString("default")));
+                uint16_t slot = next_feedback_slot_++;
+
+                bytecode_->EmitOpcode(Opcode::Ldar);
+                bytecode_->EmitU8(val_reg);
+                bytecode_->EmitOpcode(Opcode::StaNamed);
+                bytecode_->EmitU8(env_reg);
+                bytecode_->EmitU16(name_idx);
+                bytecode_->EmitU16(slot);
+
+                FreeRegister(env_reg);
+                FreeRegister(val_reg);
+            }
+        }
+        return;
+    }
+
+    if (node->Declaration()) {
+        node->Declaration()->Accept(this);
+    }
 }
 
 } // namespace aether

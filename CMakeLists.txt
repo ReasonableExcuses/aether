@@ -91,3 +91,6 @@ target_link_libraries(test_milestone15_proxy_reflect PRIVATE aether_core)
 
 add_executable(test_milestone16_async_iterators tests/test_milestone16_async_iterators.cpp)
 target_link_libraries(test_milestone16_async_iterators PRIVATE aether_core)
+
+add_executable(test_milestone17_esm tests/test_milestone17_esm.cpp)
+target_link_libraries(test_milestone17_esm PRIVATE aether_core)

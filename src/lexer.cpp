@@ -90,6 +90,9 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::Yield:             return "yield";
         case TokenKind::Async:             return "async";
         case TokenKind::Await:             return "await";
+        case TokenKind::Import:            return "import";
+        case TokenKind::Export:            return "export";
+        case TokenKind::Default:           return "default";
         default:                           return "<Unknown>";
     }
 }
@@ -362,6 +365,9 @@ Token Lexer::ScanIdentifierOrKeyword() {
     else if (text == "yield")     kind = TokenKind::Yield;
     else if (text == "async")     kind = TokenKind::Async;
     else if (text == "await")     kind = TokenKind::Await;
+    else if (text == "import")    kind = TokenKind::Import;
+    else if (text == "export")    kind = TokenKind::Export;
+    else if (text == "default")   kind = TokenKind::Default;
 
     return Token{kind, std::string(text), 0, false, 0, loc};
 }

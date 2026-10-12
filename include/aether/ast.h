@@ -362,6 +362,24 @@ private:
     std::unique_ptr<Expr> expr_;
 };
 
+class ImportMetaExpr : public Expr {
+public:
+    ImportMetaExpr() = default;
+    void Accept(ASTVisitor* visitor) override;
+};
+
+class DynamicImportExpr : public Expr {
+public:
+    explicit DynamicImportExpr(std::unique_ptr<Expr> specifier)
+        : specifier_(std::move(specifier)) {}
+
+    Expr* Specifier() const noexcept { return specifier_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> specifier_;
+};
+
 // Statements
 class Stmt : public ASTNode {};
 
@@ -566,6 +584,78 @@ private:
     std::vector<std::unique_ptr<FunctionDeclStmt>> methods_;
 };
 
+struct ImportSpecifier {
+    std::string imported_name;
+    std::string local_name;
+};
+
+class ImportDeclStmt : public Stmt {
+public:
+    ImportDeclStmt(std::string_view module_specifier,
+                   std::string_view default_import,
+                   std::string_view namespace_import,
+                   std::vector<ImportSpecifier> named_imports)
+        : module_specifier_(module_specifier),
+          default_import_(default_import),
+          namespace_import_(namespace_import),
+          named_imports_(std::move(named_imports)) {}
+
+    const std::string& ModuleSpecifier() const noexcept { return module_specifier_; }
+    const std::string& DefaultImport() const noexcept { return default_import_; }
+    const std::string& NamespaceImport() const noexcept { return namespace_import_; }
+    const std::vector<ImportSpecifier>& NamedImports() const noexcept { return named_imports_; }
+
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string module_specifier_;
+    std::string default_import_;
+    std::string namespace_import_;
+    std::vector<ImportSpecifier> named_imports_;
+};
+
+struct ExportSpecifier {
+    std::string local_name;
+    std::string exported_name;
+};
+
+class ExportDeclStmt : public Stmt {
+public:
+    ExportDeclStmt(bool is_default,
+                   std::unique_ptr<Stmt> decl,
+                   std::unique_ptr<Expr> default_expr,
+                   std::vector<ExportSpecifier> named_exports,
+                   std::string_view from_specifier = "",
+                   bool is_export_all = false,
+                   std::string_view export_all_as = "")
+        : is_default_(is_default),
+          declaration_(std::move(decl)),
+          default_expr_(std::move(default_expr)),
+          named_exports_(std::move(named_exports)),
+          from_specifier_(from_specifier),
+          is_export_all_(is_export_all),
+          export_all_as_(export_all_as) {}
+
+    bool IsDefault() const noexcept { return is_default_; }
+    Stmt* Declaration() const noexcept { return declaration_.get(); }
+    Expr* DefaultExpr() const noexcept { return default_expr_.get(); }
+    const std::vector<ExportSpecifier>& NamedExports() const noexcept { return named_exports_; }
+    const std::string& FromSpecifier() const noexcept { return from_specifier_; }
+    bool IsExportAll() const noexcept { return is_export_all_; }
+    const std::string& ExportAllAs() const noexcept { return export_all_as_; }
+
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    bool is_default_{false};
+    std::unique_ptr<Stmt> declaration_;
+    std::unique_ptr<Expr> default_expr_;
+    std::vector<ExportSpecifier> named_exports_;
+    std::string from_specifier_;
+    bool is_export_all_{false};
+    std::string export_all_as_;
+};
+
 class Program : public ASTNode {
 public:
     Program() = default;
@@ -605,6 +695,8 @@ public:
     virtual void VisitSpread(SpreadExpr* node) = 0;
     virtual void VisitYield(YieldExpr* node) = 0;
     virtual void VisitAwait(AwaitExpr* node) = 0;
+    virtual void VisitImportMeta(ImportMetaExpr* node) = 0;
+    virtual void VisitDynamicImport(DynamicImportExpr* node) = 0;
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -614,6 +706,8 @@ public:
     virtual void VisitFor(ForStmt* node) = 0;
     virtual void VisitFunctionDecl(FunctionDeclStmt* node) = 0;
     virtual void VisitClassDecl(ClassDeclStmt* node) = 0;
+    virtual void VisitImportDecl(ImportDeclStmt* node) = 0;
+    virtual void VisitExportDecl(ExportDeclStmt* node) = 0;
     virtual void VisitThrow(ThrowStmt* node) = 0;
     virtual void VisitTryCatch(TryCatchStmt* node) = 0;
     virtual void VisitReturn(ReturnStmt* node) = 0;
@@ -642,6 +736,8 @@ inline void OptionalCallExpr::Accept(ASTVisitor* v) { v->VisitOptionalCall(this)
 inline void SpreadExpr::Accept(ASTVisitor* v) { v->VisitSpread(this); }
 inline void YieldExpr::Accept(ASTVisitor* v) { v->VisitYield(this); }
 inline void AwaitExpr::Accept(ASTVisitor* v) { v->VisitAwait(this); }
+inline void ImportMetaExpr::Accept(ASTVisitor* v) { v->VisitImportMeta(this); }
+inline void DynamicImportExpr::Accept(ASTVisitor* v) { v->VisitDynamicImport(this); }
 inline void ExprStmt::Accept(ASTVisitor* v) { v->VisitExprStmt(this); }
 inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }
@@ -650,6 +746,8 @@ inline void WhileStmt::Accept(ASTVisitor* v) { v->VisitWhile(this); }
 inline void ForStmt::Accept(ASTVisitor* v) { v->VisitFor(this); }
 inline void FunctionDeclStmt::Accept(ASTVisitor* v) { v->VisitFunctionDecl(this); }
 inline void ClassDeclStmt::Accept(ASTVisitor* v) { v->VisitClassDecl(this); }
+inline void ImportDeclStmt::Accept(ASTVisitor* v) { v->VisitImportDecl(this); }
+inline void ExportDeclStmt::Accept(ASTVisitor* v) { v->VisitExportDecl(this); }
 inline void ThrowStmt::Accept(ASTVisitor* v) { v->VisitThrow(this); }
 inline void TryCatchStmt::Accept(ASTVisitor* v) { v->VisitTryCatch(this); }
 inline void ReturnStmt::Accept(ASTVisitor* v) { v->VisitReturn(this); }

@@ -58,6 +58,9 @@ private:
     std::unique_ptr<Stmt> ParseClassDecl();
     std::unique_ptr<BlockStmt> ParseBlock();
     std::unique_ptr<Stmt> ParseExprStmt();
+    std::unique_ptr<Stmt> ParseImportDecl();
+    std::unique_ptr<Stmt> ParseExportDecl();
+    bool MatchContextualKeyword(std::string_view kw);
 
     // Expression parsers
     std::unique_ptr<Expr> ParsePrefix();

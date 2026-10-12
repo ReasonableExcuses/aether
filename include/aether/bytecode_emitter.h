@@ -50,6 +50,8 @@ public:
     void VisitSpread(SpreadExpr* node) override;
     void VisitYield(YieldExpr* node) override;
     void VisitAwait(AwaitExpr* node) override;
+    void VisitImportMeta(ImportMetaExpr* node) override;
+    void VisitDynamicImport(DynamicImportExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;
@@ -59,6 +61,8 @@ public:
     void VisitFor(ForStmt* node) override;
     void VisitFunctionDecl(FunctionDeclStmt* node) override;
     void VisitClassDecl(ClassDeclStmt* node) override;
+    void VisitImportDecl(ImportDeclStmt* node) override;
+    void VisitExportDecl(ExportDeclStmt* node) override;
     void VisitThrow(ThrowStmt* node) override;
     void VisitTryCatch(TryCatchStmt* node) override;
     void VisitReturn(ReturnStmt* node) override;
@@ -75,16 +79,21 @@ public:
     void FreeRegisterRange(uint8_t start, uint8_t count);
 
     struct VarResolution {
-        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, GlobalValue, ThisVar, NotFound } kind{NotFound};
+        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, GlobalValue, ThisVar, ImportedBinding, ModuleLocal, NotFound } kind{NotFound};
         uint8_t reg{0};
         uint8_t depth{0};
         uint16_t slot{0};
         JSFunction* fn{nullptr};
         TaggedValue global_val{TaggedValue::Undefined()};
+        JSObject* module_target_obj{nullptr};
+        std::string property_name;
     };
 
     VarResolution ResolveVariable(std::string_view name);
     void ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body);
+
+    void SetModuleRecord(void* mod) noexcept { current_module_ = mod; }
+    void* GetModuleRecord() const noexcept { return current_module_; }
 
 private:
     std::unique_ptr<BytecodeArray> bytecode_;
@@ -93,6 +102,7 @@ private:
     std::vector<bool> register_in_use_;
     uint8_t max_registers_{0};
     uint16_t next_feedback_slot_{0};
+    void* current_module_{nullptr};
 
     // Function lookup
     JSFunction* LookupFunction(std::string_view name);

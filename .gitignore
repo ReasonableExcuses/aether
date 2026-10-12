@@ -18,7 +18,7 @@ out/
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
-
+PASSOVER.md
 # Visual Studio / IDE
 .vs/
 .vscode/

@@ -226,6 +226,16 @@ public:
      */
     TaggedValue EvaluateScriptWithEventLoop(std::string_view source);
 
+    /**
+     * @brief Evaluates an ECMAScript 2024 module source string end-to-end.
+     */
+    TaggedValue EvaluateModule(std::string_view source, std::string_view specifier = "main.mjs");
+
+    /**
+     * @brief Evaluates an ECMAScript module and pumps the event loop to completion.
+     */
+    TaggedValue EvaluateModuleWithEventLoop(std::string_view source, std::string_view specifier = "main.mjs");
+
     void RunEventLoop();
 
     static Agent* Current() noexcept;
