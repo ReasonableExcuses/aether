@@ -35,6 +35,7 @@ set(AETHER_SOURCES
     src/background_compiler.cpp
     src/concurrent_marker.cpp
     src/test262.cpp
+    src/advanced_intrinsics.cpp
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
@@ -107,3 +108,6 @@ target_link_libraries(test_milestone19_wasm PRIVATE aether_core)
 
 add_executable(test_milestone20_parallel tests/test_milestone20_parallel.cpp)
 target_link_libraries(test_milestone20_parallel PRIVATE aether_core)
+
+add_executable(test_milestone21_advanced_intrinsics tests/test_milestone21_advanced_intrinsics.cpp)
+target_link_libraries(test_milestone21_advanced_intrinsics PRIVATE aether_core)

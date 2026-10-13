@@ -7,6 +7,7 @@
 #include "aether/typed_array.h"
 #include "aether/intl.h"
 #include "aether/wasm.h"
+#include "aether/advanced_intrinsics.h"
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -1260,6 +1261,22 @@ static TaggedValue JSON_parse(const std::vector<TaggedValue>& args) {
     std::string text = args[0].ToString();
     SimpleJSONParser parser(text);
     return parser.Parse();
+}
+
+static TaggedValue Object_toString(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (this_val.IsUndefined()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("[object Undefined]"));
+    if (this_val.IsNull()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("[object Null]"));
+    if (this_val.IsHeapObject()) {
+        HeapObject* ho = this_val.AsHeapObject();
+        if (ho->IsJSObject()) {
+            TaggedValue tag = static_cast<JSObject*>(ho)->GetNamedProperty("@@toStringTag");
+            if (tag.IsHeapObject() && tag.AsHeapObject()->IsString()) {
+                std::string tag_str = std::string(static_cast<JSString*>(tag.AsHeapObject())->View());
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("[object " + tag_str + "]"));
+            }
+        }
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("[object Object]"));
 }
 
 // Map Intrinsics
@@ -2838,6 +2855,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return TaggedValue::FromHeapObject(AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr));
     });
     auto* object_prototype = make_old_obj();
+    object_prototype->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Object_toString)), next_shape_id_);
     object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype), next_shape_id_);
     object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(make_native("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
@@ -3498,6 +3516,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     InitializeDate(*this);
     InitializeIntl(*this);
     InitializeWebAssembly(*this);
+    InitializeAdvancedIntrinsics(*this);
 
     global_object_->SetNamedProperty("$262", TaggedValue::FromHeapObject(host262), next_shape_id_);
 }

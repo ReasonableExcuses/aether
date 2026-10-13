@@ -767,14 +767,39 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     break;
                 }
 
-                if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
-                    auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
-                    if (prop_key == "prototype") {
-                        if (!fn->GetPrototype()) {
-                            fn->SetPrototype(new JSObject(GetRootShape()));
-                        }
-                        acc_ = TaggedValue::FromHeapObject(fn->GetPrototype());
+                if (obj_val.AsHeapObject()->IsFunction()) {
+                    if (prop_key == "call") {
+                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("call", [callee = obj_val](const std::vector<TaggedValue>& args) -> TaggedValue {
+                            TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
+                            std::vector<TaggedValue> fn_args;
+                            if (args.size() > 1) {
+                                fn_args.assign(args.begin() + 1, args.end());
+                            }
+                            return CallFunction(callee, this_arg, fn_args);
+                        }));
                         break;
+                    }
+                    if (prop_key == "apply") {
+                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("apply", [callee = obj_val](const std::vector<TaggedValue>& args) -> TaggedValue {
+                            TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
+                            std::vector<TaggedValue> fn_args;
+                            if (args.size() > 1 && args[1].IsHeapObject() && args[1].AsHeapObject()->IsArray()) {
+                                auto* arr = static_cast<JSArray*>(args[1].AsHeapObject());
+                                for (size_t i = 0; i < arr->Length(); ++i) fn_args.push_back(arr->GetElement(i));
+                            }
+                            return CallFunction(callee, this_arg, fn_args);
+                        }));
+                        break;
+                    }
+                    if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
+                        auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
+                        if (prop_key == "prototype") {
+                            if (!fn->GetPrototype()) {
+                                fn->SetPrototype(new JSObject(GetRootShape()));
+                            }
+                            acc_ = TaggedValue::FromHeapObject(fn->GetPrototype());
+                            break;
+                        }
                     }
                 }
 
@@ -819,7 +844,15 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (obj_val.AsHeapObject()->IsArrayBuffer()) {
                     auto* ab = static_cast<JSArrayBuffer*>(obj_val.AsHeapObject());
                     if (prop_key == "byteLength") {
-                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(ab->ByteLength()));
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(ab->ByteLength()));
+                        break;
+                    }
+                    if (prop_key == "maxByteLength") {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(ab->MaxByteLength()));
+                        break;
+                    }
+                    if (prop_key == "growable") {
+                        acc_ = TaggedValue::FromBoolean(ab->IsGrowable());
                         break;
                     }
                 }

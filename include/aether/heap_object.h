@@ -37,6 +37,10 @@ enum class HeapObjectType : uint16_t {
     JSDataView        = 0x11,
     JSGenerator       = 0x12,
     JSProxy           = 0x13,
+    JSWeakMap         = 0x14,
+    JSWeakSet         = 0x15,
+    JSWeakRef         = 0x16,
+    JSFinalizationRegistry = 0x17,
 };
 
 /**
@@ -71,7 +75,11 @@ public:
                type_ == HeapObjectType::JSTypedArray ||
                type_ == HeapObjectType::JSDataView ||
                type_ == HeapObjectType::JSGenerator ||
-               type_ == HeapObjectType::JSProxy;
+               type_ == HeapObjectType::JSProxy  ||
+               type_ == HeapObjectType::JSWeakMap ||
+               type_ == HeapObjectType::JSWeakSet ||
+               type_ == HeapObjectType::JSWeakRef ||
+               type_ == HeapObjectType::JSFinalizationRegistry;
     }
     AETHER_ALWAYS_INLINE bool IsECMAObject() const noexcept {
         return IsJSObject() || IsFunction();
@@ -93,6 +101,10 @@ public:
     AETHER_ALWAYS_INLINE bool IsSymbol() const noexcept { return type_ == HeapObjectType::Symbol; }
     AETHER_ALWAYS_INLINE bool IsGeneratorObject() const noexcept { return type_ == HeapObjectType::JSGenerator; }
     AETHER_ALWAYS_INLINE bool IsProxy() const noexcept { return type_ == HeapObjectType::JSProxy; }
+    AETHER_ALWAYS_INLINE bool IsWeakMap() const noexcept { return type_ == HeapObjectType::JSWeakMap; }
+    AETHER_ALWAYS_INLINE bool IsWeakSet() const noexcept { return type_ == HeapObjectType::JSWeakSet; }
+    AETHER_ALWAYS_INLINE bool IsWeakRef() const noexcept { return type_ == HeapObjectType::JSWeakRef; }
+    AETHER_ALWAYS_INLINE bool IsFinalizationRegistry() const noexcept { return type_ == HeapObjectType::JSFinalizationRegistry; }
 
     static constexpr uint16_t kMarkBit      = 1 << 0;
     static constexpr uint16_t kForwardedBit = 1 << 1;

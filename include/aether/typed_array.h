@@ -22,9 +22,28 @@ public:
         : JSObject(HeapObjectType::JSArrayBuffer, shape),
           byte_length_(byte_length),
           is_detached_(false),
-          owns_data_(true) {
+          owns_data_(true),
+          is_shared_(false),
+          max_byte_length_(byte_length),
+          is_growable_(false) {
         if (byte_length_ > 0) {
             data_ = new uint8_t[byte_length_]();
+        } else {
+            data_ = nullptr;
+        }
+    }
+
+    JSArrayBuffer(size_t byte_length, size_t max_byte_length, bool is_shared, Shape* shape = nullptr)
+        : JSObject(HeapObjectType::JSArrayBuffer, shape),
+          byte_length_(byte_length),
+          is_detached_(false),
+          owns_data_(true),
+          is_shared_(is_shared),
+          max_byte_length_(std::max(byte_length, max_byte_length)),
+          is_growable_(max_byte_length > 0 && max_byte_length >= byte_length) {
+        size_t alloc_size = is_growable_ ? max_byte_length_ : byte_length_;
+        if (alloc_size > 0) {
+            data_ = new uint8_t[alloc_size]();
         } else {
             data_ = nullptr;
         }
@@ -35,17 +54,26 @@ public:
           data_(external_data),
           byte_length_(byte_length),
           is_detached_(false),
-          owns_data_(owns) {}
+          owns_data_(owns),
+          is_shared_(false),
+          max_byte_length_(byte_length),
+          is_growable_(false) {}
 
     JSArrayBuffer(JSArrayBuffer&& other) noexcept
         : JSObject(std::move(other)),
           data_(other.data_),
           byte_length_(other.byte_length_),
           is_detached_(other.is_detached_),
-          owns_data_(other.owns_data_) {
+          owns_data_(other.owns_data_),
+          is_shared_(other.is_shared_),
+          max_byte_length_(other.max_byte_length_),
+          is_growable_(other.is_growable_) {
         other.data_ = nullptr;
         other.byte_length_ = 0;
         other.owns_data_ = false;
+        other.is_shared_ = false;
+        other.max_byte_length_ = 0;
+        other.is_growable_ = false;
     }
 
     ~JSArrayBuffer() override {
@@ -68,8 +96,23 @@ public:
     uint8_t* Data() const noexcept { return is_detached_ ? nullptr : data_; }
     size_t ByteLength() const noexcept { return is_detached_ ? 0 : byte_length_; }
     bool IsDetached() const noexcept { return is_detached_; }
+    bool IsShared() const noexcept { return is_shared_; }
+    void SetShared(bool shared) noexcept { is_shared_ = shared; }
+    bool IsGrowable() const noexcept { return is_growable_; }
+    size_t MaxByteLength() const noexcept { return is_growable_ ? max_byte_length_ : byte_length_; }
+
+    bool Grow(size_t new_byte_length) noexcept {
+        if (!is_growable_ || is_detached_) return false;
+        if (new_byte_length < byte_length_ || new_byte_length > max_byte_length_) return false;
+        if (data_ && new_byte_length > byte_length_) {
+            std::memset(data_ + byte_length_, 0, new_byte_length - byte_length_);
+        }
+        byte_length_ = new_byte_length;
+        return true;
+    }
 
     void Detach() noexcept {
+        if (is_shared_) return; // SharedArrayBuffer cannot be detached per ECMAScript specification
         if (!is_detached_) {
             is_detached_ = true;
             if (owns_data_ && data_ != nullptr) {
@@ -88,7 +131,12 @@ public:
         int64_t relative_end = end < 0 ? std::max<int64_t>(len + end, 0) : std::min<int64_t>(end, len);
         int64_t new_len = std::max<int64_t>(relative_end - relative_begin, 0);
 
-        auto* copy = new JSArrayBuffer(static_cast<size_t>(new_len), shape);
+        JSArrayBuffer* copy = nullptr;
+        if (is_shared_) {
+            copy = new JSArrayBuffer(static_cast<size_t>(new_len), static_cast<size_t>(new_len), true, shape);
+        } else {
+            copy = new JSArrayBuffer(static_cast<size_t>(new_len), shape);
+        }
         if (new_len > 0 && data_ != nullptr) {
             std::memcpy(copy->Data(), data_ + relative_begin, static_cast<size_t>(new_len));
         }
@@ -100,6 +148,9 @@ private:
     size_t byte_length_{0};
     bool is_detached_{false};
     bool owns_data_{true};
+    bool is_shared_{false};
+    size_t max_byte_length_{0};
+    bool is_growable_{false};
 };
 
 /**

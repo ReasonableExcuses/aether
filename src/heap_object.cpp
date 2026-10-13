@@ -1,5 +1,6 @@
 #include "aether/heap_object.h"
 #include "aether/runtime.h"
+#include "aether/typed_array.h"
 #include <cctype>
 #include <regex>
 #include <cmath>
@@ -34,6 +35,31 @@ static bool SameValueZero(TaggedValue a, TaggedValue b) {
 }
 
 TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
+    if (IsFunction()) {
+        if (key == "call") {
+            TaggedValue callee = TaggedValue::FromHeapObject(this);
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("call", [callee](const std::vector<TaggedValue>& args) -> TaggedValue {
+                TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
+                std::vector<TaggedValue> fn_args;
+                if (args.size() > 1) {
+                    fn_args.assign(args.begin() + 1, args.end());
+                }
+                return CallFunction(callee, this_arg, fn_args);
+            }));
+        }
+        if (key == "apply") {
+            TaggedValue callee = TaggedValue::FromHeapObject(this);
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("apply", [callee](const std::vector<TaggedValue>& args) -> TaggedValue {
+                TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
+                std::vector<TaggedValue> fn_args;
+                if (args.size() > 1 && args[1].IsHeapObject() && args[1].AsHeapObject()->IsArray()) {
+                    auto* arr = static_cast<JSArray*>(args[1].AsHeapObject());
+                    for (size_t i = 0; i < arr->Length(); ++i) fn_args.push_back(arr->GetElement(i));
+                }
+                return CallFunction(callee, this_arg, fn_args);
+            }));
+        }
+    }
     if (IsArray()) {
         if (key == "length") {
             return TaggedValue::FromSmi(static_cast<int32_t>(static_cast<const JSArray*>(this)->Length()));
@@ -49,6 +75,17 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
     } else if (IsSet()) {
         if (key == "size") {
             return TaggedValue::FromSmi(static_cast<int32_t>(static_cast<const JSSet*>(this)->Size()));
+        }
+    } else if (IsArrayBuffer()) {
+        auto* ab = static_cast<const JSArrayBuffer*>(this);
+        if (key == "byteLength") {
+            return TaggedValue::FromDouble(static_cast<double>(ab->ByteLength()));
+        }
+        if (key == "maxByteLength") {
+            return TaggedValue::FromDouble(static_cast<double>(ab->MaxByteLength()));
+        }
+        if (key == "growable") {
+            return TaggedValue::FromBoolean(ab->IsGrowable());
         }
     }
 
