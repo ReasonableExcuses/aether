@@ -31,6 +31,7 @@ set(AETHER_SOURCES
     src/event_loop.cpp
     src/module.cpp
     src/intl.cpp
+    src/wasm.cpp
     src/test262.cpp
 )
 
@@ -98,3 +99,6 @@ target_link_libraries(test_milestone17_esm PRIVATE aether_core)
 
 add_executable(test_milestone18_intl tests/test_milestone18_intl.cpp)
 target_link_libraries(test_milestone18_intl PRIVATE aether_core)
+
+add_executable(test_milestone19_wasm tests/test_milestone19_wasm.cpp)
+target_link_libraries(test_milestone19_wasm PRIVATE aether_core)

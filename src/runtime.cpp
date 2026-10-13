@@ -6,6 +6,7 @@
 #include "aether/bytecode_emitter.h"
 #include "aether/typed_array.h"
 #include "aether/intl.h"
+#include "aether/wasm.h"
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -3496,6 +3497,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     InitializeNumber(*this);
     InitializeDate(*this);
     InitializeIntl(*this);
+    InitializeWebAssembly(*this);
 
     global_object_->SetNamedProperty("$262", TaggedValue::FromHeapObject(host262), next_shape_id_);
 }

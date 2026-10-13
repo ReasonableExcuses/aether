@@ -4,14 +4,15 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-18%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-19%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
+  <img src="https://img.shields.io/badge/WebAssembly-1.0%20MVP%20Stack%20Machine-654FF0?style=flat-square&logo=webassembly&logoColor=white" alt="WebAssembly" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)%20%7C%20ECMA--402-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-154%2F154%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-164%2F164%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -74,7 +75,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 #### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (18/18 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (19/19 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -97,6 +98,7 @@ Foundation Progress: [███████████████████�
 | **16** | Async Iterators & Generators | `Symbol.asyncIterator`, `async function*`, `AsyncGeneratorPrototype` (next, return, throw), Sequential FIFO AsyncQueue, `for await...of` desugaring, custom async iterables | Complete | `[==========] 100%` |
 | **17** | ECMAScript 2024 Modules (ESM) | Static `import`/`export` (named, default, namespace), Re-exports, Read-only bindings, Live bindings via environment access, Top-Level Await (TLA), Dynamic `import()`, CommonJS <-> ESM interop | Complete | `[==========] 100%` |
 | **18** | Internationalization (Intl) & Date | Full ECMA-402 `Intl` namespace (`getCanonicalLocales`, `supportedValuesOf`, `NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`, `Segmenter`), `Date` constructor & prototype, `Number.prototype.toLocaleString`, `String.prototype.localeCompare` | Complete | `[==========] 100%` |
+| **19** | WebAssembly 1.0 MVP | Binary Decoder (Sections 0–11, LEB128), Stack Machine Interpreter, Linear Memory (`WebAssembly.Memory`, 64 KiB pages), Table (`WebAssembly.Table`, `call_indirect`), Globals (`WebAssembly.Global`), Host JS $\leftrightarrow$ Wasm Bi-directional Interop, Exception Traps (`CompileError`, `RuntimeError`, `LinkError`), Async Promise API (`compile`, `instantiate`) | Complete | `[==========] 100%` |
 
 ---
 
@@ -186,7 +188,6 @@ V8 Supremacy Track:  [███████████████████�
       </td>
       <td>
         - Private class fields (<code>#field</code>)<br/>
-        - Async generator functions (async function*)<br/>
         - Decorators (Stage 3)
       </td>
     </tr>
@@ -208,13 +209,14 @@ V8 Supremacy Track:  [███████████████████�
         - performance.now high-resolution monotonic clock<br/>
         - ArrayBuffer, DataView, and 9 TypedArray constructors with full method & iterator suites<br/>
         - Global Proxy constructor & Proxy.revocable()<br/>
-        - Global Reflect standard object with 13 reflection methods
+        - Global Reflect standard object with 13 reflection methods<br/>
+        - Full ECMA-402 Intl namespace (getCanonicalLocales, supportedValuesOf, NumberFormat, DateTimeFormat, Collator, PluralRules, ListFormat, RelativeTimeFormat, Segmenter)<br/>
+        - WebAssembly 1.0 MVP namespace (validate, compile, instantiate, Module, Instance, Memory, Table, Global, CompileError, RuntimeError, LinkError)
       </td>
       <td>
         - WeakMap & WeakSet<br/>
-        - Intl internationalization API<br/>
         - Full RegExp unicode property escapes<br/>
-        - WebAssembly Core MVP integration
+        - WebAssembly SIMD & Threading Extensions
       </td>
     </tr>
     <tr>
@@ -223,15 +225,15 @@ V8 Supremacy Track:  [███████████████████�
         - Native C++ embedder API<br/>
         - CommonJS module loader (require, module.exports, cache)<br/>
         - Circular module dependency resolution<br/>
+        - ECMAScript 2024 Modules (ESM: static import/export, re-exports, live bindings, dynamic import(), Top-Level Await)<br/>
         - Global process object (argv, version, platform, arch, cwd, nextTick, exit)<br/>
         - Standalone CLI runtime executable (<code>aether.exe</code>)<br/>
         - Official Test262 Conformance Test Suite harness (YAML frontmatter, $262 host object, assert/sta)<br/>
         - Strict negative error type validation in C++ and Python runners<br/>
         - Native C++ and Python CLI Test262 runners<br/>
-        - 125 test verification suites (101 core architectural + 20 curated Test262 + 4 harness, 100% pass)
+        - 164 test verification suites across 20 test runners (100% pass)
       </td>
       <td>
-        - ES Modules (import / export) static grammar<br/>
         - Full ~45,000 file Test262 bulk-run automation<br/>
         - Standard Web API surface (fetch, URL, TextEncoder)<br/>
         - Head-to-head V8 performance benchmarking dashboard
@@ -572,7 +574,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 17 verification binaries
+# Run Milestone 1 through 19 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -591,6 +593,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone16_async_iterators.exe
 .\build\Release\test_milestone17_esm.exe
 .\build\Release\test_milestone18_intl.exe
+.\build\Release\test_milestone19_wasm.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe
