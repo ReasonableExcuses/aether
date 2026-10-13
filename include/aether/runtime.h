@@ -123,6 +123,15 @@ public:
     JSObject* GetDataViewPrototype() const noexcept { return data_view_prototype_; }
     JSObject* GetGeneratorPrototype() const noexcept { return generator_prototype_; }
     JSObject* GetAsyncGeneratorPrototype() const noexcept { return async_generator_prototype_; }
+    JSObject* GetNumberPrototype() const noexcept { return number_prototype_; }
+    void SetNumberPrototype(JSObject* proto) noexcept { number_prototype_ = proto; }
+    JSObject* GetDatePrototype() const noexcept { return date_prototype_; }
+    void SetDatePrototype(JSObject* proto) noexcept { date_prototype_ = proto; }
+    uint32_t& NextShapeId() noexcept { return next_shape_id_; }
+    void RegisterRootValue(std::unique_ptr<TaggedValue> val) {
+        if (heap_) heap_->RegisterExtraRoot(val.get());
+        root_values_.push_back(std::move(val));
+    }
     TaggedValue GetSymbolIterator() const noexcept { return symbol_iterator_; }
     TaggedValue GetSymbolAsyncIterator() const noexcept { return symbol_asyncIterator_; }
     TaggedValue GetSymbolToStringTag() const noexcept { return symbol_toStringTag_; }
@@ -145,6 +154,8 @@ private:
     JSObject* json_object_{nullptr};
     JSObject* array_prototype_{nullptr};
     JSObject* string_prototype_{nullptr};
+    JSObject* number_prototype_{nullptr};
+    JSObject* date_prototype_{nullptr};
     JSObject* map_prototype_{nullptr};
     JSObject* set_prototype_{nullptr};
     JSObject* promise_prototype_{nullptr};

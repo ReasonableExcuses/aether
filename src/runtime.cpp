@@ -5,6 +5,7 @@
 #include "aether/parser.h"
 #include "aether/bytecode_emitter.h"
 #include "aether/typed_array.h"
+#include "aether/intl.h"
 #include <cmath>
 #include <iostream>
 #include <sstream>
@@ -446,6 +447,9 @@ TaggedValue GetProperty(TaggedValue obj, std::string_view key, TaggedValue recei
             if (key == "length") return TaggedValue::FromSmi(static_cast<int32_t>(obj.ToString().length()));
             return Realm::Current()->GetStringPrototype()->GetNamedProperty(key);
         }
+        if (obj.IsNumber() && Realm::Current() && Realm::Current()->GetNumberPrototype()) {
+            return Realm::Current()->GetNumberPrototype()->GetNamedProperty(key);
+        }
         return TaggedValue::Undefined();
     }
     HeapObject* ho = obj.AsHeapObject();
@@ -747,13 +751,22 @@ static TaggedValue Array_join(TaggedValue this_val, const std::vector<TaggedValu
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
 }
 
+static bool StrictEqualValues(TaggedValue a, TaggedValue b) {
+    if (a.IsSmi() && b.IsSmi()) return a.AsSmi() == b.AsSmi();
+    if (a.IsNumber() && b.IsNumber()) return a.AsNumber() == b.AsNumber();
+    if (a.IsHeapObject() && b.IsHeapObject() && a.AsHeapObject()->IsString() && b.AsHeapObject()->IsString()) {
+        return static_cast<JSString*>(a.AsHeapObject())->View() == static_cast<JSString*>(b.AsHeapObject())->View();
+    }
+    return a == b;
+}
+
 static TaggedValue Array_indexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
     if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::FromSmi(-1);
     auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
     TaggedValue search = args.empty() ? TaggedValue::Undefined() : args[0];
     size_t from = (args.size() > 1 && args[1].IsSmi()) ? static_cast<size_t>(std::max<int32_t>(0, args[1].AsSmi())) : 0;
     for (size_t i = from; i < arr->Length(); ++i) {
-        if (arr->GetElement(i) == search) {
+        if (StrictEqualValues(arr->GetElement(i), search)) {
             return TaggedValue::FromSmi(static_cast<int32_t>(i));
         }
     }
@@ -765,7 +778,7 @@ static TaggedValue Array_includes(TaggedValue this_val, const std::vector<Tagged
     auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
     TaggedValue search = args.empty() ? TaggedValue::Undefined() : args[0];
     for (size_t i = 0; i < arr->Length(); ++i) {
-        if (arr->GetElement(i) == search) {
+        if (StrictEqualValues(arr->GetElement(i), search)) {
             return TaggedValue::FromBoolean(true);
         }
     }
@@ -3244,6 +3257,10 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return TaggedValue::FromBoolean(true);
     })), next_shape_id_);
 
+    global_object_->SetNamedProperty("NaN", TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN()), next_shape_id_);
+    global_object_->SetNamedProperty("Infinity", TaggedValue::FromDouble(std::numeric_limits<double>::infinity()), next_shape_id_);
+    global_object_->SetNamedProperty("undefined", TaggedValue::Undefined(), next_shape_id_);
+
     global_object_->SetNamedProperty("isFinite", TaggedValue::FromHeapObject(make_native("isFinite", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty()) return TaggedValue::FromBoolean(false);
         if (args[0].IsSmi()) return TaggedValue::FromBoolean(true);
@@ -3476,6 +3493,9 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return TaggedValue::FromDouble(0.0);
     })), next_shape_id_);
     host262->SetNamedProperty("agent", TaggedValue::FromHeapObject(host262_agent), next_shape_id_);
+    InitializeNumber(*this);
+    InitializeDate(*this);
+    InitializeIntl(*this);
 
     global_object_->SetNamedProperty("$262", TaggedValue::FromHeapObject(host262), next_shape_id_);
 }

@@ -4,14 +4,14 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-17%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-18%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
-  <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
+  <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)%20%7C%20ECMA--402-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-144%2F144%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-154%2F154%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -74,7 +74,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 #### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (17/17 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (18/18 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -96,6 +96,7 @@ Foundation Progress: [███████████████████�
 | **15** | Proxy & Reflect MOP | `JSProxy` heap object, 13 standard Proxy traps (`get`, `set`, `has`, `deleteProperty`, `apply`, `construct`, `getPrototypeOf`, `setPrototypeOf`, `ownKeys`, `getOwnPropertyDescriptor`, `defineProperty`, `isExtensible`, `preventExtensions`), `Proxy` constructor & `Proxy.revocable()`, global `Reflect` API (all 13 methods), relational `in` operator, unary `delete` operator, Object reflection methods | Complete | `[==========] 100%` |
 | **16** | Async Iterators & Generators | `Symbol.asyncIterator`, `async function*`, `AsyncGeneratorPrototype` (next, return, throw), Sequential FIFO AsyncQueue, `for await...of` desugaring, custom async iterables | Complete | `[==========] 100%` |
 | **17** | ECMAScript 2024 Modules (ESM) | Static `import`/`export` (named, default, namespace), Re-exports, Read-only bindings, Live bindings via environment access, Top-Level Await (TLA), Dynamic `import()`, CommonJS <-> ESM interop | Complete | `[==========] 100%` |
+| **18** | Internationalization (Intl) & Date | Full ECMA-402 `Intl` namespace (`getCanonicalLocales`, `supportedValuesOf`, `NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`, `Segmenter`), `Date` constructor & prototype, `Number.prototype.toLocaleString`, `String.prototype.localeCompare` | Complete | `[==========] 100%` |
 
 ---
 
@@ -589,6 +590,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone15_proxy_reflect.exe
 .\build\Release\test_milestone16_async_iterators.exe
 .\build\Release\test_milestone17_esm.exe
+.\build\Release\test_milestone18_intl.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe

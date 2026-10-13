@@ -30,6 +30,7 @@ set(AETHER_SOURCES
     src/runtime.cpp
     src/event_loop.cpp
     src/module.cpp
+    src/intl.cpp
     src/test262.cpp
 )
 
@@ -94,3 +95,6 @@ target_link_libraries(test_milestone16_async_iterators PRIVATE aether_core)
 
 add_executable(test_milestone17_esm tests/test_milestone17_esm.cpp)
 target_link_libraries(test_milestone17_esm PRIVATE aether_core)
+
+add_executable(test_milestone18_intl tests/test_milestone18_intl.cpp)
+target_link_libraries(test_milestone18_intl PRIVATE aether_core)

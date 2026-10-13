@@ -703,10 +703,40 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
-                assert(obj_val.IsHeapObject());
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (!obj_val.IsHeapObject()) {
+                    if (obj_val.IsNumber() && Realm::Current() && Realm::Current()->GetNumberPrototype()) {
+                        acc_ = Realm::Current()->GetNumberPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
+                    if (obj_val.IsString() && Realm::Current() && Realm::Current()->GetStringPrototype()) {
+                        if (prop_key == "length") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(obj_val.ToString().length()));
+                            break;
+                        }
+                        acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
+                    if (obj_val.IsUndefined() || obj_val.IsNull()) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot read properties of undefined or null"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::Undefined();
+                    break;
+                }
 
                 if (obj_val.AsHeapObject()->IsProxy()) {
                     acc_ = ProxyGet(static_cast<JSProxy*>(obj_val.AsHeapObject()), prop_key, obj_val);
