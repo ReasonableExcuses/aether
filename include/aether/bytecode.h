@@ -6,6 +6,8 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <atomic>
+#include <mutex>
 
 namespace aether {
 
@@ -184,6 +186,38 @@ public:
     BytecodeArray(uint32_t register_count = 0, uint32_t parameter_count = 0)
         : register_count_(register_count), parameter_count_(parameter_count) {}
 
+    BytecodeArray(BytecodeArray&& other) noexcept
+        : bytes_(std::move(other.bytes_)),
+          constants_(std::move(other.constants_)),
+          register_count_(other.register_count_),
+          parameter_count_(other.parameter_count_),
+          invocation_count_(other.invocation_count_.load(std::memory_order_relaxed)),
+          is_compiling_tier2_(other.is_compiling_tier2_.load(std::memory_order_relaxed)),
+          feedback_(std::move(other.feedback_)) {
+        std::lock_guard<std::mutex> lock(other.tier_mutex_);
+        tier1_code_ = std::move(other.tier1_code_);
+        tier2_code_ = std::move(other.tier2_code_);
+    }
+
+    BytecodeArray& operator=(BytecodeArray&& other) noexcept {
+        if (this != &other) {
+            bytes_ = std::move(other.bytes_);
+            constants_ = std::move(other.constants_);
+            register_count_ = other.register_count_;
+            parameter_count_ = other.parameter_count_;
+            invocation_count_.store(other.invocation_count_.load(std::memory_order_relaxed));
+            is_compiling_tier2_.store(other.is_compiling_tier2_.load(std::memory_order_relaxed));
+            feedback_ = std::move(other.feedback_);
+            std::scoped_lock lock(tier_mutex_, other.tier_mutex_);
+            tier1_code_ = std::move(other.tier1_code_);
+            tier2_code_ = std::move(other.tier2_code_);
+        }
+        return *this;
+    }
+
+    BytecodeArray(const BytecodeArray&) = delete;
+    BytecodeArray& operator=(const BytecodeArray&) = delete;
+
     const std::vector<uint8_t>& Code() const noexcept { return bytes_; }
     const std::vector<TaggedValue>& Constants() const noexcept { return constants_; }
     uint32_t RegisterCount() const noexcept { return register_count_; }
@@ -209,15 +243,47 @@ public:
     std::string Disassemble() const;
 
     // JIT Tiering & Invocation Profiling
-    uint32_t InvocationCount() const noexcept { return invocation_count_; }
-    void IncrementInvocationCount() const noexcept { ++invocation_count_; }
-    void ResetInvocationCount() const noexcept { invocation_count_ = 0; }
+    uint32_t InvocationCount() const noexcept { return invocation_count_.load(std::memory_order_relaxed); }
+    void IncrementInvocationCount() const noexcept { invocation_count_.fetch_add(1, std::memory_order_relaxed); }
+    void ResetInvocationCount() const noexcept { invocation_count_.store(0, std::memory_order_relaxed); }
 
-    const ExecutableMemory* GetTier1Code() const noexcept { return tier1_code_.get(); }
-    void SetTier1Code(std::shared_ptr<ExecutableMemory> code) const noexcept { tier1_code_ = std::move(code); }
+    const ExecutableMemory* GetTier1Code() const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        return tier1_code_.get();
+    }
+    std::shared_ptr<ExecutableMemory> GetTier1SharedCode() const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        return tier1_code_;
+    }
+    void SetTier1Code(std::shared_ptr<ExecutableMemory> code) const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        tier1_code_ = std::move(code);
+    }
 
-    const ExecutableMemory* GetTier2Code() const noexcept { return tier2_code_.get(); }
-    void SetTier2Code(std::shared_ptr<ExecutableMemory> code) const noexcept { tier2_code_ = std::move(code); }
+    const ExecutableMemory* GetTier2Code() const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        return tier2_code_.get();
+    }
+    std::shared_ptr<ExecutableMemory> GetTier2SharedCode() const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        return tier2_code_;
+    }
+    void SetTier2Code(std::shared_ptr<ExecutableMemory> code) const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        tier2_code_ = std::move(code);
+        is_compiling_tier2_.store(false, std::memory_order_release);
+    }
+
+    bool TryBeginTier2Compilation() const noexcept {
+        bool expected = false;
+        return is_compiling_tier2_.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    }
+    void FinishTier2Compilation() const noexcept {
+        is_compiling_tier2_.store(false, std::memory_order_release);
+    }
+    bool IsCompilingTier2() const noexcept {
+        return is_compiling_tier2_.load(std::memory_order_acquire);
+    }
 
     TypeFeedbackVector& GetFeedbackVector() const noexcept { return feedback_; }
 
@@ -226,7 +292,9 @@ private:
     std::vector<TaggedValue> constants_;
     uint32_t register_count_{0};
     uint32_t parameter_count_{0};
-    mutable uint32_t invocation_count_{0};
+    mutable std::atomic<uint32_t> invocation_count_{0};
+    mutable std::atomic<bool> is_compiling_tier2_{false};
+    mutable std::mutex tier_mutex_;
     mutable std::shared_ptr<ExecutableMemory> tier1_code_{nullptr};
     mutable std::shared_ptr<ExecutableMemory> tier2_code_{nullptr};
     mutable TypeFeedbackVector feedback_;

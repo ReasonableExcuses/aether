@@ -1,6 +1,7 @@
 #include "aether/interpreter.h"
 #include "aether/baseline_jit.h"
 #include "aether/optimizing_jit.h"
+#include "aether/background_compiler.h"
 #include "aether/runtime.h"
 #include "aether/typed_array.h"
 #include <cmath>
@@ -20,20 +21,26 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     InterpreterScope current_scope(this);
 
     // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
-    if (const ExecutableMemory* t2 = bytecode.GetTier2Code()) {
+    if (auto t2 = bytecode.GetTier2SharedCode()) {
         TaggedValue res = BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
         if (!res.IsEmpty()) return res;
     }
 
     // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled; promote to Tier 2 when hot
-    if (const ExecutableMemory* t1 = bytecode.GetTier1Code()) {
+    if (auto t1 = bytecode.GetTier1SharedCode()) {
         bytecode.IncrementInvocationCount();
         if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
-            auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
-            if (opt_code) {
-                bytecode.SetTier2Code(std::move(opt_code));
-                TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
-                if (!res.IsEmpty()) return res;
+            if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
+                if (bytecode.TryBeginTier2Compilation()) {
+                    BackgroundCompiler::Current()->Enqueue(bytecode, &feedback_);
+                }
+            } else {
+                auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
+                if (opt_code) {
+                    bytecode.SetTier2Code(std::move(opt_code));
+                    TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+                    if (!res.IsEmpty()) return res;
+                }
             }
         }
         TaggedValue res = BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
@@ -43,11 +50,17 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
     // 3. Increment invocation profile counter; promote to Tier 2 if hot enough, or Tier 1
     bytecode.IncrementInvocationCount();
     if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
-        auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
-        if (opt_code) {
-            bytecode.SetTier2Code(std::move(opt_code));
-            TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
-            if (!res.IsEmpty()) return res;
+        if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
+            if (bytecode.TryBeginTier2Compilation()) {
+                BackgroundCompiler::Current()->Enqueue(bytecode, &feedback_);
+            }
+        } else {
+            auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
+            if (opt_code) {
+                bytecode.SetTier2Code(std::move(opt_code));
+                TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+                if (!res.IsEmpty()) return res;
+            }
         }
     }
     if (bytecode.InvocationCount() >= BaselineJIT::kInvocationThreshold && BaselineJIT::CanCompile(bytecode)) {

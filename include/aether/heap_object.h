@@ -10,6 +10,7 @@
 #include <functional>
 #include <new>
 #include <utility>
+#include <atomic>
 
 namespace aether {
 
@@ -103,6 +104,19 @@ public:
     AETHER_ALWAYS_INLINE void SetMarked(bool m) noexcept {
         if (m) gc_metadata_ |= kMarkBit;
         else   gc_metadata_ &= ~kMarkBit;
+    }
+
+    AETHER_ALWAYS_INLINE bool AtomicSetMarked() noexcept {
+        std::atomic_ref<uint16_t> ref(gc_metadata_);
+        uint16_t old_val = ref.load(std::memory_order_relaxed);
+        while (!(old_val & kMarkBit)) {
+            if (ref.compare_exchange_weak(old_val, static_cast<uint16_t>(old_val | kMarkBit),
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     AETHER_ALWAYS_INLINE bool IsForwarded() const noexcept { return (gc_metadata_ & kForwardedBit) != 0; }

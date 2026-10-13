@@ -14,6 +14,7 @@ namespace aether {
 
 class IsolateHeap;
 class HandleScope;
+class ConcurrentMarker;
 
 template <typename T>
 class Handle {
@@ -124,11 +125,16 @@ public:
                 remembered_old_objects_.insert(source);
             }
         }
+        NotifyConcurrentWrite(source, value);
     }
+
+    void NotifyConcurrentWrite(HeapObject* source, TaggedValue value) noexcept;
 
     // GC Passes
     void MinorGC(); // Cheney Scavenge
     void MajorGC(); // Full Mark-Sweep
+    void StartConcurrentMark();
+    void FinalizeConcurrentGC();
 
     static IsolateHeap* Current() noexcept;
     static void SetCurrent(IsolateHeap* heap) noexcept;
@@ -160,6 +166,7 @@ public:
     NurserySpace& GetNursery() noexcept { return nursery_; }
     ImmixSpace& GetOldGen() noexcept { return old_gen_; }
     CardTable& GetCardTable() noexcept { return card_table_; }
+    ConcurrentMarker* GetConcurrentMarker() noexcept;
 
     size_t MinorGCCount() const noexcept { return minor_gc_count_; }
     size_t MajorGCCount() const noexcept { return major_gc_count_; }
@@ -170,6 +177,7 @@ private:
     NurserySpace nursery_;
     ImmixSpace old_gen_;
     CardTable card_table_;
+    std::unique_ptr<ConcurrentMarker> concurrent_marker_;
 
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;

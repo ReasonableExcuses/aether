@@ -4,15 +4,16 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 <p align="left">
   <img src="https://img.shields.io/badge/Target-Surpass%20V8%20Throughput-E65100?style=flat-square" alt="Target" />
-  <img src="https://img.shields.io/badge/Core%20Milestones-19%20Complete-0288D1?style=flat-square" alt="Milestones" />
+  <img src="https://img.shields.io/badge/Core%20Milestones-20%20Complete-0288D1?style=flat-square" alt="Milestones" />
   <img src="https://img.shields.io/badge/V8%20Supremacy%20Track-Phase%202%20Active-2E7D32?style=flat-square" alt="V8 Track" />
+  <img src="https://img.shields.io/badge/Concurrency-Multi--Threaded%20GC%20%26%20JIT-FF6F00?style=flat-square" alt="Concurrency" />
   <img src="https://img.shields.io/badge/WebAssembly-1.0%20MVP%20Stack%20Machine-654FF0?style=flat-square&logo=webassembly&logoColor=white" alt="WebAssembly" />
   <img src="https://img.shields.io/badge/Test262-100%25%20Conformance%20(Curated)-9C27B0?style=flat-square" alt="Test262" />
   <img src="https://img.shields.io/badge/Language-ISO%20C%2B%2B23-00599C?style=flat-square&logo=c%2B%2B&logoColor=white" alt="Language" />
   <img src="https://img.shields.io/badge/Architecture-x86--64--v3%20%7C%20ARM64-2F4F4F?style=flat-square" alt="Architecture" />
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)%20%7C%20ECMA--402-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
-  <img src="https://img.shields.io/badge/Test_Suite-164%2F164%20Passed-2E8B57?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/Test_Suite-174%2F174%20Passed-2E8B57?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -75,7 +76,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
 
 #### Phase 1: Core Engine Foundation (100% Complete)
 ```
-Foundation Progress: [██████████████████████████████████████████████████] 100% (19/19 Milestones Verified)
+Foundation Progress: [██████████████████████████████████████████████████] 100% (20/20 Milestones Verified)
 ```
 
 | Milestone | Subsystem / Focus | Scope & Deliverables | Status | Progress |
@@ -99,6 +100,7 @@ Foundation Progress: [███████████████████�
 | **17** | ECMAScript 2024 Modules (ESM) | Static `import`/`export` (named, default, namespace), Re-exports, Read-only bindings, Live bindings via environment access, Top-Level Await (TLA), Dynamic `import()`, CommonJS <-> ESM interop | Complete | `[==========] 100%` |
 | **18** | Internationalization (Intl) & Date | Full ECMA-402 `Intl` namespace (`getCanonicalLocales`, `supportedValuesOf`, `NumberFormat`, `DateTimeFormat`, `Collator`, `PluralRules`, `ListFormat`, `RelativeTimeFormat`, `Segmenter`), `Date` constructor & prototype, `Number.prototype.toLocaleString`, `String.prototype.localeCompare` | Complete | `[==========] 100%` |
 | **19** | WebAssembly 1.0 MVP | Binary Decoder (Sections 0–11, LEB128), Stack Machine Interpreter, Linear Memory (`WebAssembly.Memory`, 64 KiB pages), Table (`WebAssembly.Table`, `call_indirect`), Globals (`WebAssembly.Global`), Host JS $\leftrightarrow$ Wasm Bi-directional Interop, Exception Traps (`CompileError`, `RuntimeError`, `LinkError`), Async Promise API (`compile`, `instantiate`) | Complete | `[==========] 100%` |
+| **20** | Parallel Engine & Background Workers | Asynchronous Sea-of-Nodes JIT worker pool (`BackgroundCompiler`), Concurrent Immix Old Gen marking thread (`ConcurrentMarker`), SATB Write Barrier (`NotifyWrite`), Lock-free atomic mark bits (`AtomicSetMarked`), Zero-mutator-stall Tier 2 compilation, Multi-threaded stress testing | Complete | `[==========] 100%` |
 
 ---
 
@@ -136,6 +138,7 @@ V8 Supremacy Track:  [███████████████████�
         - Complete ECMA-262 truthiness semantics in JIT branches<br/>
         - Tier 2 Sea-of-Nodes SSA Optimizing JIT<br/>
         - Automatic 3-tier promotion (Tier 0 -> Tier 1 -> Tier 2)<br/>
+        - Multi-threaded background Sea-of-Nodes JIT worker pool (BackgroundCompiler, zero-stall tiering)<br/>
         - Type feedback vector with Monomorphic / Polymorphic ICs
       </td>
       <td>
@@ -153,10 +156,10 @@ V8 Supremacy Track:  [███████████████████�
         - Cheney-style copying scavenger<br/>
         - Old-to-young remembered set scanning and card table resync<br/>
         - Immix mark-sweep line-and-block allocator<br/>
+        - Concurrent Immix background marking thread (ConcurrentMarker) with SATB write barrier & atomic mark bit propagation<br/>
         - Unified runtime allocation routing via AllocateRuntime
       </td>
       <td>
-        - Concurrent / incremental background marking pass<br/>
         - SIMD AVX2-accelerated card table scanning<br/>
         - WeakRef and FinalizationRegistry<br/>
         - SharedArrayBuffer & atomic operations
@@ -231,7 +234,7 @@ V8 Supremacy Track:  [███████████████████�
         - Official Test262 Conformance Test Suite harness (YAML frontmatter, $262 host object, assert/sta)<br/>
         - Strict negative error type validation in C++ and Python runners<br/>
         - Native C++ and Python CLI Test262 runners<br/>
-        - 164 test verification suites across 20 test runners (100% pass)
+        - 174 test verification suites across 21 test runners (100% pass)
       </td>
       <td>
         - Full ~45,000 file Test262 bulk-run automation<br/>
@@ -574,7 +577,7 @@ cmake --build build -j$(nproc)
 ### Running Test Verification Suites
 
 ```cmd
-# Run Milestone 1 through 19 verification binaries
+# Run Milestone 1 through 20 verification binaries
 .\build\Release\test_milestone1.exe
 .\build\Release\test_milestone2.exe
 .\build\Release\test_milestone3.exe
@@ -594,6 +597,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone17_esm.exe
 .\build\Release\test_milestone18_intl.exe
 .\build\Release\test_milestone19_wasm.exe
+.\build\Release\test_milestone20_parallel.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe

@@ -168,6 +168,7 @@ void ImmixSpace::MarkObject(HeapObject* obj) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
     size_t size = obj->ObjectSize();
 
+    std::lock_guard<std::mutex> lock(mark_mutex_);
     for (auto& block : blocks_) {
         if (block->Contains(obj)) {
             uintptr_t block_start = reinterpret_cast<uintptr_t>(block->data);

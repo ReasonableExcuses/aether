@@ -1,4 +1,5 @@
 #include "aether/heap.h"
+#include "aether/concurrent_marker.h"
 #include <deque>
 
 namespace aether {
@@ -24,9 +25,13 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
     }
+    concurrent_marker_ = std::make_unique<ConcurrentMarker>(*this);
 }
 
 IsolateHeap::~IsolateHeap() {
+    if (concurrent_marker_) {
+        concurrent_marker_->Stop();
+    }
     if (s_current_heap_ == this) {
         s_current_heap_ = nullptr;
     }
@@ -139,7 +144,59 @@ void IsolateHeap::MinorGC() {
     minor_gc_count_++;
 }
 
+void IsolateHeap::NotifyConcurrentWrite(HeapObject* source, TaggedValue value) noexcept {
+    if (concurrent_marker_ && concurrent_marker_->IsActive()) {
+        concurrent_marker_->NotifyWrite(source, value);
+    }
+}
+
+ConcurrentMarker* IsolateHeap::GetConcurrentMarker() noexcept {
+    return concurrent_marker_.get();
+}
+
+void IsolateHeap::StartConcurrentMark() {
+    if (!concurrent_marker_) return;
+
+    // Reset marks from previous cycle
+    for (HeapObject* obj : previously_marked_objects_) {
+        obj->SetMarked(false);
+    }
+    previously_marked_objects_.clear();
+
+    std::vector<HeapObject*> roots;
+    HandleScope* scope = top_scope_;
+    while (scope != nullptr) {
+        for (TaggedValue& root_val : scope->Slots()) {
+            if (root_val.IsHeapObject()) {
+                roots.push_back(root_val.AsHeapObject());
+            }
+        }
+        scope = scope->PrevScope();
+    }
+
+    for (TaggedValue* root_ptr : extra_roots_) {
+        if (root_ptr && root_ptr->IsHeapObject()) {
+            roots.push_back(root_ptr->AsHeapObject());
+        }
+    }
+
+    concurrent_marker_->Start(roots);
+}
+
+void IsolateHeap::FinalizeConcurrentGC() {
+    if (!concurrent_marker_) return;
+
+    concurrent_marker_->FinalizeMarking();
+    old_gen_.Sweep();
+    major_gc_count_++;
+}
+
 void IsolateHeap::MajorGC() {
+    if (concurrent_marker_ && concurrent_marker_->IsActive()) {
+        FinalizeConcurrentGC();
+        return;
+    }
+
     // 0. Reset marks on objects from previous GC cycle
     for (HeapObject* obj : previously_marked_objects_) {
         obj->SetMarked(false);

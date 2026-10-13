@@ -9,6 +9,7 @@
 #include <memory>
 #include <functional>
 #include <cassert>
+#include <mutex>
 
 namespace aether {
 
@@ -156,6 +157,7 @@ public:
     void MarkObject(HeapObject* obj);
 
     size_t BlockCount() const noexcept { return blocks_.size(); }
+    std::mutex& GetMarkMutex() const noexcept { return mark_mutex_; }
 
 private:
     void AllocateBlock();
@@ -165,6 +167,7 @@ private:
     bool using_reservation_{false};
     std::vector<ImmixBlock*> blocks_;
     size_t active_block_index_{0};
+    mutable std::mutex mark_mutex_;
 };
 
 } // namespace aether

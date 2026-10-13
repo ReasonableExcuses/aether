@@ -206,8 +206,13 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
     }
 
     Shape* current_shape = GetShape();
-    if (current_shape == nullptr && Realm::Current()) {
-        current_shape = Realm::Current()->GetRootShape();
+    if (current_shape == nullptr) {
+        if (Realm::Current()) {
+            current_shape = Realm::Current()->GetRootShape();
+        } else {
+            static Shape s_fallback_root_shape(0, nullptr, "", TaggedValue::Null());
+            current_shape = &s_fallback_root_shape;
+        }
         SetShape(current_shape);
     }
     assert(current_shape != nullptr && "Object must have a valid shape");

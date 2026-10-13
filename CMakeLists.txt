@@ -32,6 +32,8 @@ set(AETHER_SOURCES
     src/module.cpp
     src/intl.cpp
     src/wasm.cpp
+    src/background_compiler.cpp
+    src/concurrent_marker.cpp
     src/test262.cpp
 )
 
@@ -102,3 +104,6 @@ target_link_libraries(test_milestone18_intl PRIVATE aether_core)
 
 add_executable(test_milestone19_wasm tests/test_milestone19_wasm.cpp)
 target_link_libraries(test_milestone19_wasm PRIVATE aether_core)
+
+add_executable(test_milestone20_parallel tests/test_milestone20_parallel.cpp)
+target_link_libraries(test_milestone20_parallel PRIVATE aether_core)
