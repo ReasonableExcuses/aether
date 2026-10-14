@@ -124,6 +124,20 @@ private:
     std::unique_ptr<Expr> value_;
 };
 
+class ArrayDestructureAssignExpr : public Expr {
+public:
+    ArrayDestructureAssignExpr(std::vector<std::string> names, std::unique_ptr<Expr> val)
+        : names_(std::move(names)), value_(std::move(val)) {}
+
+    const std::vector<std::string>& Names() const noexcept { return names_; }
+    Expr* Value() const noexcept { return value_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::vector<std::string> names_;
+    std::unique_ptr<Expr> value_;
+};
+
 class PropertyAccessExpr : public Expr {
 public:
     PropertyAccessExpr(std::unique_ptr<Expr> obj, std::string_view prop)
@@ -456,16 +470,18 @@ private:
 
 class VarDeclStmt : public Stmt {
 public:
-    VarDeclStmt(std::string_view name, std::unique_ptr<Expr> init)
-        : name_(name), initializer_(std::move(init)) {}
+    VarDeclStmt(std::string_view name, std::unique_ptr<Expr> init, bool is_const = false)
+        : name_(name), initializer_(std::move(init)), is_const_(is_const) {}
 
     const std::string& Name() const noexcept { return name_; }
     Expr* Initializer() const noexcept { return initializer_.get(); }
+    bool IsConst() const noexcept { return is_const_; }
     void Accept(ASTVisitor* visitor) override;
 
 private:
     std::string name_;
     std::unique_ptr<Expr> initializer_;
+    bool is_const_{false};
 };
 
 class BlockStmt : public Stmt {
@@ -798,6 +814,7 @@ public:
     virtual void VisitUnary(UnaryExpr* node) = 0;
     virtual void VisitBinary(BinaryExpr* node) = 0;
     virtual void VisitAssign(AssignExpr* node) = 0;
+    virtual void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* node) { (void)node; }
     virtual void VisitPropertyAccess(PropertyAccessExpr* node) = 0;
     virtual void VisitPropertyAssign(PropertyAssignExpr* node) = 0;
     virtual void VisitCall(CallExpr* node) = 0;
@@ -847,6 +864,7 @@ inline void IdentifierExpr::Accept(ASTVisitor* v) { v->VisitIdentifier(this); }
 inline void UnaryExpr::Accept(ASTVisitor* v) { v->VisitUnary(this); }
 inline void BinaryExpr::Accept(ASTVisitor* v) { v->VisitBinary(this); }
 inline void AssignExpr::Accept(ASTVisitor* v) { v->VisitAssign(this); }
+inline void ArrayDestructureAssignExpr::Accept(ASTVisitor* v) { v->VisitArrayDestructureAssign(this); }
 inline void PropertyAccessExpr::Accept(ASTVisitor* v) { v->VisitPropertyAccess(this); }
 inline void PropertyAssignExpr::Accept(ASTVisitor* v) { v->VisitPropertyAssign(this); }
 inline void CallExpr::Accept(ASTVisitor* v) { v->VisitCall(this); }

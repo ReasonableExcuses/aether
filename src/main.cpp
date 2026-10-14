@@ -78,7 +78,18 @@ int main(int argc, char* argv[]) {
 
         if (agent.GetInterpreter().HasPendingException()) {
             aether::TaggedValue exc = agent.GetInterpreter().PendingException();
-            std::cerr << "Uncaught Exception: " << exc.ToString() << "\n";
+            if (exc.IsHeapObject() && exc.AsHeapObject()->IsJSObject()) {
+                auto* obj = static_cast<aether::JSObject*>(exc.AsHeapObject());
+                std::string name = obj->HasNamedProperty("name") ? obj->GetNamedProperty("name").ToString() : "Error";
+                std::string msg = obj->HasNamedProperty("message") ? obj->GetNamedProperty("message").ToString() : "";
+                if (!msg.empty()) {
+                    std::cerr << "Uncaught Exception: " << name << ": " << msg << "\n";
+                } else {
+                    std::cerr << "Uncaught Exception: " << exc.ToString() << "\n";
+                }
+            } else {
+                std::cerr << "Uncaught Exception: " << exc.ToString() << "\n";
+            }
             return 1;
         }
 

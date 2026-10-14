@@ -33,6 +33,7 @@ public:
     void VisitUnary(UnaryExpr* node) override;
     void VisitBinary(BinaryExpr* node) override;
     void VisitAssign(AssignExpr* node) override;
+    void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* node) override;
     void VisitPropertyAccess(PropertyAccessExpr* node) override;
     void VisitPropertyAssign(PropertyAssignExpr* node) override;
     void VisitCall(CallExpr* node) override;
@@ -132,6 +133,12 @@ private:
 
     BytecodeEmitter* parent_emitter_{nullptr};
     std::unordered_map<std::string, JSFunction*> functions_;
+    std::unordered_set<std::string> const_bindings_;
+    bool IsConstBinding(std::string_view name) const {
+        if (const_bindings_.count(std::string(name))) return true;
+        if (parent_emitter_) return parent_emitter_->IsConstBinding(name);
+        return false;
+    }
 
     // Keep nested function bytecode arrays alive
     std::vector<std::unique_ptr<BytecodeArray>> compiled_routines_;

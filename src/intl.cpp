@@ -2009,6 +2009,13 @@ void InitializeNumber(Realm& realm) {
             return TaggedValue::FromBoolean(std::isfinite(d) && std::floor(d) == d);
         })), next_sid);
 
+    number_ctor->SetNamedProperty("isSafeInteger", TaggedValue::FromHeapObject(
+        make_native("isSafeInteger", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+            if (args.empty() || !args[0].IsNumber()) return TaggedValue::FromBoolean(false);
+            double d = args[0].AsNumber();
+            return TaggedValue::FromBoolean(std::isfinite(d) && std::floor(d) == d && d >= -9007199254740991.0 && d <= 9007199254740991.0);
+        })), next_sid);
+
     number_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(number_proto), next_sid);
     number_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(number_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Number", TaggedValue::FromHeapObject(number_ctor), next_sid);

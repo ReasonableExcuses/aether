@@ -26,6 +26,12 @@ public:
         }
         node->Value()->Accept(this);
     }
+    void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* node) override {
+        for (const auto& n : node->Names()) {
+            if (inside_nested_function) identifiers_in_nested_functions.insert(n);
+        }
+        node->Value()->Accept(this);
+    }
     void VisitUpdate(UpdateExpr* node) override {
         if (inside_nested_function) {
             identifiers_in_nested_functions.insert(node->Name());
@@ -615,6 +621,9 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
 }
 
 void BytecodeEmitter::VisitAssign(AssignExpr* node) {
+    if (IsConstBinding(node->Target())) {
+        throw std::runtime_error("TypeError: Assignment to constant variable.");
+    }
     node->Value()->Accept(this);
     auto res = ResolveVariable(node->Target());
     if (res.kind == VarResolution::ImportedBinding) {
@@ -658,6 +667,70 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         return;
     }
     assert(false && "Assignment to undeclared variable");
+}
+
+void BytecodeEmitter::VisitArrayDestructureAssign(ArrayDestructureAssignExpr* node) {
+    node->Value()->Accept(this);
+    uint8_t rhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(rhs_reg);
+
+    for (size_t i = 0; i < node->Names().size(); ++i) {
+        const std::string& name = node->Names()[i];
+        if (IsConstBinding(name)) {
+            throw std::runtime_error("TypeError: Assignment to constant variable.");
+        }
+        uint8_t idx_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaSmi);
+        bytecode_->EmitI32(static_cast<int32_t>(i));
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(idx_reg);
+
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaKeyed);
+        bytecode_->EmitU8(rhs_reg);
+        bytecode_->EmitU8(idx_reg);
+        bytecode_->EmitU16(slot);
+        FreeRegister(idx_reg);
+
+        auto res = ResolveVariable(name);
+        if (res.kind == VarResolution::LocalReg) {
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(res.reg);
+        } else if (res.kind == VarResolution::ContextSlot) {
+            bytecode_->EmitOpcode(Opcode::StaContextSlot);
+            bytecode_->EmitU8(res.depth);
+            bytecode_->EmitU16(res.slot);
+        } else if (res.kind == VarResolution::ModuleLocal) {
+            uint8_t val_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(val_reg);
+
+            uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+            uint8_t env_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(obj_const);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(env_reg);
+
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+            uint16_t m_slot = next_feedback_slot_++;
+
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(val_reg);
+            bytecode_->EmitOpcode(Opcode::StaNamed);
+            bytecode_->EmitU8(env_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(m_slot);
+
+            FreeRegister(env_reg);
+            FreeRegister(val_reg);
+        }
+    }
+
+    bytecode_->EmitOpcode(Opcode::Ldar);
+    bytecode_->EmitU8(rhs_reg);
+    FreeRegister(rhs_reg);
 }
 
 void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
@@ -1512,6 +1585,9 @@ void BytecodeEmitter::VisitExprStmt(ExprStmt* node) {
 }
 
 void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
+    if (node->IsConst()) {
+        const_bindings_.insert(node->Name());
+    }
     void* mod_ptr = current_module_;
     BytecodeEmitter* cur = this;
     while (!mod_ptr && cur->parent_emitter_) {

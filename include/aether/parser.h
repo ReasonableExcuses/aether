@@ -49,7 +49,7 @@ private:
     Precedence GetPrecedence(TokenKind kind);
 
     // Statement parsers
-    std::unique_ptr<Stmt> ParseVarDecl();
+    std::unique_ptr<Stmt> ParseVarDecl(bool is_const = false);
     std::unique_ptr<Stmt> ParseFunctionDecl(bool is_async = false);
     std::unique_ptr<Stmt> ParseIf();
     std::unique_ptr<Stmt> ParseWhile();

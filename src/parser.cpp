@@ -120,8 +120,14 @@ std::unique_ptr<Program> Parser::ParseProgram() {
 }
 
 std::unique_ptr<Stmt> Parser::ParseStatement() {
-    if (Match(TokenKind::Var) || Match(TokenKind::Let) || Match(TokenKind::Const)) {
-        return ParseVarDecl();
+    if (Match(TokenKind::Var)) {
+        return ParseVarDecl(/*is_const=*/false);
+    }
+    if (Match(TokenKind::Let)) {
+        return ParseVarDecl(/*is_const=*/false);
+    }
+    if (Match(TokenKind::Const)) {
+        return ParseVarDecl(/*is_const=*/true);
     }
     if (Check(TokenKind::Async)) {
         Lexer saved_lexer = lexer_;
@@ -197,16 +203,24 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
     return ParseExprStmt();
 }
 
-std::unique_ptr<Stmt> Parser::ParseVarDecl() {
+std::unique_ptr<Stmt> Parser::ParseVarDecl(bool is_const) {
     auto parse_one_declarator = [&]() -> std::vector<std::unique_ptr<Stmt>> {
         std::vector<std::unique_ptr<Stmt>> stmts;
-        // 1. Array destructuring: let [a, b, c] = expr;
+        // 1. Array destructuring: let [a, b, c = def] = expr;
         if (Match(TokenKind::OpenBracket)) {
-            std::vector<std::string> names;
+            struct ArrayElem {
+                std::string name;
+                std::unique_ptr<Expr> default_val;
+            };
+            std::vector<ArrayElem> elems;
             if (!Check(TokenKind::CloseBracket)) {
                 do {
                     Token elem_tok = Consume(TokenKind::Identifier, "Expected identifier in array destructuring");
-                    names.push_back(elem_tok.text);
+                    std::unique_ptr<Expr> def_val = nullptr;
+                    if (Match(TokenKind::Equal)) {
+                        def_val = ParseExpression();
+                    }
+                    elems.push_back(ArrayElem{elem_tok.text, std::move(def_val)});
                 } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
             }
             Consume(TokenKind::CloseBracket, "Expected ']' in array destructuring");
@@ -216,44 +230,98 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl() {
             static uint32_t s_destruct_arr_id = 0;
             std::string temp_var = "$d_arr_" + std::to_string(++s_destruct_arr_id);
             stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-            for (size_t i = 0; i < names.size(); ++i) {
+            for (size_t i = 0; i < elems.size(); ++i) {
                 auto idx_access = std::make_unique<IndexAccessExpr>(
                     std::make_unique<IdentifierExpr>(temp_var),
                     std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
                 );
-                stmts.push_back(std::make_unique<VarDeclStmt>(names[i], std::move(idx_access)));
+                std::unique_ptr<Expr> init_expr;
+                if (elems[i].default_val) {
+                    init_expr = std::make_unique<BinaryExpr>(
+                        BinaryOp::NullishCoalescing,
+                        std::move(idx_access),
+                        std::move(elems[i].default_val)
+                    );
+                } else {
+                    init_expr = std::move(idx_access);
+                }
+                stmts.push_back(std::make_unique<VarDeclStmt>(elems[i].name, std::move(init_expr), is_const));
             }
             return stmts;
         }
 
-        // 2. Object destructuring: let { a, b: c } = expr;
+        // 2. Object destructuring: let { a, b: c, active = true, coords: { lat, lng } } = expr;
         if (Match(TokenKind::OpenBrace)) {
-            std::vector<std::pair<std::string, std::string>> bindings;
-            if (!Check(TokenKind::CloseBrace)) {
-                do {
-                    Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
-                    std::string local_var = prop_tok.text;
-                    if (Match(TokenKind::Colon)) {
-                        Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
-                        local_var = alias_tok.text;
-                    }
-                    bindings.emplace_back(prop_tok.text, local_var);
-                } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
-            }
-            Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
+            struct BindingItem {
+                std::string prop;
+                std::string local_var;
+                std::unique_ptr<Expr> default_val;
+                std::vector<BindingItem> nested_items;
+                bool is_nested{false};
+            };
+            std::function<std::vector<BindingItem>()> parse_pattern = [&]() {
+                std::vector<BindingItem> items;
+                if (!Check(TokenKind::CloseBrace)) {
+                    do {
+                        Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
+                        BindingItem item;
+                        item.prop = prop_tok.text;
+                        item.local_var = prop_tok.text;
+                        if (Match(TokenKind::Colon)) {
+                            if (Match(TokenKind::OpenBrace)) {
+                                item.is_nested = true;
+                                item.nested_items = parse_pattern();
+                            } else {
+                                Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
+                                item.local_var = alias_tok.text;
+                            }
+                        }
+                        if (Match(TokenKind::Equal)) {
+                            item.default_val = ParseExpression();
+                        }
+                        items.push_back(std::move(item));
+                    } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+                }
+                Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
+                return items;
+            };
+
+            auto items = parse_pattern();
             Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
             auto rhs = ParseExpression();
 
             static uint32_t s_destruct_obj_id = 0;
             std::string temp_var = "$d_obj_" + std::to_string(++s_destruct_obj_id);
             stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-            for (const auto& [prop, local] : bindings) {
-                auto prop_access = std::make_unique<PropertyAccessExpr>(
-                    std::make_unique<IdentifierExpr>(temp_var),
-                    prop
-                );
-                stmts.push_back(std::make_unique<VarDeclStmt>(local, std::move(prop_access)));
-            }
+
+            std::function<void(const std::string&, std::vector<BindingItem>&)> emit_bindings =
+                [&](const std::string& parent_var, std::vector<BindingItem>& item_list) {
+                for (auto& it : item_list) {
+                    auto prop_access = std::make_unique<PropertyAccessExpr>(
+                        std::make_unique<IdentifierExpr>(parent_var),
+                        it.prop
+                    );
+                    if (it.is_nested) {
+                        std::string sub_var = "$d_sub_" + std::to_string(++s_destruct_obj_id);
+                        stmts.push_back(std::make_unique<VarDeclStmt>(sub_var, std::move(prop_access)));
+                        emit_bindings(sub_var, it.nested_items);
+                    } else {
+                        std::unique_ptr<Expr> init_expr;
+                        if (it.default_val) {
+                            init_expr = std::make_unique<BinaryExpr>(
+                                BinaryOp::NullishCoalescing,
+                                std::move(prop_access),
+                                std::move(it.default_val)
+                            );
+                        } else {
+                            init_expr = std::move(prop_access);
+                        }
+                        stmts.push_back(std::make_unique<VarDeclStmt>(it.local_var, std::move(init_expr), is_const));
+                    }
+                }
+            };
+
+            emit_bindings(temp_var, items);
             return stmts;
         }
 
@@ -263,7 +331,7 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl() {
         if (Match(TokenKind::Equal)) {
             init = ParseExpression();
         }
-        stmts.push_back(std::make_unique<VarDeclStmt>(name_tok.text, std::move(init)));
+        stmts.push_back(std::make_unique<VarDeclStmt>(name_tok.text, std::move(init), is_const));
         return stmts;
     };
 
@@ -905,6 +973,12 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             auto* s = new JSString(tok.text);
             return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(s));
         }
+        case TokenKind::RegExp: {
+            std::vector<std::unique_ptr<Expr>> args;
+            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString(tok.text))));
+            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString(tok.regex_flags))));
+            return std::make_unique<NewExpr>(std::make_unique<IdentifierExpr>("RegExp"), std::move(args));
+        }
         case TokenKind::True:
             return std::make_unique<LiteralExpr>(TaggedValue::True());
         case TokenKind::False:
@@ -1389,6 +1463,15 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
                 auto obj = idx->ReleaseObject();
                 auto index = idx->ReleaseIndex();
                 return std::make_unique<IndexAssignExpr>(std::move(obj), std::move(index), std::move(rhs));
+            }
+            if (auto* arr = dynamic_cast<ArrayLiteralExpr*>(lhs.get())) {
+                std::vector<std::string> names;
+                for (size_t i = 0; i < arr->Elements().size(); ++i) {
+                    if (auto* id_elem = dynamic_cast<IdentifierExpr*>(arr->Elements()[i].get())) {
+                        names.push_back(id_elem->Name());
+                    }
+                }
+                return std::make_unique<ArrayDestructureAssignExpr>(std::move(names), std::move(rhs));
             }
             throw std::runtime_error("Invalid assignment target");
         }

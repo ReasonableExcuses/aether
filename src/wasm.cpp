@@ -1038,6 +1038,9 @@ JSArrayBuffer* WasmMemoryInstance::GetOrCreateJSBuffer(Realm& realm) {
     if (!js_buffer_ || js_buffer_->IsDetached()) {
         // Create an ArrayBuffer sharing the memory data pointer
         js_buffer_ = AllocateRuntime<JSArrayBuffer>(data_.data(), data_.size(), false, realm.GetRootShape());
+        if (realm.GetArrayBufferPrototype()) {
+            js_buffer_->SetPrototype(realm.GetArrayBufferPrototype());
+        }
         all_buffers_.push_back(js_buffer_);
     }
     return js_buffer_;
@@ -2409,7 +2412,7 @@ void InitializeWebAssembly(Realm& realm) {
         }
 
         auto* mod_obj = AllocateRuntime<JSObject>(root);
-        mod_obj->SetNamedProperty("__proto__", TaggedValue::FromHeapObject(module_proto), next_sid);
+        mod_obj->SetPrototype(module_proto);
         s_module_registry[mod_obj] = mod;
         return TaggedValue::FromHeapObject(mod_obj);
     });
@@ -2504,7 +2507,7 @@ void InitializeWebAssembly(Realm& realm) {
         }
 
         auto* inst_obj = AllocateRuntime<JSObject>(root);
-        inst_obj->SetNamedProperty("__proto__", TaggedValue::FromHeapObject(instance_proto), next_sid);
+        inst_obj->SetPrototype(instance_proto);
         inst_obj->SetNamedProperty("exports", TaggedValue::FromHeapObject(inst->GetExportsObject()), next_sid);
         s_instance_registry[inst_obj] = inst;
         return TaggedValue::FromHeapObject(inst_obj);
@@ -2533,7 +2536,7 @@ void InitializeWebAssembly(Realm& realm) {
         }
         auto mem_inst = std::make_shared<WasmMemoryInstance>(limits);
         auto* mem_obj = AllocateRuntime<JSObject>(root);
-        mem_obj->SetNamedProperty("__proto__", TaggedValue::FromHeapObject(memory_proto), next_sid);
+        mem_obj->SetPrototype(memory_proto);
         mem_obj->SetNamedProperty("buffer", TaggedValue::FromHeapObject(mem_inst->GetOrCreateJSBuffer(realm)), next_sid);
         s_memory_registry[mem_obj] = mem_inst;
 
@@ -2579,7 +2582,7 @@ void InitializeWebAssembly(Realm& realm) {
         }
         auto tbl_inst = std::make_shared<WasmTableInstance>(tt);
         auto* tbl_obj = AllocateRuntime<JSObject>(root);
-        tbl_obj->SetNamedProperty("__proto__", TaggedValue::FromHeapObject(table_proto), next_sid);
+        tbl_obj->SetPrototype(table_proto);
         tbl_obj->SetNamedProperty("length", TaggedValue::FromSmi(tbl_inst->Length()), next_sid);
         s_table_registry[tbl_obj] = tbl_inst;
 
@@ -2631,7 +2634,7 @@ void InitializeWebAssembly(Realm& realm) {
         auto g_inst = std::make_shared<WasmGlobalInstance>(gt, WasmVal::FromJS(init_val, gt.content_type));
 
         auto* g_obj = AllocateRuntime<JSObject>(root);
-        g_obj->SetNamedProperty("__proto__", TaggedValue::FromHeapObject(global_proto), next_sid);
+        g_obj->SetPrototype(global_proto);
         g_obj->SetNamedProperty("value", g_inst->Get().ToJS(realm), next_sid);
         s_global_registry[g_obj] = g_inst;
 

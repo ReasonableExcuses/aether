@@ -255,12 +255,15 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
     }
     assert(current_shape != nullptr && "Object must have a valid shape");
 
+    if (is_frozen_) return;
+
     const PropertyDescriptor* desc = current_shape->LookupProperty(key);
     if (desc != nullptr) {
         // Fast path: Shape already contains property; overwrite existing slot
         SetFastSlot(desc->slot_index, desc->is_in_object, value);
         return;
     }
+    if (is_sealed_) return;
 
     // Slow path: Property does not exist; transition shape
     Shape* next_shape = current_shape->FindOrCreateTransition(key, next_shape_id++, current_shape->Prototype());

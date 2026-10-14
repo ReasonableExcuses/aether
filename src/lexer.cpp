@@ -112,7 +112,70 @@ const char* TokenKindToString(TokenKind kind) {
         case TokenKind::Export:            return "export";
         case TokenKind::Default:           return "default";
         case TokenKind::Hash:              return "#";
+        case TokenKind::RegExp:            return "RegExp";
         default:                           return "<Unknown>";
+    }
+}
+
+static bool CanFollowRegExp(TokenKind prev) {
+    switch (prev) {
+        case TokenKind::Invalid:
+        case TokenKind::EndOfFile:
+        case TokenKind::Semicolon:
+        case TokenKind::Comma:
+        case TokenKind::Colon:
+        case TokenKind::OpenParen:
+        case TokenKind::OpenBracket:
+        case TokenKind::OpenBrace:
+        case TokenKind::Equal:
+        case TokenKind::PlusEqual:
+        case TokenKind::MinusEqual:
+        case TokenKind::StarEqual:
+        case TokenKind::SlashEqual:
+        case TokenKind::PercentEqual:
+        case TokenKind::StarStarEqual:
+        case TokenKind::AmpersandEqual:
+        case TokenKind::BarEqual:
+        case TokenKind::CaretEqual:
+        case TokenKind::AmpAmpEqual:
+        case TokenKind::BarBarEqual:
+        case TokenKind::QuestionQuestionEqual:
+        case TokenKind::Question:
+        case TokenKind::QuestionQuestion:
+        case TokenKind::AmpAmp:
+        case TokenKind::BarBar:
+        case TokenKind::Exclamation:
+        case TokenKind::Tilde:
+        case TokenKind::Plus:
+        case TokenKind::Minus:
+        case TokenKind::Star:
+        case TokenKind::Slash:
+        case TokenKind::Percent:
+        case TokenKind::StarStar:
+        case TokenKind::EqualEqual:
+        case TokenKind::StrictEqual:
+        case TokenKind::NotEqual:
+        case TokenKind::StrictNotEqual:
+        case TokenKind::Less:
+        case TokenKind::LessEqual:
+        case TokenKind::Greater:
+        case TokenKind::GreaterEqual:
+        case TokenKind::Return:
+        case TokenKind::Throw:
+        case TokenKind::Yield:
+        case TokenKind::Await:
+        case TokenKind::Case:
+        case TokenKind::Delete:
+        case TokenKind::Void:
+        case TokenKind::TypeOf:
+        case TokenKind::InstanceOf:
+        case TokenKind::In:
+        case TokenKind::Do:
+        case TokenKind::Else:
+        case TokenKind::Arrow:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -230,12 +293,18 @@ void Lexer::SkipWhitespaceAndComments() {
 
 Token Lexer::PeekToken() {
     if (!peeked_token_) {
-        peeked_token_ = NextToken();
+        peeked_token_ = NextTokenImpl();
     }
     return *peeked_token_;
 }
 
 Token Lexer::NextToken() {
+    Token tok = NextTokenImpl();
+    last_token_kind_ = tok.kind;
+    return tok;
+}
+
+Token Lexer::NextTokenImpl() {
     if (peeked_token_) {
         Token tok = *peeked_token_;
         peeked_token_.reset();
@@ -330,6 +399,9 @@ Token Lexer::NextToken() {
             return Token{TokenKind::Star, "*", 0, false, 0, false, loc};
 
         case '/':
+            if (CanFollowRegExp(last_token_kind_)) {
+                return ScanRegExp();
+            }
             if (Match('=')) return Token{TokenKind::SlashEqual, "/=", 0, false, 0, false, loc};
             return Token{TokenKind::Slash, "/", 0, false, 0, false, loc};
 
@@ -763,14 +835,62 @@ Token Lexer::ScanTemplateLiteral() {
                 default: current_quasi.push_back(esc); break;
             }
         } else {
-            if (c == '\n') {
+            if (c == '\r') {
+                Advance();
+                if (!IsAtEnd() && Peek() == '\n') Advance();
                 line_++;
                 column_ = 1;
+                current_quasi.push_back('\n');
+            } else if (c == '\n') {
+                line_++;
+                column_ = 1;
+                current_quasi.push_back(Advance());
+            } else {
+                current_quasi.push_back(Advance());
             }
-            current_quasi.push_back(Advance());
         }
     }
     tok.template_quasis.push_back(std::move(current_quasi));
+    return tok;
+}
+
+Token Lexer::ScanRegExp() {
+    SourceLocation loc{line_, column_};
+    std::string pattern;
+    std::string flags;
+    bool in_class = false;
+    while (!IsAtEnd()) {
+        char ch = Advance();
+        if (ch == '\n' || ch == '\r') {
+            break;
+        }
+        if (ch == '\\') {
+            pattern.push_back('\\');
+            if (!IsAtEnd()) {
+                pattern.push_back(Advance());
+            }
+            continue;
+        }
+        if (ch == '[') {
+            in_class = true;
+            pattern.push_back(ch);
+            continue;
+        }
+        if (ch == ']' && in_class) {
+            in_class = false;
+            pattern.push_back(ch);
+            continue;
+        }
+        if (ch == '/' && !in_class) {
+            while (!IsAtEnd() && std::isalpha(static_cast<unsigned char>(Peek()))) {
+                flags.push_back(Advance());
+            }
+            break;
+        }
+        pattern.push_back(ch);
+    }
+    Token tok{TokenKind::RegExp, pattern, 0.0, false, 0, false, loc};
+    tok.regex_flags = std::move(flags);
     return tok;
 }
 

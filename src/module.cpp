@@ -48,6 +48,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Rhs()) n->Rhs()->Accept(this);
         }
         void VisitAssign(AssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
+        void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
         void VisitUpdate(UpdateExpr*) override {}
         void VisitPropertyAccess(PropertyAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
         void VisitPropertyAssign(PropertyAssignExpr* n) override {

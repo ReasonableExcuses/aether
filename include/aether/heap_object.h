@@ -260,6 +260,8 @@ public:
 
     JSObject(JSObject&& other) noexcept
         : HeapObject(std::move(other)),
+          is_frozen_(other.is_frozen_),
+          is_sealed_(other.is_sealed_),
           prototype_(other.prototype_),
           out_of_line_slots_(std::move(other.out_of_line_slots_)) {
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
@@ -314,6 +316,11 @@ public:
         }
     }
 
+    bool IsFrozen() const noexcept { return is_frozen_; }
+    void Freeze() noexcept { is_frozen_ = true; is_sealed_ = true; }
+    bool IsSealed() const noexcept { return is_sealed_; }
+    void Seal() noexcept { is_sealed_ = true; }
+
     size_t ObjectSize() const override { return sizeof(JSObject); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         if (prototype_ != nullptr) {
@@ -344,6 +351,8 @@ protected:
     }
 
 private:
+    bool is_frozen_{false};
+    bool is_sealed_{false};
     JSObject* prototype_{nullptr};
     TaggedValue in_object_slots_[Shape::kDefaultInObjectProperties];
     std::vector<TaggedValue> out_of_line_slots_;

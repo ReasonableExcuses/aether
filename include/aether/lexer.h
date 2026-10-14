@@ -126,6 +126,7 @@ enum class TokenKind {
     Export,                 // export
     Default,                // default
     Hash,                   // #
+    RegExp,                 // /pattern/flags
 };
 
 const char* TokenKindToString(TokenKind kind);
@@ -145,6 +146,7 @@ struct Token {
     SourceLocation location;
     std::vector<std::string> template_quasis;
     std::vector<std::string> template_exprs;
+    std::string regex_flags;
 };
 
 class Lexer {
@@ -166,12 +168,15 @@ private:
     Token ScanNumber();
     Token ScanString(char quote);
     Token ScanTemplateLiteral();
+    Token ScanRegExp();
+    Token NextTokenImpl();
 
     std::string_view source_;
     size_t cursor_{0};
     uint32_t line_{1};
     uint32_t column_{1};
     std::optional<Token> peeked_token_;
+    TokenKind last_token_kind_{TokenKind::Invalid};
 };
 
 } // namespace aether
