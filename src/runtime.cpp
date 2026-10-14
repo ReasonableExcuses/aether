@@ -3793,6 +3793,7 @@ Agent::Agent() {
 }
 
 Agent::~Agent() {
+    AsyncWaitManager::Instance().CancelAndJoinForAgent(this);
     if (s_current_agent_ == this) {
         s_current_agent_ = nullptr;
     }

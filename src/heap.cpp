@@ -19,9 +19,7 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
       card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
-    if (!s_current_heap_) {
-        s_current_heap_ = this;
-    }
+    s_current_heap_ = this;
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
     }

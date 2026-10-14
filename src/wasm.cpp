@@ -10,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -17,14 +18,93 @@
 namespace aether {
 
 // ============================================================================
-// Internal Registries for WebAssembly Host JSObjects
+// Internal Thread-Safe Registries for WebAssembly Host JSObjects
 // ============================================================================
 
-static std::unordered_map<JSObject*, std::shared_ptr<WasmModule>> s_module_registry;
-static std::unordered_map<JSObject*, std::shared_ptr<WasmInstance>> s_instance_registry;
-static std::unordered_map<JSObject*, std::shared_ptr<WasmMemoryInstance>> s_memory_registry;
-static std::unordered_map<JSObject*, std::shared_ptr<WasmTableInstance>> s_table_registry;
-static std::unordered_map<JSObject*, std::shared_ptr<WasmGlobalInstance>> s_global_registry;
+template <typename T>
+class ThreadSafeWasmRegistry {
+public:
+    bool contains(JSObject* key) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return map_.find(key) != map_.end();
+    }
+
+    std::shared_ptr<T> get(JSObject* key) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = map_.find(key);
+        return it != map_.end() ? it->second : nullptr;
+    }
+
+    std::shared_ptr<T> operator[](JSObject* key) const {
+        return get(key);
+    }
+
+    struct ProxyAssigner {
+        ThreadSafeWasmRegistry& reg_;
+        JSObject* key_;
+
+        ProxyAssigner(ThreadSafeWasmRegistry& reg, JSObject* key) : reg_(reg), key_(key) {}
+
+        operator std::shared_ptr<T>() const {
+            return reg_.get(key_);
+        }
+
+        std::shared_ptr<T> operator->() const {
+            return reg_.get(key_);
+        }
+
+        T& operator*() const {
+            return *reg_.get(key_);
+        }
+
+        explicit operator bool() const {
+            return reg_.get(key_) != nullptr;
+        }
+
+        bool operator==(std::nullptr_t) const {
+            return reg_.get(key_) == nullptr;
+        }
+
+        bool operator!=(std::nullptr_t) const {
+            return reg_.get(key_) != nullptr;
+        }
+
+        ProxyAssigner& operator=(std::shared_ptr<T> val) {
+            std::lock_guard<std::mutex> lock(reg_.mtx_);
+            reg_.map_[key_] = std::move(val);
+            return *this;
+        }
+    };
+
+    ProxyAssigner operator[](JSObject* key) {
+        return ProxyAssigner(*this, key);
+    }
+
+    void erase(JSObject* key) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        map_.erase(key);
+    }
+
+    void PruneDead(const std::function<bool(JSObject*)>& is_alive) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::erase_if(map_, [&](const auto& kv) { return !is_alive(kv.first); });
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return map_.size();
+    }
+
+private:
+    mutable std::mutex mtx_;
+    std::unordered_map<JSObject*, std::shared_ptr<T>> map_;
+};
+
+static ThreadSafeWasmRegistry<WasmModule> s_module_registry;
+static ThreadSafeWasmRegistry<WasmInstance> s_instance_registry;
+static ThreadSafeWasmRegistry<WasmMemoryInstance> s_memory_registry;
+static ThreadSafeWasmRegistry<WasmTableInstance> s_table_registry;
+static ThreadSafeWasmRegistry<WasmGlobalInstance> s_global_registry;
 
 // Helper to extract binary buffer from ArrayBuffer or TypedArray
 static bool ExtractBufferSource(TaggedValue val, const uint8_t*& out_data, size_t& out_size) {
@@ -155,13 +235,388 @@ bool DecodeLimits(const uint8_t*& p, const uint8_t* end, WasmLimits& out) {
 bool SkipInitExpr(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& expr_out) {
     const uint8_t* start = p;
     while (p < end) {
-        uint8_t b = *p++;
-        if (b == static_cast<uint8_t>(WasmOpcode::End)) {
+        uint8_t opcode = *p++;
+        if (opcode == static_cast<uint8_t>(WasmOpcode::End)) {
             expr_out.assign(start, p);
             return true;
         }
+        switch (static_cast<WasmOpcode>(opcode)) {
+            case WasmOpcode::I32Const: {
+                int32_t imm;
+                if (!DecodeI32(p, end, imm)) return false;
+                break;
+            }
+            case WasmOpcode::I64Const: {
+                int64_t imm;
+                if (!DecodeI64(p, end, imm)) return false;
+                break;
+            }
+            case WasmOpcode::F32Const: {
+                if (p + 4 > end) return false;
+                p += 4;
+                break;
+            }
+            case WasmOpcode::F64Const: {
+                if (p + 8 > end) return false;
+                p += 8;
+                break;
+            }
+            case WasmOpcode::GlobalGet: {
+                uint32_t gidx;
+                if (!DecodeU32(p, end, gidx)) return false;
+                break;
+            }
+            default:
+                return false;
+        }
     }
     return false;
+}
+
+bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::string* error_msg) {
+    const uint8_t* code = fd.code.data();
+    size_t code_len = fd.code.size();
+    if (code_len == 0) {
+        if (error_msg) *error_msg = "Function body is empty";
+        return false;
+    }
+
+    if (code[code_len - 1] != static_cast<uint8_t>(WasmOpcode::End)) {
+        if (error_msg) *error_msg = "Function body does not terminate with End opcode";
+        return false;
+    }
+
+    uint32_t total_funcs = mod.NumImportedFunctions() + static_cast<uint32_t>(mod.Functions().size());
+    uint32_t total_tables = mod.NumImportedTables() + static_cast<uint32_t>(mod.Tables().size());
+    uint32_t total_mems = mod.NumImportedMemories() + static_cast<uint32_t>(mod.Memories().size());
+    uint32_t total_globals = mod.NumImportedGlobals() + static_cast<uint32_t>(mod.Globals().size());
+
+    if (fd.type_index >= mod.Types().size()) {
+        if (error_msg) *error_msg = "Function type index out of range: " + std::to_string(fd.type_index);
+        return false;
+    }
+    const auto& sig = mod.Types()[fd.type_index];
+    uint64_t total_locals = sig.params.size();
+    for (const auto& loc : fd.locals) {
+        total_locals += loc.first;
+    }
+    if (total_locals > 0xFFFFFF) {
+        if (error_msg) *error_msg = "Too many locals in function";
+        return false;
+    }
+
+    size_t pc = 0;
+    std::vector<WasmOpcode> control_stack;
+
+    while (pc < code_len) {
+        uint8_t raw_op = code[pc++];
+        WasmOpcode op = static_cast<WasmOpcode>(raw_op);
+
+        switch (op) {
+            case WasmOpcode::Unreachable:
+            case WasmOpcode::Nop:
+            case WasmOpcode::Drop:
+            case WasmOpcode::Select:
+                break;
+
+            case WasmOpcode::Block:
+            case WasmOpcode::Loop:
+            case WasmOpcode::If: {
+                if (pc >= code_len) {
+                    if (error_msg) *error_msg = "Truncated block type immediate";
+                    return false;
+                }
+                uint8_t btype = code[pc++];
+                if (btype != 0x40 && btype != 0x7F && btype != 0x7E && btype != 0x7D && btype != 0x7C) {
+                    if (error_msg) *error_msg = "Invalid block return type: " + std::to_string(btype);
+                    return false;
+                }
+                control_stack.push_back(op);
+                break;
+            }
+
+            case WasmOpcode::Else: {
+                if (control_stack.empty() || control_stack.back() != WasmOpcode::If) {
+                    if (error_msg) *error_msg = "Else without matching If block";
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::End: {
+                if (control_stack.empty()) {
+                    if (pc != code_len) {
+                        if (error_msg) *error_msg = "Extraneous End opcode before function body end";
+                        return false;
+                    }
+                } else {
+                    control_stack.pop_back();
+                }
+                break;
+            }
+
+            case WasmOpcode::Br:
+            case WasmOpcode::BrIf: {
+                uint32_t label_idx = 0;
+                const uint8_t* p = code + pc;
+                if (!DecodeU32(p, code + code_len, label_idx)) {
+                    if (error_msg) *error_msg = "Failed to decode branch target immediate";
+                    return false;
+                }
+                pc = p - code;
+                if (label_idx > control_stack.size()) {
+                    if (error_msg) *error_msg = "Branch depth exceeds control stack: " + std::to_string(label_idx);
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::BrTable: {
+                const uint8_t* p = code + pc;
+                uint32_t count = 0;
+                if (!DecodeU32(p, code + code_len, count)) {
+                    if (error_msg) *error_msg = "Failed to decode br_table count";
+                    return false;
+                }
+                for (uint32_t i = 0; i <= count; ++i) {
+                    uint32_t target = 0;
+                    if (!DecodeU32(p, code + code_len, target)) {
+                        if (error_msg) *error_msg = "Failed to decode br_table entry";
+                        return false;
+                    }
+                    if (target > control_stack.size()) {
+                        if (error_msg) *error_msg = "br_table target depth exceeds control stack";
+                        return false;
+                    }
+                }
+                pc = p - code;
+                break;
+            }
+
+            case WasmOpcode::Return:
+                break;
+
+            case WasmOpcode::Call: {
+                const uint8_t* p = code + pc;
+                uint32_t func_idx = 0;
+                if (!DecodeU32(p, code + code_len, func_idx)) {
+                    if (error_msg) *error_msg = "Failed to decode call func_idx";
+                    return false;
+                }
+                pc = p - code;
+                if (func_idx >= total_funcs) {
+                    if (error_msg) *error_msg = "Call function index out of range: " + std::to_string(func_idx);
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::CallIndirect: {
+                const uint8_t* p = code + pc;
+                uint32_t tidx = 0;
+                if (!DecodeU32(p, code + code_len, tidx)) {
+                    if (error_msg) *error_msg = "Failed to decode call_indirect type_idx";
+                    return false;
+                }
+                if (p >= code + code_len || *p++ != 0x00) {
+                    if (error_msg) *error_msg = "call_indirect missing 0x00 reserved byte";
+                    return false;
+                }
+                pc = p - code;
+                if (tidx >= mod.Types().size()) {
+                    if (error_msg) *error_msg = "call_indirect type index out of range";
+                    return false;
+                }
+                if (total_tables == 0) {
+                    if (error_msg) *error_msg = "call_indirect requires a table";
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::LocalGet:
+            case WasmOpcode::LocalSet:
+            case WasmOpcode::LocalTee: {
+                const uint8_t* p = code + pc;
+                uint32_t local_idx = 0;
+                if (!DecodeU32(p, code + code_len, local_idx)) {
+                    if (error_msg) *error_msg = "Failed to decode local index";
+                    return false;
+                }
+                pc = p - code;
+                if (local_idx >= total_locals) {
+                    if (error_msg) *error_msg = "Local index out of range: " + std::to_string(local_idx);
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::GlobalGet:
+            case WasmOpcode::GlobalSet: {
+                const uint8_t* p = code + pc;
+                uint32_t global_idx = 0;
+                if (!DecodeU32(p, code + code_len, global_idx)) {
+                    if (error_msg) *error_msg = "Failed to decode global index";
+                    return false;
+                }
+                pc = p - code;
+                if (global_idx >= total_globals) {
+                    if (error_msg) *error_msg = "Global index out of range: " + std::to_string(global_idx);
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::I32Const: {
+                const uint8_t* p = code + pc;
+                int32_t v = 0;
+                if (!DecodeI32(p, code + code_len, v)) {
+                    if (error_msg) *error_msg = "Failed to decode i32.const immediate";
+                    return false;
+                }
+                pc = p - code;
+                break;
+            }
+
+            case WasmOpcode::I64Const: {
+                const uint8_t* p = code + pc;
+                int64_t v = 0;
+                if (!DecodeI64(p, code + code_len, v)) {
+                    if (error_msg) *error_msg = "Failed to decode i64.const immediate";
+                    return false;
+                }
+                pc = p - code;
+                break;
+            }
+
+            case WasmOpcode::F32Const: {
+                if (pc + 4 > code_len) {
+                    if (error_msg) *error_msg = "Truncated f32.const immediate";
+                    return false;
+                }
+                pc += 4;
+                break;
+            }
+
+            case WasmOpcode::F64Const: {
+                if (pc + 8 > code_len) {
+                    if (error_msg) *error_msg = "Truncated f64.const immediate";
+                    return false;
+                }
+                pc += 8;
+                break;
+            }
+
+            case WasmOpcode::I32Load:
+            case WasmOpcode::I64Load:
+            case WasmOpcode::F32Load:
+            case WasmOpcode::F64Load:
+            case WasmOpcode::I32Load8S:
+            case WasmOpcode::I32Load8U:
+            case WasmOpcode::I32Load16S:
+            case WasmOpcode::I32Load16U:
+            case WasmOpcode::I64Load8S:
+            case WasmOpcode::I64Load8U:
+            case WasmOpcode::I64Load16S:
+            case WasmOpcode::I64Load16U:
+            case WasmOpcode::I64Load32S:
+            case WasmOpcode::I64Load32U:
+            case WasmOpcode::I32Store:
+            case WasmOpcode::I64Store:
+            case WasmOpcode::F32Store:
+            case WasmOpcode::F64Store:
+            case WasmOpcode::I32Store8:
+            case WasmOpcode::I32Store16:
+            case WasmOpcode::I64Store8:
+            case WasmOpcode::I64Store16:
+            case WasmOpcode::I64Store32: {
+                if (total_mems == 0) {
+                    if (error_msg) *error_msg = "Memory instruction used without declared memory";
+                    return false;
+                }
+                const uint8_t* p = code + pc;
+                uint32_t align = 0, offset = 0;
+                if (!DecodeU32(p, code + code_len, align) || !DecodeU32(p, code + code_len, offset)) {
+                    if (error_msg) *error_msg = "Failed to decode memory immediate";
+                    return false;
+                }
+                pc = p - code;
+                break;
+            }
+
+            case WasmOpcode::MemorySize:
+            case WasmOpcode::MemoryGrow: {
+                if (total_mems == 0) {
+                    if (error_msg) *error_msg = "memory.size/grow requires memory";
+                    return false;
+                }
+                if (pc >= code_len || code[pc++] != 0x00) {
+                    if (error_msg) *error_msg = "memory.size/grow missing 0x00 reserved byte";
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::I32Eqz: case WasmOpcode::I32Eq: case WasmOpcode::I32Ne:
+            case WasmOpcode::I32LtS: case WasmOpcode::I32LtU: case WasmOpcode::I32GtS: case WasmOpcode::I32GtU:
+            case WasmOpcode::I32LeS: case WasmOpcode::I32LeU: case WasmOpcode::I32GeS: case WasmOpcode::I32GeU:
+            case WasmOpcode::I64Eqz: case WasmOpcode::I64Eq: case WasmOpcode::I64Ne:
+            case WasmOpcode::I64LtS: case WasmOpcode::I64LtU: case WasmOpcode::I64GtS: case WasmOpcode::I64GtU:
+            case WasmOpcode::I64LeS: case WasmOpcode::I64LeU: case WasmOpcode::I64GeS: case WasmOpcode::I64GeU:
+            case WasmOpcode::F32Eq: case WasmOpcode::F32Ne: case WasmOpcode::F32Lt: case WasmOpcode::F32Gt:
+            case WasmOpcode::F32Le: case WasmOpcode::F32Ge:
+            case WasmOpcode::F64Eq: case WasmOpcode::F64Ne: case WasmOpcode::F64Lt: case WasmOpcode::F64Gt:
+            case WasmOpcode::F64Le: case WasmOpcode::F64Ge:
+            case WasmOpcode::I32Clz: case WasmOpcode::I32Ctz: case WasmOpcode::I32Popcnt:
+            case WasmOpcode::I32Add: case WasmOpcode::I32Sub: case WasmOpcode::I32Mul:
+            case WasmOpcode::I32DivS: case WasmOpcode::I32DivU: case WasmOpcode::I32RemS: case WasmOpcode::I32RemU:
+            case WasmOpcode::I32And: case WasmOpcode::I32Or: case WasmOpcode::I32Xor:
+            case WasmOpcode::I32Shl: case WasmOpcode::I32ShrS: case WasmOpcode::I32ShrU:
+            case WasmOpcode::I32Rotl: case WasmOpcode::I32Rotr:
+            case WasmOpcode::I64Clz: case WasmOpcode::I64Ctz: case WasmOpcode::I64Popcnt:
+            case WasmOpcode::I64Add: case WasmOpcode::I64Sub: case WasmOpcode::I64Mul:
+            case WasmOpcode::I64DivS: case WasmOpcode::I64DivU: case WasmOpcode::I64RemS: case WasmOpcode::I64RemU:
+            case WasmOpcode::I64And: case WasmOpcode::I64Or: case WasmOpcode::I64Xor:
+            case WasmOpcode::I64Shl: case WasmOpcode::I64ShrS: case WasmOpcode::I64ShrU:
+            case WasmOpcode::I64Rotl: case WasmOpcode::I64Rotr:
+            case WasmOpcode::F32Abs: case WasmOpcode::F32Neg: case WasmOpcode::F32Ceil: case WasmOpcode::F32Floor:
+            case WasmOpcode::F32Trunc: case WasmOpcode::F32Nearest: case WasmOpcode::F32Sqrt:
+            case WasmOpcode::F32Add: case WasmOpcode::F32Sub: case WasmOpcode::F32Mul: case WasmOpcode::F32Div:
+            case WasmOpcode::F32Min: case WasmOpcode::F32Max: case WasmOpcode::F32Copysign:
+            case WasmOpcode::F64Abs: case WasmOpcode::F64Neg: case WasmOpcode::F64Ceil: case WasmOpcode::F64Floor:
+            case WasmOpcode::F64Trunc: case WasmOpcode::F64Nearest: case WasmOpcode::F64Sqrt:
+            case WasmOpcode::F64Add: case WasmOpcode::F64Sub: case WasmOpcode::F64Mul: case WasmOpcode::F64Div:
+            case WasmOpcode::F64Min: case WasmOpcode::F64Max: case WasmOpcode::F64Copysign:
+            case WasmOpcode::I32WrapI64:
+            case WasmOpcode::I32TruncF32S: case WasmOpcode::I32TruncF32U:
+            case WasmOpcode::I32TruncF64S: case WasmOpcode::I32TruncF64U:
+            case WasmOpcode::I64ExtendI32S: case WasmOpcode::I64ExtendI32U:
+            case WasmOpcode::I64TruncF32S: case WasmOpcode::I64TruncF32U:
+            case WasmOpcode::I64TruncF64S: case WasmOpcode::I64TruncF64U:
+            case WasmOpcode::F32ConvertI32S: case WasmOpcode::F32ConvertI32U:
+            case WasmOpcode::F32ConvertI64S: case WasmOpcode::F32ConvertI64U:
+            case WasmOpcode::F32DemoteF64:
+            case WasmOpcode::F64ConvertI32S: case WasmOpcode::F64ConvertI32U:
+            case WasmOpcode::F64ConvertI64S: case WasmOpcode::F64ConvertI64U:
+            case WasmOpcode::F64PromoteF32:
+            case WasmOpcode::I32ReinterpretF32:
+            case WasmOpcode::I64ReinterpretF64:
+            case WasmOpcode::F32ReinterpretI32:
+            case WasmOpcode::F64ReinterpretI64:
+                break;
+
+            default:
+                if (error_msg) *error_msg = "Unknown or unsupported Wasm opcode: 0x" + std::to_string(static_cast<uint32_t>(raw_op));
+                return false;
+        }
+    }
+
+    if (!control_stack.empty()) {
+        if (error_msg) *error_msg = "Unterminated block/loop/if control constructs";
+        return false;
+    }
+
+    return true;
 }
 
 } // namespace
@@ -515,13 +970,37 @@ std::shared_ptr<WasmModule> WasmModule::Decode(const uint8_t* data, size_t lengt
         p = sec_start + sec_len; // advance exactly to end of section
     }
 
+    // Post-decode validation pass over all decoded function bodies
+    for (const auto& fn : module->functions_) {
+        if (!ValidateFunctionBody(*module, fn, error_msg)) {
+            return nullptr;
+        }
+    }
+
     return module;
 }
 
 bool WasmModule::Validate(const uint8_t* data, size_t length) {
     std::string err;
     auto mod = Decode(data, length, &err);
-    return (mod != nullptr);
+    if (!mod) return false;
+
+    if (mod->Tables().size() > 1) return false;
+    for (const auto& tbl : mod->Tables()) {
+        if (tbl.limits.has_max && tbl.limits.initial > tbl.limits.maximum) return false;
+    }
+    if (mod->Memories().size() > 1) return false;
+    for (const auto& mem : mod->Memories()) {
+        if (mem.limits.has_max && mem.limits.initial > mem.limits.maximum) return false;
+    }
+    if (mod->StartFunction().has_value()) {
+        uint32_t s_idx = mod->StartFunction().value();
+        uint32_t total_funcs = mod->NumImportedFunctions() + static_cast<uint32_t>(mod->Functions().size());
+        if (s_idx >= total_funcs) return false;
+        const auto& sig = mod->GetFunctionSignature(s_idx);
+        if (!sig.params.empty() || !sig.results.empty()) return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -538,17 +1017,28 @@ int32_t WasmMemoryInstance::Grow(uint32_t delta_pages) {
     if (target_pages > kMaxPages) return -1;
     if (limits_.has_max && target_pages > limits_.maximum) return -1;
 
+    // Detach all existing JS buffers wrapping this memory BEFORE reallocating
+    if (js_buffer_) {
+        js_buffer_->Detach();
+        js_buffer_ = nullptr;
+    }
+    for (auto* buf : all_buffers_) {
+        if (buf && !buf->IsDetached()) {
+            buf->Detach();
+        }
+    }
+    all_buffers_.clear();
+
     data_.resize(target_pages * kPageSize, 0);
 
-    // If a JSArrayBuffer was already wrapping this memory, recreate it so buffer reflects new size
-    js_buffer_ = nullptr;
     return static_cast<int32_t>(current_pages);
 }
 
 JSArrayBuffer* WasmMemoryInstance::GetOrCreateJSBuffer(Realm& realm) {
-    if (!js_buffer_) {
+    if (!js_buffer_ || js_buffer_->IsDetached()) {
         // Create an ArrayBuffer sharing the memory data pointer
         js_buffer_ = AllocateRuntime<JSArrayBuffer>(data_.data(), data_.size(), false, realm.GetRootShape());
+        all_buffers_.push_back(js_buffer_);
     }
     return js_buffer_;
 }

@@ -111,3 +111,7 @@ target_link_libraries(test_milestone20_parallel PRIVATE aether_core)
 
 add_executable(test_milestone21_advanced_intrinsics tests/test_milestone21_advanced_intrinsics.cpp)
 target_link_libraries(test_milestone21_advanced_intrinsics PRIVATE aether_core)
+
+add_executable(test_issue_regressions tests/test_issue_regressions.cpp)
+target_link_libraries(test_issue_regressions PRIVATE aether_core)
+

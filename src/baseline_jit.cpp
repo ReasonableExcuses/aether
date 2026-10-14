@@ -120,7 +120,14 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
             case Opcode::LdaConstant: {
                 uint16_t idx = code[pc] | (code[pc + 1] << 8);
                 pc += 2;
-                masm.MovRegImm64(X86Reg::RAX, bytecode.Constants()[idx].RawBits());
+                const auto& c = bytecode.Constants()[idx];
+                if (!c.IsHeapObject()) {
+                    masm.MovRegImm64(X86Reg::RAX, c.RawBits());
+                } else {
+                    const TaggedValue* cell_ptr = &bytecode.Constants()[idx];
+                    masm.MovRegImm64(X86Reg::RAX, reinterpret_cast<uint64_t>(cell_ptr));
+                    masm.MovMemToReg(X86Reg::RAX, X86Reg::RAX, 0);
+                }
                 break;
             }
             case Opcode::Star: {

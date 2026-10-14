@@ -48,6 +48,7 @@ void ConcurrentMarker::Start(const std::vector<HeapObject*>& roots) {
     {
         std::lock_guard<std::mutex> b_lock(barrier_mutex_);
         write_barrier_buffer_.clear();
+        dirty_sources_.clear();
     }
 
     stop_requested_.store(false, std::memory_order_release);
@@ -85,19 +86,25 @@ void ConcurrentMarker::Stop() {
 }
 
 void ConcurrentMarker::NotifyWrite(HeapObject* source, TaggedValue value) {
-    (void)source;
-    if (!IsActive() || !value.IsHeapObject()) {
+    if (!IsActive()) {
         return;
     }
 
-    HeapObject* target = value.AsHeapObject();
-    if (target && target->AtomicSetMarked()) {
-        marked_count_.fetch_add(1, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(barrier_mutex_);
-            write_barrier_buffer_.push_back(target);
+    if (value.IsHeapObject()) {
+        HeapObject* target = value.AsHeapObject();
+        if (target && target->AtomicSetMarked()) {
+            marked_count_.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(barrier_mutex_);
+                write_barrier_buffer_.push_back(target);
+            }
+            cv_work_.notify_one();
         }
-        cv_work_.notify_one();
+    }
+
+    if (source) {
+        std::lock_guard<std::mutex> lock(barrier_mutex_);
+        dirty_sources_.push_back(source);
     }
 }
 
@@ -116,16 +123,25 @@ void ConcurrentMarker::WaitForCompletion() {
 void ConcurrentMarker::FinalizeMarking() {
     Stop();
 
-    // Drain remaining write barrier buffer synchronously during STW finalization
+    // Drain remaining write barrier buffer and re-trace mutated sources during STW remark
     std::vector<HeapObject*> remaining_barrier;
+    std::vector<HeapObject*> dirty_sources;
     {
         std::lock_guard<std::mutex> b_lock(barrier_mutex_);
         remaining_barrier = std::move(write_barrier_buffer_);
+        dirty_sources = std::move(dirty_sources_);
         write_barrier_buffer_.clear();
+        dirty_sources_.clear();
     }
 
     for (HeapObject* obj : remaining_barrier) {
         TraceObject(obj);
+    }
+
+    for (HeapObject* src : dirty_sources) {
+        if (src) {
+            TraceObject(src);
+        }
     }
 
     // Drain any remaining objects in worklist

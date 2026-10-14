@@ -19,13 +19,106 @@ static inline double ValueToNumber(TaggedValue v) {
     if (v.IsNull()) return 0.0;
     if (v.IsUndefined()) return std::numeric_limits<double>::quiet_NaN();
     if (v.IsHeapObject() && v.AsHeapObject()->IsString()) {
+        std::string s(static_cast<JSString*>(v.AsHeapObject())->View());
+        size_t first = s.find_first_not_of(" \t\n\r");
+        if (first == std::string::npos) return 0.0;
+        size_t last = s.find_last_not_of(" \t\n\r");
+        std::string trimmed = s.substr(first, last - first + 1);
         try {
-            return std::stod(std::string(static_cast<JSString*>(v.AsHeapObject())->View()));
+            size_t idx = 0;
+            double d = std::stod(trimmed, &idx);
+            if (idx == trimmed.length()) return d;
+            return std::numeric_limits<double>::quiet_NaN();
         } catch (...) {
             return std::numeric_limits<double>::quiet_NaN();
         }
     }
-    return 0.0;
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+// ============================================================================
+// Managed Async Wait Thread Pool
+// ============================================================================
+
+AsyncWaitManager& AsyncWaitManager::Instance() {
+    static AsyncWaitManager s_mgr;
+    return s_mgr;
+}
+
+void AsyncWaitManager::SpawnWait(int32_t* ptr, int32_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (realm) {
+        realm->RegisterRootValue(std::make_unique<TaggedValue>(TaggedValue::FromHeapObject(promise)));
+    }
+
+    auto task = std::make_shared<WaitTask>();
+    task->agent = agent;
+
+    task->worker = std::thread([ptr, expected, timeout, promise, task]() {
+        std::string wait_res = FutexManager::Instance().Wait32(ptr, expected, timeout);
+        if (task->cancelled.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (task->agent) {
+            task->agent->GetMicrotasks().Enqueue([promise, wait_res, task]() {
+                if (task->cancelled.load(std::memory_order_acquire)) return;
+                MicrotaskQueue dummy;
+                promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(wait_res)), dummy);
+            });
+        } else {
+            CurrentMicrotaskQueue().Enqueue([promise, wait_res, task]() {
+                if (task->cancelled.load(std::memory_order_acquire)) return;
+                MicrotaskQueue dummy;
+                promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(wait_res)), dummy);
+            });
+        }
+    });
+
+    tasks_.push_back(task);
+}
+
+void AsyncWaitManager::CancelAndJoinForAgent(Agent* agent) {
+    std::vector<std::shared_ptr<WaitTask>> agent_tasks;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto it = tasks_.begin(); it != tasks_.end(); ) {
+            if ((*it)->agent == agent) {
+                (*it)->cancelled.store(true, std::memory_order_release);
+                agent_tasks.push_back(*it);
+                it = tasks_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (!agent_tasks.empty()) {
+        FutexManager::Instance().Clear();
+        for (auto& t : agent_tasks) {
+            if (t->worker.joinable()) {
+                t->worker.join();
+            }
+        }
+    }
+}
+
+void AsyncWaitManager::Shutdown() {
+    std::vector<std::shared_ptr<WaitTask>> all_tasks;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (auto& t : tasks_) {
+            t->cancelled.store(true, std::memory_order_release);
+            all_tasks.push_back(t);
+        }
+        tasks_.clear();
+    }
+    if (!all_tasks.empty()) {
+        FutexManager::Instance().Clear();
+        for (auto& t : all_tasks) {
+            if (t->worker.joinable()) {
+                t->worker.join();
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -37,7 +130,7 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
     if (args.size() < 2) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", std::string(op_name) + ": requires at least 2 arguments")));
+                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": requires at least 2 arguments")));
         }
         return TaggedValue::Undefined();
     }
@@ -45,12 +138,30 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
     if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", std::string(op_name) + ": argument 0 must be a TypedArray")));
+                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": argument 0 must be a TypedArray")));
         }
         return TaggedValue::Undefined();
     }
 
     auto* ta = static_cast<JSTypedArray*>(args[0].AsHeapObject());
+    if (!ta->Buffer() || !ta->Buffer()->IsShared()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": typedArray must be backed by a SharedArrayBuffer")));
+        }
+        return TaggedValue::Undefined();
+    }
+
+    if (ta->Kind() == TypedArrayKind::Uint8Clamped ||
+        ta->Kind() == TypedArrayKind::Float32 ||
+        ta->Kind() == TypedArrayKind::Float64) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": unsupported TypedArray element type")));
+        }
+        return TaggedValue::Undefined();
+    }
+
     int64_t idx = -1;
     if (args[1].IsSmi()) {
         idx = args[1].AsSmi();
@@ -59,7 +170,7 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
     } else {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", std::string(op_name) + ": invalid index")));
+                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": invalid index")));
         }
         return TaggedValue::Undefined();
     }
@@ -67,7 +178,7 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
     if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("RangeError", std::string(op_name) + ": index out of bounds")));
+                AllocateRuntime<JSError>("RangeError", std::string(op_name) + ": index out of bounds")));
         }
         return TaggedValue::Undefined();
     }
@@ -81,8 +192,7 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
             std::atomic_ref<int8_t> ref(*p);
             return TaggedValue::FromSmi(op(ref, static_cast<int8_t>(args.size() > 2 ? ValueToNumber(args[2]) : 0)));
         }
-        case TypedArrayKind::Uint8:
-        case TypedArrayKind::Uint8Clamped: {
+        case TypedArrayKind::Uint8: {
             auto* p = reinterpret_cast<uint8_t*>(ptr);
             std::atomic_ref<uint8_t> ref(*p);
             return TaggedValue::FromSmi(op(ref, static_cast<uint8_t>(args.size() > 2 ? ValueToNumber(args[2]) : 0)));
@@ -110,17 +220,29 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
         case TypedArrayKind::BigInt64: {
             auto* p = reinterpret_cast<int64_t*>(ptr);
             std::atomic_ref<int64_t> ref(*p);
-            return TaggedValue::FromDouble(static_cast<double>(op(ref, static_cast<int64_t>(args.size() > 2 ? ValueToNumber(args[2]) : 0))));
+            int64_t arg_val = 0;
+            if (args.size() > 2) {
+                if (args[2].IsSmi()) arg_val = args[2].AsSmi();
+                else if (args[2].IsDouble()) arg_val = static_cast<int64_t>(args[2].AsDouble());
+                else arg_val = static_cast<int64_t>(ValueToNumber(args[2]));
+            }
+            return TaggedValue::FromDouble(static_cast<double>(op(ref, arg_val)));
         }
         case TypedArrayKind::BigUint64: {
             auto* p = reinterpret_cast<uint64_t*>(ptr);
             std::atomic_ref<uint64_t> ref(*p);
-            return TaggedValue::FromDouble(static_cast<double>(op(ref, static_cast<uint64_t>(args.size() > 2 ? ValueToNumber(args[2]) : 0))));
+            uint64_t arg_val = 0;
+            if (args.size() > 2) {
+                if (args[2].IsSmi()) arg_val = static_cast<uint64_t>(args[2].AsSmi());
+                else if (args[2].IsDouble()) arg_val = static_cast<uint64_t>(args[2].AsDouble());
+                else arg_val = static_cast<uint64_t>(ValueToNumber(args[2]));
+            }
+            return TaggedValue::FromDouble(static_cast<double>(op(ref, arg_val)));
         }
         default: {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", std::string(op_name) + ": unsupported TypedArray element type")));
+                    AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": unsupported TypedArray element type")));
             }
             return TaggedValue::Undefined();
         }
@@ -517,6 +639,13 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             return TaggedValue::Undefined();
         }
         auto* ta = static_cast<JSTypedArray*>(args[0].AsHeapObject());
+        if (!ta->Buffer() || !ta->Buffer()->IsShared()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Atomics.compareExchange: typedArray buffer must be a SharedArrayBuffer")));
+            }
+            return TaggedValue::Undefined();
+        }
         int64_t idx = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber());
         if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
             if (Interpreter::Current()) {
@@ -549,7 +678,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             int8_t replacement = static_cast<int8_t>(ValueToNumber(args[3]));
             ref.compare_exchange_strong(expected, replacement, std::memory_order_seq_cst);
             return TaggedValue::FromSmi(expected);
-        } else if (ta->Kind() == TypedArrayKind::Uint8 || ta->Kind() == TypedArrayKind::Uint8Clamped) {
+        } else if (ta->Kind() == TypedArrayKind::Uint8) {
             auto* p = reinterpret_cast<uint8_t*>(ptr);
             std::atomic_ref<uint8_t> ref(*p);
             uint8_t expected = static_cast<uint8_t>(ValueToNumber(args[2]));
@@ -704,7 +833,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (ta->Kind() != TypedArrayKind::Int32) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.waitAsync: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: typedArray must be an Int32Array")));
+            }
+            return TaggedValue::Undefined();
+        }
+        if (!ta->Buffer() || !ta->Buffer()->IsShared()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: typedArray buffer must be a SharedArrayBuffer")));
             }
             return TaggedValue::Undefined();
         }
@@ -748,13 +884,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             promise->SetPrototype(Realm::Current()->GetPromisePrototype());
         }
 
-        std::thread([ptr, expected, timeout, promise]() {
-            std::string wait_res = FutexManager::Instance().Wait32(ptr, expected, timeout);
-            CurrentMicrotaskQueue().Enqueue([promise, wait_res]() {
-                MicrotaskQueue dummy;
-                promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(wait_res)), dummy);
-            });
-        }).detach();
+        AsyncWaitManager::Instance().SpawnWait(ptr, expected, timeout, promise, Agent::Current(), Realm::Current());
 
         res_obj->SetNamedProperty("async", TaggedValue::FromBoolean(true), sid);
         res_obj->SetNamedProperty("value", TaggedValue::FromHeapObject(promise), sid);

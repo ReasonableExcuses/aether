@@ -8,6 +8,7 @@
 #include "aether/interpreter.h"
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <memory>
@@ -73,21 +74,34 @@ public:
     MicrotaskQueue() = default;
 
     void Enqueue(std::function<void()> task) {
+        std::lock_guard<std::mutex> lock(mtx_);
         queue_.push_back(std::move(task));
     }
 
     void PerformMicrotaskCheckpoint() {
-        while (!queue_.empty()) {
-            auto task = std::move(queue_.front());
-            queue_.pop_front();
+        while (true) {
+            std::function<void()> task;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                if (queue_.empty()) break;
+                task = std::move(queue_.front());
+                queue_.pop_front();
+            }
             task();
         }
     }
 
-    size_t Size() const noexcept { return queue_.size(); }
-    bool Empty() const noexcept { return queue_.empty(); }
+    size_t Size() const noexcept {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return queue_.size();
+    }
+    bool Empty() const noexcept {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return queue_.empty();
+    }
 
 private:
+    mutable std::mutex mtx_;
     std::deque<std::function<void()>> queue_;
 };
 

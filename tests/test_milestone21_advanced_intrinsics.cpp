@@ -511,7 +511,7 @@ static void Test10_FinalizationRegistryCore() {
     delete target;
     delete callback;
 
-    std::cout << "  -> FinalizationRegistry passed (10/10)\n";
+    std::cout << "  -> FinalizationRegistry passed (10/10)" << std::endl;
 }
 
 int main() {

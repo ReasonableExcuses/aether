@@ -724,16 +724,7 @@ public:
     bool IsAsyncGenerator() const noexcept { return is_async_ && is_generator_; }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
-        JSObject::IteratePointers(visitor);
-        if (environment_ != nullptr) {
-            TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
-            visitor(env_val);
-            if (env_val.IsHeapObject()) {
-                environment_ = env_val.As<LexicalEnvironment>();
-            }
-        }
-    }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override;
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSFunction(std::move(*this));

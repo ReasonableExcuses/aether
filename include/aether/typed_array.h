@@ -117,8 +117,8 @@ public:
             is_detached_ = true;
             if (owns_data_ && data_ != nullptr) {
                 delete[] data_;
-                data_ = nullptr;
             }
+            data_ = nullptr;
             byte_length_ = 0;
         }
     }
@@ -281,35 +281,89 @@ public:
                 return TaggedValue::FromSmi(static_cast<int32_t>(v));
             }
             case TypedArrayKind::Int16: {
-                int16_t v = *reinterpret_cast<const int16_t*>(ptr + index * 2);
+                int16_t v;
+                std::memcpy(&v, ptr + index * 2, sizeof(v));
                 return TaggedValue::FromSmi(static_cast<int32_t>(v));
             }
             case TypedArrayKind::Uint16: {
-                uint16_t v = *reinterpret_cast<const uint16_t*>(ptr + index * 2);
+                uint16_t v;
+                std::memcpy(&v, ptr + index * 2, sizeof(v));
                 return TaggedValue::FromSmi(static_cast<int32_t>(v));
             }
             case TypedArrayKind::Int32: {
-                int32_t v = *reinterpret_cast<const int32_t*>(ptr + index * 4);
+                int32_t v;
+                std::memcpy(&v, ptr + index * 4, sizeof(v));
                 return TaggedValue::FromSmi(v);
             }
             case TypedArrayKind::Uint32: {
-                uint32_t v = *reinterpret_cast<const uint32_t*>(ptr + index * 4);
+                uint32_t v;
+                std::memcpy(&v, ptr + index * 4, sizeof(v));
                 if (v <= 0x3FFFFFFF) {
                     return TaggedValue::FromSmi(static_cast<int32_t>(v));
                 }
                 return TaggedValue::FromDouble(static_cast<double>(v));
             }
             case TypedArrayKind::Float32: {
-                float v = *reinterpret_cast<const float*>(ptr + index * 4);
+                float v;
+                std::memcpy(&v, ptr + index * 4, sizeof(v));
                 return TaggedValue::FromDouble(static_cast<double>(v));
             }
             case TypedArrayKind::Float64: {
-                double v = *reinterpret_cast<const double*>(ptr + index * 8);
+                double v;
+                std::memcpy(&v, ptr + index * 8, sizeof(v));
                 return TaggedValue::FromDouble(v);
             }
-            default:
-                return TaggedValue::Undefined();
+            case TypedArrayKind::BigInt64: {
+                int64_t v;
+                std::memcpy(&v, ptr + index * 8, sizeof(v));
+                return TaggedValue::FromDouble(static_cast<double>(v));
+            }
+            case TypedArrayKind::BigUint64: {
+                uint64_t v;
+                std::memcpy(&v, ptr + index * 8, sizeof(v));
+                return TaggedValue::FromDouble(static_cast<double>(v));
+            }
         }
+        return TaggedValue::Undefined();
+    }
+
+    // ECMAScript ToNumber conversion for typed array assignment
+    static double TypedArrayToNumber(TaggedValue value) noexcept {
+        if (value.IsSmi()) return static_cast<double>(value.AsSmi());
+        if (value.IsDouble()) return value.AsDouble();
+        if (value.IsBoolean()) return value.AsBoolean() ? 1.0 : 0.0;
+        if (value.IsUndefined()) return std::numeric_limits<double>::quiet_NaN();
+        if (value.IsNull()) return 0.0;
+        if (value.IsHeapObject() && value.AsHeapObject()->IsString()) {
+            auto sv = static_cast<JSString*>(value.AsHeapObject())->View();
+            if (sv.empty()) return 0.0;
+            try { return std::stod(std::string(sv)); } catch (...) {}
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // ECMAScript ToInt32 (wrapping modulo 2^32 then interpret as signed)
+    static int32_t ToInt32(double num) noexcept {
+        if (std::isnan(num) || std::isinf(num) || num == 0.0) return 0;
+        // Use fmod to get modulo 2^32, then convert
+        double d = std::fmod(std::trunc(num), 4294967296.0);
+        if (d < 0) d += 4294967296.0;
+        if (d >= 2147483648.0) d -= 4294967296.0;
+        return static_cast<int32_t>(d);
+    }
+
+    // ECMAScript ToUint32 (wrapping modulo 2^32)
+    static uint32_t ToUint32(double num) noexcept {
+        if (std::isnan(num) || std::isinf(num) || num == 0.0) return 0;
+        double d = std::fmod(std::trunc(num), 4294967296.0);
+        if (d < 0) d += 4294967296.0;
+        return static_cast<uint32_t>(d);
+    }
+
+    // ECMAScript ToUint16 (wrapping modulo 2^16)
+    static uint16_t ToUint16(double num) noexcept {
+        return static_cast<uint16_t>(ToUint32(num) & 0xFFFF);
     }
 
     void SetElement(size_t index, TaggedValue value) {
@@ -319,21 +373,17 @@ public:
         uint8_t* ptr = Data();
         if (!ptr) return;
 
-        double num = 0.0;
-        if (value.IsSmi()) num = static_cast<double>(value.AsSmi());
-        else if (value.IsDouble()) num = value.AsDouble();
-        else if (value.IsBoolean()) num = value.AsBoolean() ? 1.0 : 0.0;
-        else if (value.IsUndefined() || value.IsNull()) num = 0.0;
+        double num = TypedArrayToNumber(value);
 
         switch (kind_) {
             case TypedArrayKind::Int8: {
-                int32_t i = static_cast<int32_t>(num);
-                *reinterpret_cast<int8_t*>(ptr + index) = static_cast<int8_t>(i);
+                int8_t v = static_cast<int8_t>(ToInt32(num) & 0xFF);
+                *(ptr + index) = static_cast<uint8_t>(v);
                 break;
             }
             case TypedArrayKind::Uint8: {
-                uint32_t u = static_cast<uint32_t>(num);
-                *(ptr + index) = static_cast<uint8_t>(u);
+                uint8_t v = static_cast<uint8_t>(ToUint32(num) & 0xFF);
+                *(ptr + index) = v;
                 break;
             }
             case TypedArrayKind::Uint8Clamped: {
@@ -357,33 +407,50 @@ public:
                 break;
             }
             case TypedArrayKind::Int16: {
-                int32_t i = static_cast<int32_t>(num);
-                *reinterpret_cast<int16_t*>(ptr + index * 2) = static_cast<int16_t>(i);
+                int16_t v = static_cast<int16_t>(ToInt32(num) & 0xFFFF);
+                std::memcpy(ptr + index * 2, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::Uint16: {
-                uint32_t u = static_cast<uint32_t>(num);
-                *reinterpret_cast<uint16_t*>(ptr + index * 2) = static_cast<uint16_t>(u);
+                uint16_t v = ToUint16(num);
+                std::memcpy(ptr + index * 2, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::Int32: {
-                *reinterpret_cast<int32_t*>(ptr + index * 4) = static_cast<int32_t>(num);
+                int32_t v = ToInt32(num);
+                std::memcpy(ptr + index * 4, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::Uint32: {
-                *reinterpret_cast<uint32_t*>(ptr + index * 4) = static_cast<uint32_t>(num);
+                uint32_t v = ToUint32(num);
+                std::memcpy(ptr + index * 4, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::Float32: {
-                *reinterpret_cast<float*>(ptr + index * 4) = static_cast<float>(num);
+                float v = static_cast<float>(num);
+                std::memcpy(ptr + index * 4, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::Float64: {
-                *reinterpret_cast<double*>(ptr + index * 8) = num;
+                std::memcpy(ptr + index * 8, &num, sizeof(num));
                 break;
             }
-            default:
+            case TypedArrayKind::BigInt64: {
+                int64_t v = 0;
+                if (!std::isnan(num) && !std::isinf(num)) {
+                    v = static_cast<int64_t>(std::trunc(num));
+                }
+                std::memcpy(ptr + index * 8, &v, sizeof(v));
                 break;
+            }
+            case TypedArrayKind::BigUint64: {
+                uint64_t v = 0;
+                if (!std::isnan(num) && !std::isinf(num) && num >= 0.0) {
+                    v = static_cast<uint64_t>(std::trunc(num));
+                }
+                std::memcpy(ptr + index * 8, &v, sizeof(v));
+                break;
+            }
         }
     }
 
@@ -456,7 +523,8 @@ public:
     }
 
     bool CheckBounds(size_t offset, size_t size) const noexcept {
-        return buffer_ && !buffer_->IsDetached() && (offset + size <= byte_length_);
+        return buffer_ && !buffer_->IsDetached() &&
+               offset <= byte_length_ && size <= byte_length_ - offset;
     }
 
     // Int8 / Uint8 Accessors

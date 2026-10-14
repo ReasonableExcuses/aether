@@ -37,6 +37,7 @@ BackgroundCompiler::~BackgroundCompiler() {
 }
 
 void BackgroundCompiler::Start() {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (is_running_.load(std::memory_order_acquire)) {
         return;
     }
@@ -50,6 +51,7 @@ void BackgroundCompiler::Start() {
 }
 
 void BackgroundCompiler::Stop() {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (!is_running_.load(std::memory_order_acquire)) {
         return;
     }
@@ -67,15 +69,44 @@ void BackgroundCompiler::Stop() {
     is_running_.store(false, std::memory_order_release);
 }
 
-bool BackgroundCompiler::Enqueue(const BytecodeArray& bytecode, TypeFeedbackVector* feedback,
+bool BackgroundCompiler::Enqueue(std::shared_ptr<const BytecodeArray> bytecode,
+                                 const TypeFeedbackVector* feedback,
                                  std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete) {
     if (!is_running_.load(std::memory_order_acquire)) {
         Start();
     }
 
+    BackgroundCompilationJob job;
+    job.bytecode_shared = std::move(bytecode);
+    if (feedback) {
+        job.feedback_snapshot = std::make_unique<TypeFeedbackVector>(*feedback);
+    }
+    job.on_complete = std::move(on_complete);
+
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.push({&bytecode, feedback, std::move(on_complete)});
+        queue_.push(std::move(job));
+    }
+    cv_work_.notify_one();
+    return true;
+}
+
+bool BackgroundCompiler::Enqueue(const BytecodeArray& bytecode, const TypeFeedbackVector* feedback,
+                                 std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete) {
+    if (!is_running_.load(std::memory_order_acquire)) {
+        Start();
+    }
+
+    BackgroundCompilationJob job;
+    job.bytecode_raw = &bytecode;
+    if (feedback) {
+        job.feedback_snapshot = std::make_unique<TypeFeedbackVector>(*feedback);
+    }
+    job.on_complete = std::move(on_complete);
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        queue_.push(std::move(job));
     }
     cv_work_.notify_one();
     return true;
@@ -116,16 +147,17 @@ void BackgroundCompiler::WorkerLoop() {
         }
 
         // Perform Sea-of-Nodes Tier 2 compilation in background worker
-        if (job.bytecode) {
-            auto opt_code = OptimizingJIT::Compile(*job.bytecode, job.feedback);
+        const BytecodeArray* bcode = job.GetBytecode();
+        if (bcode) {
+            auto opt_code = OptimizingJIT::Compile(*bcode, job.feedback_snapshot.get());
             if (opt_code) {
                 std::shared_ptr<ExecutableMemory> shared = std::move(opt_code);
-                job.bytecode->SetTier2Code(shared);
+                bcode->SetTier2Code(shared);
                 if (job.on_complete) {
                     job.on_complete(shared);
                 }
             } else {
-                job.bytecode->FinishTier2Compilation();
+                bcode->FinishTier2Compilation();
             }
         }
 

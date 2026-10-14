@@ -19,9 +19,14 @@ namespace aether {
  * @brief Job payload dispatched to background JIT compilation worker threads.
  */
 struct BackgroundCompilationJob {
-    const BytecodeArray* bytecode{nullptr};
-    TypeFeedbackVector* feedback{nullptr};
+    std::shared_ptr<const BytecodeArray> bytecode_shared{nullptr};
+    const BytecodeArray* bytecode_raw{nullptr};
+    std::unique_ptr<TypeFeedbackVector> feedback_snapshot{nullptr};
     std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete{nullptr};
+
+    const BytecodeArray* GetBytecode() const noexcept {
+        return bytecode_shared ? bytecode_shared.get() : bytecode_raw;
+    }
 };
 
 /**
@@ -43,8 +48,12 @@ public:
     void Start();
     void Stop();
 
-    // Enqueue compilation job. Returns true if queued, false if rejected.
-    bool Enqueue(const BytecodeArray& bytecode, TypeFeedbackVector* feedback = nullptr,
+    // Enqueue compilation job with shared ownership.
+    bool Enqueue(std::shared_ptr<const BytecodeArray> bytecode, const TypeFeedbackVector* feedback = nullptr,
+                 std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete = nullptr);
+
+    // Enqueue compilation job with reference (snapshots feedback). Returns true if queued, false if rejected.
+    bool Enqueue(const BytecodeArray& bytecode, const TypeFeedbackVector* feedback = nullptr,
                  std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete = nullptr);
 
     // Wait for all currently pending and active compilation tasks to finish
@@ -62,6 +71,7 @@ private:
     std::vector<std::thread> workers_;
     std::queue<BackgroundCompilationJob> queue_;
     mutable std::mutex queue_mutex_;
+    mutable std::mutex lifecycle_mutex_;
     std::condition_variable cv_work_;
     std::condition_variable cv_idle_;
 

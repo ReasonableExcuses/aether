@@ -571,6 +571,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone19_wasm.cpp      # WebAssembly MVP execution & interop tests
 │   ├── test_milestone20_parallel.cpp  # Concurrent Immix GC & Background JIT tests
 │   ├── test_milestone21_advanced_intrinsics.cpp # Advanced Intrinsics & Concurrency tests
+│   ├── test_issue_regressions.cpp     # Memory safety, concurrency & validation regressions
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
     └── run_test262.py            # Automated CLI Test262 runner tool
@@ -627,6 +628,7 @@ cmake --build build -j$(nproc)
 .\build\Release\test_milestone19_wasm.exe
 .\build\Release\test_milestone20_parallel.exe
 .\build\Release\test_milestone21_advanced_intrinsics.exe
+.\build\Release\test_issue_regressions.exe
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe
@@ -637,6 +639,54 @@ python tools\run_test262.py
 # Run comprehensive compiler & runtime stress test suite (120/120 tests passed)
 .\build\Release\aether.exe build\Release\test.js
 ```
+
+---
+
+## Hardened Memory Safety, Concurrency & Validation Architecture
+
+AetherVM incorporates comprehensive guarantees addressing low-level concurrency, memory safety, and specification compliance:
+
+1. **WebAssembly Memory Growth & Safe Buffer Detachment**:
+   - `WebAssembly.Memory.prototype.grow()` detaches all existing `JSArrayBuffer` instances and typed array views prior to reallocating the underlying linear memory vector.
+   - Prevents stale pointers and use-after-free conditions; views reflect `byteLength === 0` immediately upon detachment.
+
+2. **WebAssembly Full Bytecode Validation Pass**:
+   - Decodes instruction streams instruction-by-instruction with structural validation.
+   - Verifies block/loop/if nesting, table/memory initial and maximum limits (`initial <= maximum`), and start function index bounds.
+
+3. **Background JIT Compiler Concurrency & Lifetime Safety**:
+   - Background compilation jobs own immutable `BytecodeArray` references via `std::shared_ptr<const BytecodeArray>`.
+   - Snapshots `TypeFeedbackVector` state to insulate parallel Sea-of-Nodes workers from mutator IC mutations.
+   - Serializes `Start()` and `Stop()` transitions via `lifecycle_mutex_`.
+
+4. **SATB Concurrent GC Write Barrier & STW Remark**:
+   - Enforces the Snapshot-At-The-Beginning (SATB) tri-color invariant during background Immix marking.
+   - Write barrier records mutated source objects into a thread-safe dirty buffer, re-tracing modified slots during the Stop-The-World (STW) remark phase.
+
+5. **Managed Async Wait Synchronization (`Atomics.waitAsync`)**:
+   - Validates that typed arrays are backed by a valid `SharedArrayBuffer` (rejecting unshared buffers and disallowed kinds like `Uint8Clamped`, `Float32`, and `Float64`).
+   - Roots pending promises in the owning `Realm` and routes task completions directly into the owning agent's thread-safe microtask queue.
+   - Automatically cancels and cleanly joins outstanding worker threads upon agent/isolate teardown.
+
+6. **Thread-Safe Host Registries**:
+   - WebAssembly module, instance, memory, and table host associations are synchronized with mutexes (`ThreadSafeWasmRegistry`) and support GC-driven dead instance pruning.
+
+7. **Overflow-Free Bounds Checking**:
+   - `JSDataView::CheckBounds` utilizes subtraction-based arithmetic (`offset <= byte_length_ && size <= byte_length_ - offset`) to guarantee safety against `size_t` integer overflows.
+
+8. **64-bit Integer TypedArray Support**:
+   - Complete `BigInt64Array` and `BigUint64Array` element reads and writes.
+
+9. **ECMA-262 TypedArray Value Conversions**:
+   - Enforces two's complement modulo truncation wrapping (`ToUint8`, `ToInt8`, `ToUint16`, `ToInt32`, `ToUint32`) and numeric coercion rules on element assignment.
+
+10. **Multi-Isolate Scope Management**:
+    - RAII `IsolateScope` manages context switching between distinct `IsolateHeap` instances across threads.
+    - `AllocateRuntime<T>` dynamically routes allocations through the current thread's managed isolate heap.
+
+11. **Constant Cell Indirection & GC Tracing for JIT Machine Code**:
+    - Baseline JIT `LdaConstant` loads heap objects via stable constant cells to ensure pointers remain valid across moving collections.
+    - Constant pools are registered as GC roots during nursery scavenge and Immix marking.
 
 ### Running the Standalone Aether CLI
 

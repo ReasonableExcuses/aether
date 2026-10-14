@@ -364,6 +364,32 @@ private:
     std::vector<std::shared_ptr<Waiter>> waiters_;
 };
 
+class Agent;
+class JSPromise;
+
+/**
+ * @brief Managed asynchronous wait coordinator for Atomics.waitAsync.
+ * Prevents dangling threads, roots promises in realms, and routes completions to the owning agent.
+ */
+class AsyncWaitManager {
+public:
+    static AsyncWaitManager& Instance();
+
+    struct WaitTask {
+        Agent* agent{nullptr};
+        std::atomic<bool> cancelled{false};
+        std::thread worker;
+    };
+
+    void SpawnWait(int32_t* ptr, int32_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm);
+    void CancelAndJoinForAgent(Agent* agent);
+    void Shutdown();
+
+private:
+    std::mutex mtx_;
+    std::vector<std::shared_ptr<WaitTask>> tasks_;
+};
+
 /**
  * @brief Initializes all Advanced Intrinsics (WeakMap, WeakSet, SharedArrayBuffer, Atomics, WeakRef, FinalizationRegistry) on the given Realm.
  */

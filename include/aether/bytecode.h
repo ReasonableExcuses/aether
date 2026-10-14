@@ -8,6 +8,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <functional>
 
 namespace aether {
 
@@ -241,6 +242,14 @@ public:
     void PatchI32(size_t offset, int32_t val);
 
     uint16_t AddConstant(TaggedValue val);
+
+    void IterateConstants(const std::function<void(TaggedValue&)>& visitor) {
+        for (auto& c : constants_) {
+            if (c.IsHeapObject()) {
+                visitor(c);
+            }
+        }
+    }
 
     // Disassembly for verification and debugging
     std::string Disassemble() const;

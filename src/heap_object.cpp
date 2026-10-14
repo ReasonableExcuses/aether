@@ -1,6 +1,7 @@
 #include "aether/heap_object.h"
 #include "aether/runtime.h"
 #include "aether/typed_array.h"
+#include "aether/bytecode.h"
 #include <cctype>
 #include <regex>
 #include <cmath>
@@ -427,6 +428,20 @@ bool JSRegExp::Test(std::string_view str) const {
         return std::regex_search(s, re);
     } catch (...) {
         return false;
+    }
+}
+
+void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visitor) {
+    JSObject::IteratePointers(visitor);
+    if (environment_ != nullptr) {
+        TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
+        visitor(env_val);
+        if (env_val.IsHeapObject()) {
+            environment_ = env_val.As<LexicalEnvironment>();
+        }
+    }
+    if (bytecode_) {
+        const_cast<BytecodeArray*>(bytecode_)->IterateConstants(visitor);
     }
 }
 

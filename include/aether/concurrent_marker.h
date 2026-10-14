@@ -79,6 +79,7 @@ private:
 
     mutable std::mutex barrier_mutex_;
     std::vector<HeapObject*> write_barrier_buffer_;
+    std::vector<HeapObject*> dirty_sources_;
 
     std::atomic<bool> stop_requested_{false};
     std::atomic<size_t> marked_count_{0};

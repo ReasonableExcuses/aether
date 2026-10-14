@@ -198,6 +198,27 @@ inline HandleScope::~HandleScope() {
     heap_.PopHandleScope(this);
 }
 
+/**
+ * @brief RAII Scope for managing active IsolateHeap context switches across threads/agents.
+ */
+class IsolateScope {
+public:
+    explicit IsolateScope(IsolateHeap* heap)
+        : prev_heap_(IsolateHeap::Current()) {
+        IsolateHeap::SetCurrent(heap);
+    }
+    explicit IsolateScope(IsolateHeap& heap)
+        : IsolateScope(&heap) {}
+    ~IsolateScope() {
+        IsolateHeap::SetCurrent(prev_heap_);
+    }
+    IsolateScope(const IsolateScope&) = delete;
+    IsolateScope& operator=(const IsolateScope&) = delete;
+
+private:
+    IsolateHeap* prev_heap_;
+};
+
 using Heap = IsolateHeap;
 
 template <typename T, typename... Args>

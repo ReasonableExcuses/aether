@@ -462,6 +462,7 @@ private:
     WasmLimits limits_;
     std::vector<uint8_t> data_;
     JSArrayBuffer* js_buffer_{nullptr};
+    std::vector<JSArrayBuffer*> all_buffers_;
 };
 
 class WasmTableInstance {
