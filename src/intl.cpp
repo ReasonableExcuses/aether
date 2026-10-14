@@ -1632,7 +1632,7 @@ void InitializeDate(Realm& realm) {
 #endif
                     epoch_ms = static_cast<double>(t_val) * 1000.0;
                 } else {
-                    epoch_ms = 0.0;
+                    epoch_ms = std::numeric_limits<double>::quiet_NaN();
                 }
             } else if (args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
                 auto* src_obj = static_cast<JSObject*>(args[0].AsHeapObject());
@@ -1902,7 +1902,12 @@ void InitializeNumber(Realm& realm) {
     realm.SetNumberPrototype(number_proto);
 
     auto* number_ctor = make_native("Number", [number_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
-        double d = args.empty() ? 0.0 : args[0].AsNumber();
+        if (args.empty()) return TaggedValue::FromSmi(0);
+        double d = args[0].ToDouble();
+        if (std::isnan(d)) return TaggedValue::FromDouble(d);
+        if (std::floor(d) == d && d >= -1073741824.0 && d <= 1073741823.0 && (d != 0.0 || !std::signbit(d))) {
+            return TaggedValue::FromSmi(static_cast<int32_t>(d));
+        }
         return TaggedValue::FromDouble(d);
     });
 

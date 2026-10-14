@@ -493,6 +493,16 @@ bool HasProperty(TaggedValue obj, std::string_view key) {
     if (ho->IsProxy()) {
         return ProxyHas(static_cast<JSProxy*>(ho), key);
     }
+    if (ho->IsArray()) {
+        auto* arr = static_cast<JSArray*>(ho);
+        if (key == "length") return true;
+        try {
+            size_t idx = std::stoull(std::string(key));
+            if (idx < arr->Length()) {
+                return !arr->Elements()[idx].IsEmpty();
+            }
+        } catch (...) {}
+    }
     if (ho->IsJSObject()) {
         return static_cast<JSObject*>(ho)->HasNamedProperty(key);
     }
@@ -612,6 +622,17 @@ static TaggedValue Math_ceil(const std::vector<TaggedValue>& args) {
     if (args.empty()) return TaggedValue::FromDouble(std::nan(""));
     double d = args[0].AsNumber();
     return TaggedValue::FromDouble(std::ceil(d));
+}
+
+static TaggedValue Math_round(const std::vector<TaggedValue>& args) {
+    if (args.empty()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    double val = args[0].ToDouble();
+    if (std::isnan(val)) return TaggedValue::FromDouble(val);
+    double res = std::floor(val + 0.5);
+    if (res >= -1073741824.0 && res <= 1073741823.0 && (res != 0.0 || !std::signbit(res))) {
+        return TaggedValue::FromSmi(static_cast<int32_t>(res));
+    }
+    return TaggedValue::FromDouble(res);
 }
 
 static TaggedValue Math_sqrt(const std::vector<TaggedValue>& args) {
@@ -880,6 +901,74 @@ static TaggedValue Array_reduce(TaggedValue this_val, const std::vector<TaggedVa
     return acc;
 }
 
+static TaggedValue Array_splice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
+    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(arr->Length());
+    if (args.empty()) {
+        auto* empty_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 0);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            empty_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        return TaggedValue::FromHeapObject(empty_arr);
+    }
+    int64_t start = args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble());
+    if (start < 0) start = std::max<int64_t>(0, len + start);
+    else start = std::min<int64_t>(len, start);
+
+    int64_t delete_count = 0;
+    if (args.size() == 1) {
+        delete_count = len - start;
+    } else {
+        int64_t dc = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble());
+        delete_count = std::clamp<int64_t>(dc, 0, len - start);
+    }
+
+    std::vector<TaggedValue> removed;
+    removed.reserve(static_cast<size_t>(delete_count));
+    for (int64_t i = 0; i < delete_count; ++i) {
+        removed.push_back(arr->GetElement(static_cast<size_t>(start + i)));
+    }
+
+    std::vector<TaggedValue>& elems = arr->Elements();
+    std::vector<TaggedValue> items_to_insert;
+    if (args.size() > 2) {
+        items_to_insert.assign(args.begin() + 2, args.end());
+    }
+
+    auto it = elems.begin() + start;
+    elems.erase(it, it + delete_count);
+    elems.insert(elems.begin() + start, items_to_insert.begin(), items_to_insert.end());
+    arr->SetLength(elems.size());
+
+    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(removed));
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    return TaggedValue::FromHeapObject(new_arr);
+}
+
+static TaggedValue Array_sort(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return this_val;
+    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    TaggedValue compare_fn = args.empty() ? TaggedValue::Undefined() : args[0];
+    std::vector<TaggedValue>& elems = arr->Elements();
+
+    if (compare_fn.IsHeapObject() && compare_fn.AsHeapObject()->IsFunction()) {
+        std::stable_sort(elems.begin(), elems.end(), [&](const TaggedValue& a, const TaggedValue& b) {
+            std::vector<TaggedValue> cmp_args = {a, b};
+            TaggedValue res = CallFunction(compare_fn, TaggedValue::Undefined(), cmp_args);
+            double d = res.ToDouble();
+            return d < 0;
+        });
+    } else {
+        std::stable_sort(elems.begin(), elems.end(), [](const TaggedValue& a, const TaggedValue& b) {
+            return a.ToString() < b.ToString();
+        });
+    }
+    return this_val;
+}
+
 static TaggedValue Array_isArray(const std::vector<TaggedValue>& args) {
     if (args.empty()) return TaggedValue::FromBoolean(false);
     return TaggedValue::FromBoolean(args[0].IsHeapObject() && args[0].AsHeapObject()->IsArray());
@@ -1018,6 +1107,145 @@ static TaggedValue String_includes(TaggedValue this_val, const std::vector<Tagge
     auto* s = static_cast<JSString*>(this_val.AsHeapObject());
     std::string search = args.empty() ? "undefined" : args[0].ToString();
     return TaggedValue::FromBoolean(s->View().find(search) != std::string_view::npos);
+}
+
+static TaggedValue String_replace(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    std::string str = this_val.ToString();
+    if (args.empty()) {
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str));
+    }
+    std::string pattern = args[0].ToString();
+    std::string replacement = args.size() > 1 ? args[1].ToString() : "undefined";
+
+    size_t pos = str.find(pattern);
+    if (pos != std::string::npos) {
+        str.replace(pos, pattern.length(), replacement);
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str));
+}
+
+static TaggedValue String_repeat(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    std::string str = this_val.ToString();
+    if (args.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+    int64_t count = args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble());
+    if (count < 0) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("RangeError", "Invalid count value")));
+        }
+        return TaggedValue::Undefined();
+    }
+    std::string res;
+    res.reserve(str.length() * count);
+    for (int64_t i = 0; i < count; ++i) {
+        res += str;
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
+}
+
+static TaggedValue Function_call(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function.prototype.call called on non-function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue target_this = args.empty() ? TaggedValue::Undefined() : args[0];
+    std::vector<TaggedValue> call_args;
+    if (args.size() > 1) {
+        call_args.assign(args.begin() + 1, args.end());
+    }
+    return CallFunction(this_val, target_this, call_args);
+}
+
+static TaggedValue Function_apply(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function.prototype.apply called on non-function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue target_this = args.empty() ? TaggedValue::Undefined() : args[0];
+    std::vector<TaggedValue> call_args;
+    if (args.size() > 1 && args[1].IsHeapObject() && args[1].AsHeapObject()->IsArray()) {
+        auto* arr = static_cast<JSArray*>(args[1].AsHeapObject());
+        for (size_t i = 0; i < arr->Length(); ++i) {
+            call_args.push_back(arr->GetElement(i));
+        }
+    }
+    return CallFunction(this_val, target_this, call_args);
+}
+
+static TaggedValue Object_hasOwnProperty(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (args.empty() || !this_val.IsHeapObject()) return TaggedValue::FromBoolean(false);
+    std::string key = args[0].ToString();
+    auto* ho = this_val.AsHeapObject();
+    if (ho->IsJSObject()) {
+        auto* obj = static_cast<JSObject*>(ho);
+        Shape* shape = obj->GetShape();
+        if (shape != nullptr) {
+            const PropertyDescriptor* desc = shape->LookupProperty(key);
+            if (desc != nullptr) {
+                TaggedValue val = obj->GetFastSlot(desc->slot_index, desc->is_in_object);
+                if (!val.IsEmpty()) return TaggedValue::FromBoolean(true);
+            }
+        }
+        if (obj->IsArray()) {
+            if (key == "length") return TaggedValue::FromBoolean(true);
+            auto is_digits = [](std::string_view sv) {
+                if (sv.empty()) return false;
+                for (char c : sv) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+                return true;
+            };
+            if (is_digits(key)) {
+                size_t idx = static_cast<size_t>(std::stoull(key));
+                auto* arr = static_cast<const JSArray*>(obj);
+                if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
+                    return TaggedValue::FromBoolean(true);
+                }
+            }
+        }
+        return TaggedValue::FromBoolean(false);
+    }
+    return TaggedValue::FromBoolean(false);
+}
+
+static TaggedValue Global_parseInt(const std::vector<TaggedValue>& args) {
+    if (args.empty()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    std::string s = args[0].ToString();
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    s = s.substr(start);
+
+    int radix = 10;
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        radix = static_cast<int>(args[1].ToDouble());
+        if (radix == 0) radix = 10;
+        else if (radix < 2 || radix > 36) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    }
+    if ((radix == 10 || radix == 16) && s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        radix = 16;
+        s = s.substr(2);
+    }
+    char* end = nullptr;
+    long long val = std::strtoll(s.c_str(), &end, radix);
+    if (end == s.c_str()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    if (val >= -1073741824LL && val <= 1073741823LL) {
+        return TaggedValue::FromSmi(static_cast<int32_t>(val));
+    }
+    return TaggedValue::FromDouble(static_cast<double>(val));
+}
+
+static TaggedValue Global_parseFloat(const std::vector<TaggedValue>& args) {
+    if (args.empty()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    std::string s = args[0].ToString();
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    s = s.substr(start);
+
+    char* end = nullptr;
+    double val = std::strtod(s.c_str(), &end);
+    if (end == s.c_str()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+    return TaggedValue::FromDouble(val);
 }
 
 // JSON Parser & Serializer
@@ -2543,6 +2771,9 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     auto make_native = [this, &heap](std::string_view name, auto cb) -> JSNativeFunction* {
         JSNativeFunction* fn = heap.AllocateOld<JSNativeFunction>(name, cb);
+        if (function_prototype_) {
+            fn->SetPrototype(function_prototype_);
+        }
         auto val = std::make_unique<TaggedValue>(TaggedValue::FromHeapObject(fn));
         heap.RegisterExtraRoot(val.get());
         root_values_.push_back(std::move(val));
@@ -2562,6 +2793,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     console_object_ = make_old_obj();
     json_object_ = make_old_obj();
 
+    object_prototype_ = make_old_obj();
+    function_prototype_ = make_old_obj();
     array_prototype_ = make_old_obj();
     string_prototype_ = make_old_obj();
     map_prototype_ = make_old_obj();
@@ -2721,6 +2954,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     math_object_->SetNamedProperty("abs", TaggedValue::FromHeapObject(make_native("abs", &Math_abs)), next_shape_id_);
     math_object_->SetNamedProperty("floor", TaggedValue::FromHeapObject(make_native("floor", &Math_floor)), next_shape_id_);
     math_object_->SetNamedProperty("ceil", TaggedValue::FromHeapObject(make_native("ceil", &Math_ceil)), next_shape_id_);
+    math_object_->SetNamedProperty("round", TaggedValue::FromHeapObject(make_native("round", &Math_round)), next_shape_id_);
     math_object_->SetNamedProperty("sqrt", TaggedValue::FromHeapObject(make_native("sqrt", &Math_sqrt)), next_shape_id_);
     math_object_->SetNamedProperty("max", TaggedValue::FromHeapObject(make_native("max", &Math_max)), next_shape_id_);
     math_object_->SetNamedProperty("min", TaggedValue::FromHeapObject(make_native("min", &Math_min)), next_shape_id_);
@@ -2735,6 +2969,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     array_prototype_->SetNamedProperty("shift", TaggedValue::FromHeapObject(make_native("shift", &Array_shift)), next_shape_id_);
     array_prototype_->SetNamedProperty("unshift", TaggedValue::FromHeapObject(make_native("unshift", &Array_unshift)), next_shape_id_);
     array_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &Array_slice)), next_shape_id_);
+    array_prototype_->SetNamedProperty("splice", TaggedValue::FromHeapObject(make_native("splice", &Array_splice)), next_shape_id_);
+    array_prototype_->SetNamedProperty("sort", TaggedValue::FromHeapObject(make_native("sort", &Array_sort)), next_shape_id_);
     array_prototype_->SetNamedProperty("join", TaggedValue::FromHeapObject(make_native("join", &Array_join)), next_shape_id_);
     array_prototype_->SetNamedProperty("indexOf", TaggedValue::FromHeapObject(make_native("indexOf", &Array_indexOf)), next_shape_id_);
     array_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &Array_includes)), next_shape_id_);
@@ -2778,6 +3014,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     string_prototype_->SetNamedProperty("trim", TaggedValue::FromHeapObject(make_native("trim", &String_trim)), next_shape_id_);
     string_prototype_->SetNamedProperty("split", TaggedValue::FromHeapObject(make_native("split", &String_split)), next_shape_id_);
     string_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &String_includes)), next_shape_id_);
+    string_prototype_->SetNamedProperty("replace", TaggedValue::FromHeapObject(make_native("replace", &String_replace)), next_shape_id_);
+    string_prototype_->SetNamedProperty("repeat", TaggedValue::FromHeapObject(make_native("repeat", &String_repeat)), next_shape_id_);
     auto* str_iter = make_native("values", &String_iterator);
     string_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(str_iter), next_shape_id_);
 
@@ -2854,13 +3092,17 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         }
         return TaggedValue::FromHeapObject(AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr));
     });
-    auto* object_prototype = make_old_obj();
-    object_prototype->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Object_toString)), next_shape_id_);
-    object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype), next_shape_id_);
+    object_prototype_->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Object_toString)), next_shape_id_);
+    object_prototype_->SetNamedProperty("hasOwnProperty", TaggedValue::FromHeapObject(make_native("hasOwnProperty", &Object_hasOwnProperty)), next_shape_id_);
+    object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype_), next_shape_id_);
     object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(make_native("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
         if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
             obj->SetPrototype(static_cast<JSObject*>(args[0].AsHeapObject()));
+        } else if (args.empty() || args[0].IsNull()) {
+            obj->SetPrototype(nullptr);
+        } else if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
+            obj->SetPrototype(Realm::Current()->GetObjectPrototype());
         }
         return TaggedValue::FromHeapObject(obj);
     })), next_shape_id_);
@@ -2958,6 +3200,17 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return target;
     })), next_shape_id_);
     global_object_->SetNamedProperty("Object", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
+    global_object_->SetNamedProperty("parseInt", TaggedValue::FromHeapObject(make_native("parseInt", &Global_parseInt)), next_shape_id_);
+    global_object_->SetNamedProperty("parseFloat", TaggedValue::FromHeapObject(make_native("parseFloat", &Global_parseFloat)), next_shape_id_);
+
+    // Function Constructor & Prototype
+    function_prototype_->SetNamedProperty("call", TaggedValue::FromHeapObject(make_native("call", &Function_call)), next_shape_id_);
+    function_prototype_->SetNamedProperty("apply", TaggedValue::FromHeapObject(make_native("apply", &Function_apply)), next_shape_id_);
+    auto* function_ctor = make_native("Function", [](const std::vector<TaggedValue>&) -> TaggedValue {
+        return TaggedValue::Undefined();
+    });
+    function_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(function_prototype_), next_shape_id_);
+    global_object_->SetNamedProperty("Function", TaggedValue::FromHeapObject(function_ctor), next_shape_id_);
 
     // Proxy Constructor & revocable
     auto* proxy_ctor = make_native("Proxy", [](const std::vector<TaggedValue>& args) -> TaggedValue {

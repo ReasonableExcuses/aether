@@ -37,6 +37,7 @@ enum class Opcode : uint8_t {
     Mul,                // [Op, reg: u8, slot: u16]    acc = acc * Reg[reg]
     Div,                // [Op, reg: u8, slot: u16]    acc = acc / Reg[reg]
     Mod,                // [Op, reg: u8, slot: u16]    acc = acc % Reg[reg]
+    Exp,                // [Op, reg: u8, slot: u16]    acc = acc ** Reg[reg]
 
     // Bitwise Operations
     BitwiseAnd,         // [Op, reg: u8]               acc = acc & Reg[reg]
@@ -44,6 +45,7 @@ enum class Opcode : uint8_t {
     BitwiseXor,         // [Op, reg: u8]               acc = acc ^ Reg[reg]
     ShiftLeft,          // [Op, reg: u8]               acc = acc << Reg[reg]
     ShiftRight,         // [Op, reg: u8]               acc = acc >> Reg[reg]
+    ShiftRightUnsigned, // [Op, reg: u8]               acc = acc >>> Reg[reg]
 
     // Comparisons (acc = (acc <op> Reg[reg]))
     TestEqual,              // [Op, reg: u8]           acc = (acc == Reg[reg])
@@ -102,6 +104,7 @@ enum class Opcode : uint8_t {
     // Execution & Control
     Yield,              // [Op]                        suspend and yield acc
     Await,              // [Op]                        suspend async coroutine for await acc
+    Debugger,           // [Op]                        debugger breakpoint hook
     Return,             // [Op]                        return acc
     Halt,               // [Op]                        halt execution
     Count               // Total opcode count marker

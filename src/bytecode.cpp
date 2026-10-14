@@ -21,11 +21,13 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Mul:                return "Mul";
         case Opcode::Div:                return "Div";
         case Opcode::Mod:                return "Mod";
+        case Opcode::Exp:                return "Exp";
         case Opcode::BitwiseAnd:         return "BitwiseAnd";
         case Opcode::BitwiseOr:          return "BitwiseOr";
         case Opcode::BitwiseXor:         return "BitwiseXor";
         case Opcode::ShiftLeft:          return "ShiftLeft";
         case Opcode::ShiftRight:         return "ShiftRight";
+        case Opcode::ShiftRightUnsigned: return "ShiftRightUnsigned";
         case Opcode::TestEqual:          return "TestEqual";
         case Opcode::TestStrictEqual:    return "TestStrictEqual";
         case Opcode::TestLessThan:       return "TestLessThan";
@@ -68,6 +70,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Throw:              return "Throw";
         case Opcode::Yield:              return "Yield";
         case Opcode::Await:              return "Await";
+        case Opcode::Debugger:           return "Debugger";
         case Opcode::Return:             return "Return";
         case Opcode::Halt:               return "Halt";
         default:                         return "<UnknownOpcode>";

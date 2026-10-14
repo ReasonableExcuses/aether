@@ -248,6 +248,15 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.ImulRegReg32(X86Reg::RAX, X86Reg::RCX);
                 masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                // In ECMAScript, 0 * negative produces -0.0, which cannot be represented as Smi
+                masm.CmpRegImm32(X86Reg::RAX, 0);
+                JITLabel not_zero_mul;
+                masm.Jcc(Condition::NotEqual, not_zero_mul);
+                masm.MovMemToReg(X86Reg::RDX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.OrRegReg32(X86Reg::RDX, X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.Bind(not_zero_mul);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }

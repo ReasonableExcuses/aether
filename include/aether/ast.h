@@ -18,11 +18,13 @@ enum class BinaryOp {
     Mul,
     Div,
     Mod,
+    Exp,
     BitwiseAnd,
     BitwiseOr,
     BitwiseXor,
     ShiftLeft,
     ShiftRight,
+    ShiftRightUnsigned,
     Equal,
     StrictEqual,
     NotEqual,
@@ -35,7 +37,8 @@ enum class BinaryOp {
     LogicalOr,
     NullishCoalescing,
     InstanceOf,
-    In
+    In,
+    Comma
 };
 
 enum class UnaryOp {
@@ -44,7 +47,8 @@ enum class UnaryOp {
     BitwiseNot,
     Plus,
     TypeOf,
-    Delete
+    Delete,
+    Void
 };
 
 class ASTNode {
@@ -237,6 +241,63 @@ private:
     std::unique_ptr<Expr> object_;
     std::unique_ptr<Expr> index_;
     std::unique_ptr<Expr> value_;
+};
+
+class CompoundPropertyAssignExpr : public Expr {
+public:
+    CompoundPropertyAssignExpr(BinaryOp op, std::unique_ptr<Expr> object, std::string_view property, std::unique_ptr<Expr> rhs)
+        : op_(op), object_(std::move(object)), property_(property), rhs_(std::move(rhs)) {}
+
+    BinaryOp Op() const noexcept { return op_; }
+    Expr* Object() const noexcept { return object_.get(); }
+    const std::string& Property() const noexcept { return property_; }
+    Expr* Rhs() const noexcept { return rhs_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    BinaryOp op_;
+    std::unique_ptr<Expr> object_;
+    std::string property_;
+    std::unique_ptr<Expr> rhs_;
+};
+
+class CompoundIndexAssignExpr : public Expr {
+public:
+    CompoundIndexAssignExpr(BinaryOp op, std::unique_ptr<Expr> object, std::unique_ptr<Expr> index, std::unique_ptr<Expr> rhs)
+        : op_(op), object_(std::move(object)), index_(std::move(index)), rhs_(std::move(rhs)) {}
+
+    BinaryOp Op() const noexcept { return op_; }
+    Expr* Object() const noexcept { return object_.get(); }
+    Expr* Index() const noexcept { return index_.get(); }
+    Expr* Rhs() const noexcept { return rhs_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    BinaryOp op_;
+    std::unique_ptr<Expr> object_;
+    std::unique_ptr<Expr> index_;
+    std::unique_ptr<Expr> rhs_;
+};
+
+enum class UpdateOp {
+    Increment,
+    Decrement
+};
+
+class UpdateExpr : public Expr {
+public:
+    UpdateExpr(UpdateOp op, std::string_view name, bool is_prefix)
+        : op_(op), name_(name), is_prefix_(is_prefix) {}
+
+    UpdateOp Op() const noexcept { return op_; }
+    const std::string& Name() const noexcept { return name_; }
+    bool IsPrefix() const noexcept { return is_prefix_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    UpdateOp op_;
+    std::string name_;
+    bool is_prefix_;
 };
 
 class NewExpr : public Expr {
@@ -468,6 +529,65 @@ private:
     std::unique_ptr<Stmt> body_;
 };
 
+class DoWhileStmt : public Stmt {
+public:
+    DoWhileStmt(std::unique_ptr<Stmt> body, std::unique_ptr<Expr> cond)
+        : body_(std::move(body)), condition_(std::move(cond)) {}
+
+    Stmt* Body() const noexcept { return body_.get(); }
+    Expr* Condition() const noexcept { return condition_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Stmt> body_;
+    std::unique_ptr<Expr> condition_;
+};
+
+class BreakStmt : public Stmt {
+public:
+    explicit BreakStmt(std::string_view label = "") : label_(label) {}
+    const std::string& Label() const noexcept { return label_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string label_;
+};
+
+class ContinueStmt : public Stmt {
+public:
+    explicit ContinueStmt(std::string_view label = "") : label_(label) {}
+    const std::string& Label() const noexcept { return label_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string label_;
+};
+
+struct SwitchCase {
+    std::unique_ptr<Expr> test; // nullptr indicates 'default' case
+    std::vector<std::unique_ptr<Stmt>> statements;
+};
+
+class SwitchStmt : public Stmt {
+public:
+    SwitchStmt(std::unique_ptr<Expr> discriminant, std::vector<SwitchCase> cases)
+        : discriminant_(std::move(discriminant)), cases_(std::move(cases)) {}
+
+    Expr* Discriminant() const noexcept { return discriminant_.get(); }
+    const std::vector<SwitchCase>& Cases() const noexcept { return cases_; }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::unique_ptr<Expr> discriminant_;
+    std::vector<SwitchCase> cases_;
+};
+
+class DebuggerStmt : public Stmt {
+public:
+    DebuggerStmt() = default;
+    void Accept(ASTVisitor* visitor) override;
+};
+
 class FunctionDeclStmt : public Stmt {
 public:
     FunctionDeclStmt(std::string_view name, std::vector<std::string> params, std::unique_ptr<BlockStmt> body)
@@ -687,6 +807,9 @@ public:
     virtual void VisitArrayLiteral(ArrayLiteralExpr* node) = 0;
     virtual void VisitIndexAccess(IndexAccessExpr* node) = 0;
     virtual void VisitIndexAssign(IndexAssignExpr* node) = 0;
+    virtual void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* node) = 0;
+    virtual void VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) = 0;
+    virtual void VisitUpdate(UpdateExpr* node) = 0;
     virtual void VisitConditional(ConditionalExpr* node) = 0;
     virtual void VisitTemplateLiteral(TemplateLiteralExpr* node) = 0;
     virtual void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) = 0;
@@ -703,7 +826,12 @@ public:
     virtual void VisitBlock(BlockStmt* node) = 0;
     virtual void VisitIf(IfStmt* node) = 0;
     virtual void VisitWhile(WhileStmt* node) = 0;
+    virtual void VisitDoWhile(DoWhileStmt* node) = 0;
     virtual void VisitFor(ForStmt* node) = 0;
+    virtual void VisitBreak(BreakStmt* node) = 0;
+    virtual void VisitContinue(ContinueStmt* node) = 0;
+    virtual void VisitSwitch(SwitchStmt* node) = 0;
+    virtual void VisitDebugger(DebuggerStmt* node) = 0;
     virtual void VisitFunctionDecl(FunctionDeclStmt* node) = 0;
     virtual void VisitClassDecl(ClassDeclStmt* node) = 0;
     virtual void VisitImportDecl(ImportDeclStmt* node) = 0;
@@ -728,6 +856,9 @@ inline void ObjectLiteralExpr::Accept(ASTVisitor* v) { v->VisitObjectLiteral(thi
 inline void ArrayLiteralExpr::Accept(ASTVisitor* v) { v->VisitArrayLiteral(this); }
 inline void IndexAccessExpr::Accept(ASTVisitor* v) { v->VisitIndexAccess(this); }
 inline void IndexAssignExpr::Accept(ASTVisitor* v) { v->VisitIndexAssign(this); }
+inline void CompoundPropertyAssignExpr::Accept(ASTVisitor* v) { v->VisitCompoundPropertyAssign(this); }
+inline void CompoundIndexAssignExpr::Accept(ASTVisitor* v) { v->VisitCompoundIndexAssign(this); }
+inline void UpdateExpr::Accept(ASTVisitor* v) { v->VisitUpdate(this); }
 inline void ConditionalExpr::Accept(ASTVisitor* v) { v->VisitConditional(this); }
 inline void TemplateLiteralExpr::Accept(ASTVisitor* v) { v->VisitTemplateLiteral(this); }
 inline void OptionalPropertyAccessExpr::Accept(ASTVisitor* v) { v->VisitOptionalPropertyAccess(this); }
@@ -743,7 +874,12 @@ inline void VarDeclStmt::Accept(ASTVisitor* v) { v->VisitVarDecl(this); }
 inline void BlockStmt::Accept(ASTVisitor* v) { v->VisitBlock(this); }
 inline void IfStmt::Accept(ASTVisitor* v) { v->VisitIf(this); }
 inline void WhileStmt::Accept(ASTVisitor* v) { v->VisitWhile(this); }
+inline void DoWhileStmt::Accept(ASTVisitor* v) { v->VisitDoWhile(this); }
 inline void ForStmt::Accept(ASTVisitor* v) { v->VisitFor(this); }
+inline void BreakStmt::Accept(ASTVisitor* v) { v->VisitBreak(this); }
+inline void ContinueStmt::Accept(ASTVisitor* v) { v->VisitContinue(this); }
+inline void SwitchStmt::Accept(ASTVisitor* v) { v->VisitSwitch(this); }
+inline void DebuggerStmt::Accept(ASTVisitor* v) { v->VisitDebugger(this); }
 inline void FunctionDeclStmt::Accept(ASTVisitor* v) { v->VisitFunctionDecl(this); }
 inline void ClassDeclStmt::Accept(ASTVisitor* v) { v->VisitClassDecl(this); }
 inline void ImportDeclStmt::Accept(ASTVisitor* v) { v->VisitImportDecl(this); }

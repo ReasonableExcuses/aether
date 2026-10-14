@@ -44,6 +44,14 @@ enum class TokenKind {
     InstanceOf,
     In,
     Delete,
+    Switch,
+    Case,
+    Do,
+    Void,
+    Debugger,
+    With,
+    Super,
+    Static,
 
     // Operators & Punctuators
     OpenParen,          // (
@@ -68,6 +76,10 @@ enum class TokenKind {
     MinusEqual,         // -=
     StarEqual,          // *=
     SlashEqual,         // /=
+    PercentEqual,       // %=
+
+    StarStar,           // **
+    StarStarEqual,      // **=
 
     EqualEqual,         // ==
     StrictEqual,        // ===
@@ -87,6 +99,13 @@ enum class TokenKind {
     BarBar,             // ||
     LessLess,           // <<
     GreaterGreater,     // >>
+    GreaterGreaterGreater,      // >>>
+    LessLessEqual,              // <<=
+    GreaterGreaterEqual,        // >>=
+    GreaterGreaterGreaterEqual, // >>>=
+    AmpersandEqual,             // &=
+    BarEqual,                   // |=
+    CaretEqual,                 // ^=
     PlusPlus,           // ++
     MinusMinus,         // --
 
@@ -106,6 +125,7 @@ enum class TokenKind {
     Import,                 // import
     Export,                 // export
     Default,                // default
+    Hash,                   // #
 };
 
 const char* TokenKindToString(TokenKind kind);
@@ -121,6 +141,7 @@ struct Token {
     double number_value{0.0};
     bool is_integer{false};
     int32_t int_value{0};
+    bool is_bigint{false};
     SourceLocation location;
     std::vector<std::string> template_quasis;
     std::vector<std::string> template_exprs;

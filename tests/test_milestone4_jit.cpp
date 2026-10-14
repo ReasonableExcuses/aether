@@ -306,7 +306,28 @@ void TestBaselineJITTypeGuardsAndOverflow() {
     TaggedValue res_div_zero = interp.Execute(*div_bc, { TaggedValue::FromSmi(1), TaggedValue::FromSmi(0) });
     assert(res_div_zero.IsDouble() && std::isinf(res_div_zero.AsDouble()));
 
-    std::cout << "  -> Baseline JIT type guards, overflow checks, and deoptimization fallback verified.\n" << std::flush;
+    // 0 / -1 in JS produces -0.0, which deopts to double -0.0
+    TaggedValue res_div_negzero = interp.Execute(*div_bc, { TaggedValue::FromSmi(0), TaggedValue::FromSmi(-1) });
+    assert(res_div_negzero.IsDouble() && res_div_negzero.AsDouble() == 0.0 && std::signbit(res_div_negzero.AsDouble()));
+
+    // 5. Multiplication: 0 * -1 produces -0.0, which deopts to double -0.0
+    const char* mul_src =
+        "function mulNums(a, b) {\n"
+        "    return a * b;\n"
+        "}\n";
+    Lexer lexer_mul(mul_src);
+    Parser parser_mul(lexer_mul);
+    auto mul_decl = parser_mul.ParseStatement();
+    auto mul_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(mul_decl.get()));
+    for (uint32_t i = 0; i < BaselineJIT::kInvocationThreshold + 5; ++i) {
+        interp.Execute(*mul_bc, { TaggedValue::FromSmi(3), TaggedValue::FromSmi(4) });
+    }
+    assert(mul_bc->GetTier1Code() != nullptr);
+
+    TaggedValue res_mul_negzero = interp.Execute(*mul_bc, { TaggedValue::FromSmi(0), TaggedValue::FromSmi(-1) });
+    assert(res_mul_negzero.IsDouble() && res_mul_negzero.AsDouble() == 0.0 && std::signbit(res_mul_negzero.AsDouble()));
+
+    std::cout << "  -> Baseline JIT type guards, overflow checks, -0.0 preservation, and deoptimization fallback verified.\n" << std::flush;
 }
 
 int main() {

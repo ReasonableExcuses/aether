@@ -184,6 +184,9 @@ public:
     // ECMAScript ToBoolean conversion
     bool ToBoolean() const noexcept;
 
+    // ECMAScript ToNumber conversion
+    double ToDouble() const;
+
     // Diagnostic stringification
     std::string ToString() const;
 

@@ -26,6 +26,11 @@ public:
         }
         node->Value()->Accept(this);
     }
+    void VisitUpdate(UpdateExpr* node) override {
+        if (inside_nested_function) {
+            identifiers_in_nested_functions.insert(node->Name());
+        }
+    }
     void VisitPropertyAccess(PropertyAccessExpr* node) override { node->Object()->Accept(this); }
     void VisitPropertyAssign(PropertyAssignExpr* node) override {
         node->Object()->Accept(this);
@@ -62,6 +67,15 @@ public:
         node->Object()->Accept(this);
         node->Index()->Accept(this);
         node->Value()->Accept(this);
+    }
+    void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* node) override {
+        if (node->Object()) node->Object()->Accept(this);
+        node->Rhs()->Accept(this);
+    }
+    void VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) override {
+        node->Object()->Accept(this);
+        node->Index()->Accept(this);
+        node->Rhs()->Accept(this);
     }
     void VisitConditional(ConditionalExpr* node) override {
         node->Condition()->Accept(this);
@@ -107,12 +121,26 @@ public:
         node->Condition()->Accept(this);
         node->Body()->Accept(this);
     }
+    void VisitDoWhile(DoWhileStmt* node) override {
+        node->Body()->Accept(this);
+        node->Condition()->Accept(this);
+    }
     void VisitFor(ForStmt* node) override {
         if (node->Init()) node->Init()->Accept(this);
         if (node->Cond()) node->Cond()->Accept(this);
         if (node->Update()) node->Update()->Accept(this);
         node->Body()->Accept(this);
     }
+    void VisitBreak(BreakStmt*) override {}
+    void VisitContinue(ContinueStmt*) override {}
+    void VisitSwitch(SwitchStmt* node) override {
+        node->Discriminant()->Accept(this);
+        for (const auto& c : node->Cases()) {
+            if (c.test) c.test->Accept(this);
+            for (const auto& s : c.statements) s->Accept(this);
+        }
+    }
+    void VisitDebugger(DebuggerStmt*) override {}
     void VisitFunctionDecl(FunctionDeclStmt* node) override {
         bool prev = inside_nested_function;
         inside_nested_function = true;
@@ -162,43 +190,34 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
         }
     }
 
-    if (auto* block = dynamic_cast<BlockStmt*>(body)) {
-        for (const auto& stmt : block->Statements()) {
-            if (auto* v = dynamic_cast<VarDeclStmt*>(stmt.get())) {
-                if (scanner.identifiers_in_nested_functions.count(v->Name())) {
-                    if (!context_slots_.count(v->Name())) {
-                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
-                        context_slots_[v->Name()] = slot;
-                    }
-                }
-            } else if (auto* f = dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
-                if (scanner.identifiers_in_nested_functions.count(f->Name())) {
-                    if (!context_slots_.count(f->Name())) {
-                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
-                        context_slots_[f->Name()] = slot;
-                    }
+    auto collect_decls = [&](auto& self, ASTNode* s) -> void {
+        if (!s) return;
+        if (auto* v = dynamic_cast<VarDeclStmt*>(s)) {
+            if (scanner.identifiers_in_nested_functions.count(v->Name())) {
+                if (!context_slots_.count(v->Name())) {
+                    uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                    context_slots_[v->Name()] = slot;
                 }
             }
-        }
-    } else if (auto* prog = dynamic_cast<Program*>(body)) {
-        for (const auto& stmt : prog->Statements()) {
-            if (auto* v = dynamic_cast<VarDeclStmt*>(stmt.get())) {
-                if (scanner.identifiers_in_nested_functions.count(v->Name())) {
-                    if (!context_slots_.count(v->Name())) {
-                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
-                        context_slots_[v->Name()] = slot;
-                    }
-                }
-            } else if (auto* f = dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
-                if (scanner.identifiers_in_nested_functions.count(f->Name())) {
-                    if (!context_slots_.count(f->Name())) {
-                        uint16_t slot = static_cast<uint16_t>(context_slots_.size());
-                        context_slots_[f->Name()] = slot;
-                    }
+        } else if (auto* f = dynamic_cast<FunctionDeclStmt*>(s)) {
+            if (scanner.identifiers_in_nested_functions.count(f->Name())) {
+                if (!context_slots_.count(f->Name())) {
+                    uint16_t slot = static_cast<uint16_t>(context_slots_.size());
+                    context_slots_[f->Name()] = slot;
                 }
             }
+        } else if (auto* b = dynamic_cast<BlockStmt*>(s)) {
+            for (const auto& child : b->Statements()) {
+                self(self, child.get());
+            }
+        } else if (auto* prog = dynamic_cast<Program*>(s)) {
+            for (const auto& child : prog->Statements()) {
+                self(self, child.get());
+            }
         }
-    }
+    };
+
+    collect_decls(collect_decls, body);
 }
 
 BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view name) {
@@ -587,6 +606,9 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
         case UnaryOp::TypeOf:
             bytecode_->EmitOpcode(Opcode::TypeOf);
             break;
+        case UnaryOp::Void:
+            bytecode_->EmitOpcode(Opcode::LdaUndefined);
+            break;
         case UnaryOp::Delete:
             break;
     }
@@ -636,6 +658,110 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         return;
     }
     assert(false && "Assignment to undeclared variable");
+}
+
+void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
+    auto res = ResolveVariable(node->Name());
+    if (res.kind == VarResolution::ImportedBinding) {
+        throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Name() + "'");
+    }
+
+    if (res.kind == VarResolution::LocalReg) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res.reg);
+    } else if (res.kind == VarResolution::ContextSlot) {
+        bytecode_->EmitOpcode(Opcode::LdaContextSlot);
+        bytecode_->EmitU8(res.depth);
+        bytecode_->EmitU16(res.slot);
+    } else if (res.kind == VarResolution::ModuleLocal) {
+        uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+        uint8_t obj_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(obj_const);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(obj_reg);
+
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+        FreeRegister(obj_reg);
+    } else {
+        assert(false && "Update of undeclared variable");
+    }
+
+    uint8_t old_reg = 0;
+    if (!node->IsPrefix()) {
+        old_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(old_reg);
+    }
+
+    uint8_t lhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(lhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::LdaSmi);
+    bytecode_->EmitI32(1);
+    uint8_t rhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(rhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::Ldar);
+    bytecode_->EmitU8(lhs_reg);
+
+    uint16_t op_slot = next_feedback_slot_++;
+    if (node->Op() == UpdateOp::Increment) {
+        bytecode_->EmitOpcode(Opcode::Add);
+    } else {
+        bytecode_->EmitOpcode(Opcode::Sub);
+    }
+    bytecode_->EmitU8(rhs_reg);
+    bytecode_->EmitU16(op_slot);
+
+    FreeRegister(rhs_reg);
+    FreeRegister(lhs_reg);
+
+    if (res.kind == VarResolution::LocalReg) {
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(res.reg);
+    } else if (res.kind == VarResolution::ContextSlot) {
+        bytecode_->EmitOpcode(Opcode::StaContextSlot);
+        bytecode_->EmitU8(res.depth);
+        bytecode_->EmitU16(res.slot);
+    } else if (res.kind == VarResolution::ModuleLocal) {
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+
+        uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+        uint8_t env_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(obj_const);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(env_reg);
+
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+        uint16_t slot = next_feedback_slot_++;
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(env_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+
+        FreeRegister(env_reg);
+        FreeRegister(val_reg);
+    }
+
+    if (!node->IsPrefix()) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(old_reg);
+        FreeRegister(old_reg);
+    }
 }
 
 void BytecodeEmitter::VisitPropertyAccess(PropertyAccessExpr* node) {
@@ -956,6 +1082,267 @@ void BytecodeEmitter::VisitIndexAssign(IndexAssignExpr* node) {
     FreeRegister(obj_reg);
 }
 
+void BytecodeEmitter::EmitBinaryOp(BinaryOp op, uint8_t rhs_reg) {
+    uint16_t slot = next_feedback_slot_++;
+    switch (op) {
+        case BinaryOp::Add:
+            bytecode_->EmitOpcode(Opcode::Add);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::Sub:
+            bytecode_->EmitOpcode(Opcode::Sub);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::Mul:
+            bytecode_->EmitOpcode(Opcode::Mul);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::Div:
+            bytecode_->EmitOpcode(Opcode::Div);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::Mod:
+            bytecode_->EmitOpcode(Opcode::Mod);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::Exp:
+            bytecode_->EmitOpcode(Opcode::Exp);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
+        case BinaryOp::BitwiseAnd:
+            bytecode_->EmitOpcode(Opcode::BitwiseAnd);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::BitwiseOr:
+            bytecode_->EmitOpcode(Opcode::BitwiseOr);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::BitwiseXor:
+            bytecode_->EmitOpcode(Opcode::BitwiseXor);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::ShiftLeft:
+            bytecode_->EmitOpcode(Opcode::ShiftLeft);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::ShiftRight:
+            bytecode_->EmitOpcode(Opcode::ShiftRight);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::ShiftRightUnsigned:
+            bytecode_->EmitOpcode(Opcode::ShiftRightUnsigned);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        default:
+            break;
+    }
+}
+
+void BytecodeEmitter::VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Property())));
+    uint16_t lda_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaNamed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+    bytecode_->EmitU16(lda_slot);
+
+    if (node->Op() == BinaryOp::LogicalAnd) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfFalse, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::LogicalOr) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::NullishCoalescing) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfNotNullish, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else {
+        uint8_t cur_val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(cur_val_reg);
+
+        node->Rhs()->Accept(this);
+        uint8_t rhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rhs_reg);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(cur_val_reg);
+
+        EmitBinaryOp(node->Op(), rhs_reg);
+
+        uint8_t res_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(res_reg);
+
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(sta_slot);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res_reg);
+
+        FreeRegister(res_reg);
+        FreeRegister(rhs_reg);
+        FreeRegister(cur_val_reg);
+    }
+
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    node->Index()->Accept(this);
+    uint8_t key_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(key_reg);
+
+    uint16_t lda_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(key_reg);
+    bytecode_->EmitU16(lda_slot);
+
+    if (node->Op() == BinaryOp::LogicalAnd) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfFalse, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaKeyed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU8(key_reg);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::LogicalOr) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaKeyed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU8(key_reg);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::NullishCoalescing) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfNotNullish, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaKeyed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU8(key_reg);
+        bytecode_->EmitU16(sta_slot);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else {
+        uint8_t cur_val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(cur_val_reg);
+
+        node->Rhs()->Accept(this);
+        uint8_t rhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rhs_reg);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(cur_val_reg);
+
+        EmitBinaryOp(node->Op(), rhs_reg);
+
+        uint8_t res_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(res_reg);
+
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaKeyed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU8(key_reg);
+        bytecode_->EmitU16(sta_slot);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res_reg);
+
+        FreeRegister(res_reg);
+        FreeRegister(rhs_reg);
+        FreeRegister(cur_val_reg);
+    }
+
+    FreeRegister(key_reg);
+    FreeRegister(obj_reg);
+}
+
 void BytecodeEmitter::VisitConditional(ConditionalExpr* node) {
     node->Condition()->Accept(this);
     Label else_label;
@@ -991,6 +1378,11 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
         EmitJump(Opcode::JumpIfNotNullish, short_circuit);
         node->Rhs()->Accept(this);
         Bind(short_circuit);
+        return;
+    }
+    if (node->Op() == BinaryOp::Comma) {
+        node->Lhs()->Accept(this);
+        node->Rhs()->Accept(this);
         return;
     }
 
@@ -1038,6 +1430,11 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             bytecode_->EmitU8(rhs_reg);
             bytecode_->EmitU16(slot);
             break;
+        case BinaryOp::Exp:
+            bytecode_->EmitOpcode(Opcode::Exp);
+            bytecode_->EmitU8(rhs_reg);
+            bytecode_->EmitU16(slot);
+            break;
         case BinaryOp::BitwiseAnd:
             bytecode_->EmitOpcode(Opcode::BitwiseAnd);
             bytecode_->EmitU8(rhs_reg);
@@ -1056,6 +1453,10 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             break;
         case BinaryOp::ShiftRight:
             bytecode_->EmitOpcode(Opcode::ShiftRight);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::ShiftRightUnsigned:
+            bytecode_->EmitOpcode(Opcode::ShiftRightUnsigned);
             bytecode_->EmitU8(rhs_reg);
             break;
         case BinaryOp::Equal:
@@ -1209,9 +1610,27 @@ void BytecodeEmitter::VisitWhile(WhileStmt* node) {
     node->Condition()->Accept(this);
     EmitJump(Opcode::JumpIfFalse, loop_exit);
 
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &loop_header});
     node->Body()->Accept(this);
-    EmitJump(Opcode::Jump, loop_header);
+    breakable_scopes_.pop_back();
 
+    EmitJump(Opcode::Jump, loop_header);
+    Bind(loop_exit);
+}
+
+void BytecodeEmitter::VisitDoWhile(DoWhileStmt* node) {
+    Label loop_header;
+    Label loop_exit;
+    Label cond_label;
+
+    Bind(loop_header);
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &cond_label});
+    node->Body()->Accept(this);
+    breakable_scopes_.pop_back();
+
+    Bind(cond_label);
+    node->Condition()->Accept(this);
+    EmitJump(Opcode::JumpIfTrue, loop_header);
     Bind(loop_exit);
 }
 
@@ -1222,6 +1641,7 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
 
     Label loop_header;
     Label loop_exit;
+    Label continue_label;
 
     Bind(loop_header);
     if (node->Cond()) {
@@ -1229,8 +1649,11 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
         EmitJump(Opcode::JumpIfFalse, loop_exit);
     }
 
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &continue_label});
     node->Body()->Accept(this);
+    breakable_scopes_.pop_back();
 
+    Bind(continue_label);
     if (node->Update()) {
         node->Update()->Accept(this);
     }
@@ -1239,9 +1662,95 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
     Bind(loop_exit);
 }
 
+void BytecodeEmitter::VisitBreak(BreakStmt* node) {
+    for (auto it = breakable_scopes_.rbegin(); it != breakable_scopes_.rend(); ++it) {
+        if (node->Label().empty() || it->label == node->Label()) {
+            if (it->break_label) {
+                EmitJump(Opcode::Jump, *it->break_label);
+                return;
+            }
+        }
+    }
+}
+
+void BytecodeEmitter::VisitContinue(ContinueStmt* node) {
+    for (auto it = breakable_scopes_.rbegin(); it != breakable_scopes_.rend(); ++it) {
+        if (it->kind == BreakableScope::Kind::Loop) {
+            if (node->Label().empty() || it->label == node->Label()) {
+                if (it->continue_label) {
+                    EmitJump(Opcode::Jump, *it->continue_label);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+void BytecodeEmitter::VisitSwitch(SwitchStmt* node) {
+    node->Discriminant()->Accept(this);
+    uint8_t disc_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(disc_reg);
+
+    const auto& cases = node->Cases();
+    std::vector<Label> body_labels(cases.size());
+    Label default_label;
+    Label switch_exit;
+    int default_idx = -1;
+
+    for (size_t i = 0; i < cases.size(); ++i) {
+        if (cases[i].test) {
+            cases[i].test->Accept(this);
+            uint8_t test_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(test_reg);
+
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(disc_reg);
+            bytecode_->EmitOpcode(Opcode::TestStrictEqual);
+            bytecode_->EmitU8(test_reg);
+            FreeRegister(test_reg);
+
+            EmitJump(Opcode::JumpIfTrue, body_labels[i]);
+        } else {
+            default_idx = static_cast<int>(i);
+        }
+    }
+
+    if (default_idx != -1) {
+        EmitJump(Opcode::Jump, default_label);
+    } else {
+        EmitJump(Opcode::Jump, switch_exit);
+    }
+
+    breakable_scopes_.push_back({BreakableScope::Kind::Switch, "", &switch_exit, nullptr});
+
+    for (size_t i = 0; i < cases.size(); ++i) {
+        Bind(body_labels[i]);
+        if (static_cast<int>(i) == default_idx) {
+            Bind(default_label);
+        }
+        for (const auto& stmt : cases[i].statements) {
+            stmt->Accept(this);
+        }
+    }
+
+    breakable_scopes_.pop_back();
+
+    Bind(switch_exit);
+    FreeRegister(disc_reg);
+}
+
+void BytecodeEmitter::VisitDebugger(DebuggerStmt*) {
+    bytecode_->EmitOpcode(Opcode::Debugger);
+}
+
 void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
     // 1. Allocate function object placeholder and register for recursive lookups
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
+    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+        fn_obj->SetPrototype(Realm::Current()->GetFunctionPrototype());
+    }
     fn_obj->SetGenerator(node->IsGenerator());
     fn_obj->SetAsync(node->IsAsync());
     functions_[node->Name()] = fn_obj;
@@ -1313,6 +1822,9 @@ void BytecodeEmitter::VisitNew(NewExpr* node) {
 
 void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
     auto* fn_obj = new JSFunction(node->Name(), nullptr);
+    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+        fn_obj->SetPrototype(Realm::Current()->GetFunctionPrototype());
+    }
     fn_obj->SetGenerator(node->IsGenerator());
     fn_obj->SetAsync(node->IsAsync());
 
@@ -1447,6 +1959,8 @@ void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
     Label catch_label;
     Label end_label;
 
+    try_stack_.push_back({true, node->FinallyBlock()});
+
     bytecode_->EmitOpcode(Opcode::PushExceptionHandler);
     size_t handler_patch_offset = bytecode_->CurrentOffset();
     catch_label.forward_jumps.push_back(handler_patch_offset);
@@ -1454,9 +1968,13 @@ void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
 
     node->TryBlock()->Accept(this);
     bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
+    try_stack_.back().has_handler = false;
 
     if (node->FinallyBlock()) {
+        try_stack_.pop_back();
         node->FinallyBlock()->Accept(this);
+    } else {
+        try_stack_.pop_back();
     }
     EmitJump(Opcode::Jump, end_label);
 
@@ -1468,7 +1986,13 @@ void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(err_reg);
         }
+        if (node->FinallyBlock()) {
+            try_stack_.push_back({false, node->FinallyBlock()});
+        }
         node->CatchBlock()->Accept(this);
+        if (node->FinallyBlock()) {
+            try_stack_.pop_back();
+        }
     }
     if (node->FinallyBlock()) {
         node->FinallyBlock()->Accept(this);
@@ -1482,6 +2006,24 @@ void BytecodeEmitter::VisitReturn(ReturnStmt* node) {
         node->Value()->Accept(this);
     } else {
         bytecode_->EmitOpcode(Opcode::LdaUndefined);
+    }
+    if (!try_stack_.empty()) {
+        uint8_t ret_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(ret_reg);
+
+        for (auto it = try_stack_.rbegin(); it != try_stack_.rend(); ++it) {
+            if (it->has_handler) {
+                bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
+            }
+            if (it->finally_block) {
+                it->finally_block->Accept(this);
+            }
+        }
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(ret_reg);
+        FreeRegister(ret_reg);
     }
     bytecode_->EmitOpcode(Opcode::Return);
 }

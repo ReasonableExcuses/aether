@@ -30,6 +30,33 @@ bool TaggedValue::ToBoolean() const noexcept {
     return false;
 }
 
+double TaggedValue::ToDouble() const {
+    if (IsSmi()) return static_cast<double>(AsSmi());
+    if (IsDouble()) return AsDouble();
+    if (IsBoolean()) return AsBoolean() ? 1.0 : 0.0;
+    if (IsNull()) return 0.0;
+    if (IsUndefined()) return std::numeric_limits<double>::quiet_NaN();
+    if (IsHeapObject()) {
+        HeapObject* obj = AsHeapObject();
+        if (obj->IsString()) {
+            std::string_view sv = static_cast<JSString*>(obj)->View();
+            size_t start = sv.find_first_not_of(" \t\n\r");
+            if (start == std::string_view::npos) return 0.0;
+            size_t end = sv.find_last_not_of(" \t\n\r");
+            std::string trimmed(sv.substr(start, end - start + 1));
+            try {
+                size_t idx = 0;
+                double val = std::stod(trimmed, &idx);
+                if (idx == trimmed.size()) return val;
+                return std::numeric_limits<double>::quiet_NaN();
+            } catch (...) {
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+        }
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
 bool TaggedValue::IsSymbol() const noexcept {
     return (raw_ & kTagMask) == kTagSymbol || (IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::Symbol);
 }

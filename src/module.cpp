@@ -48,6 +48,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Rhs()) n->Rhs()->Accept(this);
         }
         void VisitAssign(AssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
+        void VisitUpdate(UpdateExpr*) override {}
         void VisitPropertyAccess(PropertyAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
         void VisitPropertyAssign(PropertyAssignExpr* n) override {
             if (n->Object()) n->Object()->Accept(this);
@@ -79,6 +80,15 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Object()) n->Object()->Accept(this);
             if (n->Index()) n->Index()->Accept(this);
             if (n->Value()) n->Value()->Accept(this);
+        }
+        void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* n) override {
+            if (n->Object()) n->Object()->Accept(this);
+            if (n->Rhs()) n->Rhs()->Accept(this);
+        }
+        void VisitCompoundIndexAssign(CompoundIndexAssignExpr* n) override {
+            if (n->Object()) n->Object()->Accept(this);
+            if (n->Index()) n->Index()->Accept(this);
+            if (n->Rhs()) n->Rhs()->Accept(this);
         }
         void VisitConditional(ConditionalExpr* n) override {
             if (n->Condition()) n->Condition()->Accept(this);
@@ -115,12 +125,26 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Condition()) n->Condition()->Accept(this);
             if (n->Body()) n->Body()->Accept(this);
         }
+        void VisitDoWhile(DoWhileStmt* n) override {
+            if (n->Body()) n->Body()->Accept(this);
+            if (n->Condition()) n->Condition()->Accept(this);
+        }
         void VisitFor(ForStmt* n) override {
             if (n->Init()) n->Init()->Accept(this);
             if (n->Cond()) n->Cond()->Accept(this);
             if (n->Update()) n->Update()->Accept(this);
             if (n->Body()) n->Body()->Accept(this);
         }
+        void VisitBreak(BreakStmt*) override {}
+        void VisitContinue(ContinueStmt*) override {}
+        void VisitSwitch(SwitchStmt* n) override {
+            if (n->Discriminant()) n->Discriminant()->Accept(this);
+            for (const auto& c : n->Cases()) {
+                if (c.test) c.test->Accept(this);
+                for (const auto& s : c.statements) s->Accept(this);
+            }
+        }
+        void VisitDebugger(DebuggerStmt*) override {}
         void VisitFunctionDecl(FunctionDeclStmt*) override {} // Don't descend into nested functions!
         void VisitClassDecl(ClassDeclStmt*) override {}
         void VisitImportDecl(ImportDeclStmt*) override {}

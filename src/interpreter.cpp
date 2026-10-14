@@ -405,13 +405,14 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(sum));
                     }
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromDouble(acc_.AsNumber() + rhs.AsNumber());
-                } else {
+                } else if ((acc_.IsHeapObject() && acc_.AsHeapObject()->IsString()) ||
+                           (rhs.IsHeapObject() && rhs.AsHeapObject()->IsString())) {
                     // String concatenation
                     std::string s1 = acc_.ToString();
                     std::string s2 = rhs.ToString();
                     acc_ = TaggedValue::FromHeapObject(new JSString(s1 + s2));
+                } else {
+                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() + rhs.ToDouble());
                 }
                 break;
             }
@@ -434,8 +435,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(diff));
                     }
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromDouble(acc_.AsNumber() - rhs.AsNumber());
+                } else {
+                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() - rhs.ToDouble());
                 }
                 break;
             }
@@ -455,11 +456,13 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     int64_t prod = static_cast<int64_t>(acc_.AsSmi()) * rhs.AsSmi();
                     if (AETHER_LIKELY(prod <= INT32_MAX && prod >= INT32_MIN && !(prod == 0 && (acc_.AsSmi() < 0 || rhs.AsSmi() < 0)))) {
                         acc_ = TaggedValue::FromSmi(static_cast<int32_t>(prod));
+                    } else if (prod == 0 && (acc_.AsSmi() < 0 || rhs.AsSmi() < 0)) {
+                        acc_ = TaggedValue::FromDouble(-0.0);
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(prod));
                     }
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromDouble(acc_.AsNumber() * rhs.AsNumber());
+                } else {
+                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() * rhs.ToDouble());
                 }
                 break;
             }
@@ -478,8 +481,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(n) / static_cast<double>(d));
                     }
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromDouble(acc_.AsNumber() / rhs.AsNumber());
+                } else {
+                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() / rhs.ToDouble());
                 }
                 break;
             }
@@ -492,9 +495,21 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi() && rhs.AsSmi() != 0)) {
                     acc_ = TaggedValue::FromSmi(acc_.AsSmi() % rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromDouble(std::fmod(acc_.AsNumber(), rhs.AsNumber()));
+                } else {
+                    acc_ = TaggedValue::FromDouble(std::fmod(acc_.ToDouble(), rhs.ToDouble()));
                 }
+                break;
+            }
+            case Opcode::Exp: {
+                uint8_t reg = *pc++;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+
+                TaggedValue rhs = frame.GetRegister(reg);
+                double base = acc_.IsSmi() ? acc_.AsSmi() : (acc_.IsNumber() ? acc_.AsNumber() : 0.0);
+                double exp = rhs.IsSmi() ? rhs.AsSmi() : (rhs.IsNumber() ? rhs.AsNumber() : 0.0);
+                acc_ = TaggedValue::FromDouble(std::pow(base, exp));
                 break;
             }
             case Opcode::BitwiseAnd: {
@@ -537,7 +552,42 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 acc_ = TaggedValue::FromSmi(a >> shift);
                 break;
             }
-            case Opcode::TestEqual:
+            case Opcode::ShiftRightUnsigned: {
+                uint8_t reg = *pc++;
+                TaggedValue rhs = frame.GetRegister(reg);
+                uint32_t a = static_cast<uint32_t>(acc_.IsSmi() ? acc_.AsSmi() : (acc_.IsNumber() ? static_cast<int64_t>(acc_.AsNumber()) : 0));
+                uint32_t shift = (rhs.IsSmi() ? rhs.AsSmi() : (rhs.IsNumber() ? static_cast<int32_t>(rhs.AsNumber()) : 0)) & 0x1F;
+                uint32_t res = a >> shift;
+                if (res <= static_cast<uint32_t>(INT32_MAX)) {
+                    acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
+                } else {
+                    acc_ = TaggedValue::FromDouble(static_cast<double>(res));
+                }
+                break;
+            }
+            case Opcode::TestEqual: {
+                uint8_t reg = *pc++;
+                TaggedValue rhs = frame.GetRegister(reg);
+                if (acc_.IsSmi() && rhs.IsSmi()) {
+                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() == rhs.AsSmi());
+                } else if (acc_.IsNumber() && rhs.IsNumber()) {
+                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() == rhs.AsNumber());
+                } else if ((acc_.IsNull() || acc_.IsUndefined()) && (rhs.IsNull() || rhs.IsUndefined())) {
+                    acc_ = TaggedValue::FromBoolean(true);
+                } else if (acc_.IsHeapObject() && rhs.IsHeapObject() &&
+                           acc_.AsHeapObject()->IsString() && rhs.AsHeapObject()->IsString()) {
+                    auto* s1 = static_cast<JSString*>(acc_.AsHeapObject());
+                    auto* s2 = static_cast<JSString*>(rhs.AsHeapObject());
+                    acc_ = TaggedValue::FromBoolean(s1->View() == s2->View());
+                } else if ((acc_.IsNumber() || acc_.IsBoolean()) && (rhs.IsString() || rhs.IsBoolean())) {
+                    acc_ = TaggedValue::FromBoolean(acc_.ToDouble() == rhs.ToDouble());
+                } else if (acc_.IsString() && (rhs.IsNumber() || rhs.IsBoolean())) {
+                    acc_ = TaggedValue::FromBoolean(acc_.ToDouble() == rhs.ToDouble());
+                } else {
+                    acc_ = TaggedValue::FromBoolean(acc_ == rhs);
+                }
+                break;
+            }
             case Opcode::TestStrictEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
@@ -970,13 +1020,15 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             case Opcode::Negate: {
                 if (AETHER_LIKELY(acc_.IsSmi())) {
                     int32_t val = acc_.AsSmi();
-                    if (AETHER_LIKELY(val != INT32_MIN)) {
+                    if (val == 0) {
+                        acc_ = TaggedValue::FromDouble(-0.0);
+                    } else if (AETHER_LIKELY(val != INT32_MIN)) {
                         acc_ = TaggedValue::FromSmi(-val);
                     } else {
                         acc_ = TaggedValue::FromDouble(-static_cast<double>(val));
                     }
-                } else if (acc_.IsDouble()) {
-                    acc_ = TaggedValue::FromDouble(-acc_.AsDouble());
+                } else {
+                    acc_ = TaggedValue::FromDouble(-acc_.ToDouble());
                 }
                 break;
             }
@@ -1012,6 +1064,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             }
             case Opcode::CreateObject: {
                 auto* obj = new JSObject(GetRootShape());
+                if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
+                    obj->SetPrototype(Realm::Current()->GetObjectPrototype());
+                }
                 acc_ = TaggedValue::FromHeapObject(obj);
                 break;
             }
@@ -1391,7 +1446,11 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 auto* closure = new JSFunction(proto_fn->Name(), 
                                                proto_fn->GetSharedBytecode() ? proto_fn->GetSharedBytecode() : std::shared_ptr<const BytecodeArray>(proto_fn->GetBytecode(), [](const BytecodeArray*){}), 
                                                frame.GetEnvironment());
-                closure->SetPrototype(proto_fn->GetPrototype());
+                if (proto_fn->GetPrototype()) {
+                    closure->SetPrototype(proto_fn->GetPrototype());
+                } else if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+                    closure->SetPrototype(Realm::Current()->GetFunctionPrototype());
+                }
                 closure->SetGenerator(proto_fn->IsGenerator());
                 closure->SetAsync(proto_fn->IsAsync());
                 acc_ = TaggedValue::FromHeapObject(closure);
@@ -1730,6 +1789,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     return yielded_val;
                 }
                 acc_ = TaggedValue::Undefined();
+                break;
+            }
+            case Opcode::Debugger: {
+                // Breakpoint hook / no-op in normal execution
                 break;
             }
             case Opcode::Return: {

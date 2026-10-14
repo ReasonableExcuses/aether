@@ -18,6 +18,7 @@ bool BaselineJIT::CanCompile(const BytecodeArray& bytecode) {
             case Opcode::LdaTrue:
             case Opcode::LdaFalse:
             case Opcode::LogicalNot:
+            case Opcode::Debugger:
             case Opcode::Return:
                 break;
             case Opcode::LdaSmi:
@@ -179,6 +180,15 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.Movsxd(X86Reg::R8, X86Reg::RCX);
                 masm.ImulRegReg32(X86Reg::RDX, X86Reg::R8);
                 masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                // In ECMAScript, 0 * negative produces -0.0, which cannot be represented as Smi
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                JITLabel not_zero_prod;
+                masm.Jcc(Condition::NotEqual, not_zero_prod);
+                masm.MovRegReg32(X86Reg::R8, X86Reg::RAX);
+                masm.OrRegReg32(X86Reg::R8, X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::R8, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.Bind(not_zero_prod);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
                 masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
@@ -194,6 +204,13 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.CmpRegImm32(X86Reg::RDX, 0);
                 masm.Jcc(Condition::Equal, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
+                // In ECMAScript, 0 / negative produces -0.0, which cannot be represented as Smi
+                masm.CmpRegImm32(X86Reg::RAX, 0);
+                JITLabel not_zero_div;
+                masm.Jcc(Condition::NotEqual, not_zero_div);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.Bind(not_zero_div);
                 masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
                 JITLabel not_min;
                 masm.Jcc(Condition::NotEqual, not_min);
@@ -405,6 +422,9 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.Bind(was_truthy);
                 masm.MovRegImm64(X86Reg::RAX, TaggedValue::False().RawBits());
                 masm.Bind(done);
+                break;
+            }
+            case Opcode::Debugger: {
                 break;
             }
             case Opcode::Return: {

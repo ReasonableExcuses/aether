@@ -127,6 +127,10 @@ public:
     void SetNumberPrototype(JSObject* proto) noexcept { number_prototype_ = proto; }
     JSObject* GetDatePrototype() const noexcept { return date_prototype_; }
     void SetDatePrototype(JSObject* proto) noexcept { date_prototype_ = proto; }
+    JSObject* GetObjectPrototype() const noexcept { return object_prototype_; }
+    void SetObjectPrototype(JSObject* proto) noexcept { object_prototype_ = proto; }
+    JSObject* GetFunctionPrototype() const noexcept { return function_prototype_; }
+    void SetFunctionPrototype(JSObject* proto) noexcept { function_prototype_ = proto; }
     uint32_t& NextShapeId() noexcept { return next_shape_id_; }
     void RegisterRootValue(std::unique_ptr<TaggedValue> val) {
         if (heap_) heap_->RegisterExtraRoot(val.get());
@@ -165,6 +169,8 @@ private:
     JSObject* data_view_prototype_{nullptr};
     JSObject* generator_prototype_{nullptr};
     JSObject* async_generator_prototype_{nullptr};
+    JSObject* object_prototype_{nullptr};
+    JSObject* function_prototype_{nullptr};
     TaggedValue symbol_iterator_{TaggedValue::Undefined()};
     TaggedValue symbol_asyncIterator_{TaggedValue::Undefined()};
     TaggedValue symbol_toStringTag_{TaggedValue::Undefined()};
@@ -177,13 +183,21 @@ inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType ca
     : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
       name_(name),
       callback_(std::move(callback)),
-      method_callback_(nullptr) {}
+      method_callback_(nullptr) {
+    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+        SetPrototype(Realm::Current()->GetFunctionPrototype());
+    }
+}
 
 inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape)
     : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
       name_(name),
       callback_(nullptr),
-      method_callback_(std::move(method_callback)) {}
+      method_callback_(std::move(method_callback)) {
+    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+        SetPrototype(Realm::Current()->GetFunctionPrototype());
+    }
+}
 
 class EventLoop;
 class ModuleLoader;

@@ -42,6 +42,9 @@ public:
     void VisitArrayLiteral(ArrayLiteralExpr* node) override;
     void VisitIndexAccess(IndexAccessExpr* node) override;
     void VisitIndexAssign(IndexAssignExpr* node) override;
+    void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* node) override;
+    void VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) override;
+    void VisitUpdate(UpdateExpr* node) override;
     void VisitConditional(ConditionalExpr* node) override;
     void VisitTemplateLiteral(TemplateLiteralExpr* node) override;
     void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) override;
@@ -58,7 +61,12 @@ public:
     void VisitBlock(BlockStmt* node) override;
     void VisitIf(IfStmt* node) override;
     void VisitWhile(WhileStmt* node) override;
+    void VisitDoWhile(DoWhileStmt* node) override;
     void VisitFor(ForStmt* node) override;
+    void VisitBreak(BreakStmt* node) override;
+    void VisitContinue(ContinueStmt* node) override;
+    void VisitSwitch(SwitchStmt* node) override;
+    void VisitDebugger(DebuggerStmt* node) override;
     void VisitFunctionDecl(FunctionDeclStmt* node) override;
     void VisitClassDecl(ClassDeclStmt* node) override;
     void VisitImportDecl(ImportDeclStmt* node) override;
@@ -96,16 +104,31 @@ public:
     void* GetModuleRecord() const noexcept { return current_module_; }
 
 private:
+    struct BreakableScope {
+        enum class Kind { Loop, Switch };
+        Kind kind;
+        std::string label;
+        Label* break_label{nullptr};
+        Label* continue_label{nullptr};
+    };
+
     std::unique_ptr<BytecodeArray> bytecode_;
     std::unordered_map<std::string, uint8_t> scope_;
     std::unordered_map<std::string, uint16_t> context_slots_;
     std::vector<bool> register_in_use_;
+    std::vector<BreakableScope> breakable_scopes_;
+    struct TryContext {
+        bool has_handler{false};
+        Stmt* finally_block{nullptr};
+    };
+    std::vector<TryContext> try_stack_;
     uint8_t max_registers_{0};
     uint16_t next_feedback_slot_{0};
     void* current_module_{nullptr};
 
     // Function lookup
     JSFunction* LookupFunction(std::string_view name);
+    void EmitBinaryOp(BinaryOp op, uint8_t rhs_reg);
 
     BytecodeEmitter* parent_emitter_{nullptr};
     std::unordered_map<std::string, JSFunction*> functions_;

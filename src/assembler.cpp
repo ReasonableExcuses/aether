@@ -270,6 +270,13 @@ void MacroAssembler::CmpRegReg(X86Reg r1, X86Reg r2) {
 }
 
 void MacroAssembler::CmpRegImm32(X86Reg r, int32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(7), r);
+    Emit8(0x81); // cmp r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(7), r);
+    Emit32(static_cast<uint32_t>(imm));
+}
+
+void MacroAssembler::CmpRegImm64(X86Reg r, int32_t imm) {
     EmitRex(true, static_cast<X86Reg>(7), r);
     Emit8(0x81); // cmp r/m64, imm32
     EmitModRM(0b11, static_cast<X86Reg>(7), r);

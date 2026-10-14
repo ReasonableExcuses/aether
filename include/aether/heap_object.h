@@ -372,7 +372,7 @@ public:
     void SetLength(size_t len) { elements_.resize(len, TaggedValue::Undefined()); }
 
     TaggedValue GetElement(size_t index) const {
-        if (index < elements_.size()) {
+        if (index < elements_.size() && !elements_[index].IsEmpty()) {
             return elements_[index];
         }
         return TaggedValue::Undefined();
@@ -380,7 +380,7 @@ public:
 
     void SetElement(size_t index, TaggedValue val) {
         if (index >= elements_.size()) {
-            elements_.resize(index + 1, TaggedValue::Undefined());
+            elements_.resize(index + 1, TaggedValue::Empty());
         }
         elements_[index] = val;
         if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {

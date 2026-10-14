@@ -41,11 +41,21 @@ Token Parser::Consume(TokenKind kind, std::string_view error_message) {
 
 Precedence Parser::GetPrecedence(TokenKind kind) {
     switch (kind) {
+        case TokenKind::Comma:
+            return Precedence::Comma;
         case TokenKind::Equal:
         case TokenKind::PlusEqual:
         case TokenKind::MinusEqual:
         case TokenKind::StarEqual:
         case TokenKind::SlashEqual:
+        case TokenKind::PercentEqual:
+        case TokenKind::StarStarEqual:
+        case TokenKind::LessLessEqual:
+        case TokenKind::GreaterGreaterEqual:
+        case TokenKind::GreaterGreaterGreaterEqual:
+        case TokenKind::AmpersandEqual:
+        case TokenKind::BarEqual:
+        case TokenKind::CaretEqual:
         case TokenKind::AmpAmpEqual:
         case TokenKind::BarBarEqual:
         case TokenKind::QuestionQuestionEqual:
@@ -77,6 +87,7 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
             return Precedence::Relational;
         case TokenKind::LessLess:
         case TokenKind::GreaterGreater:
+        case TokenKind::GreaterGreaterGreater:
             return Precedence::Shift;
         case TokenKind::Plus:
         case TokenKind::Minus:
@@ -85,6 +96,8 @@ Precedence Parser::GetPrecedence(TokenKind kind) {
         case TokenKind::Slash:
         case TokenKind::Percent:
             return Precedence::Multiplicative;
+        case TokenKind::StarStar:
+            return Precedence::Exponentiation;
         case TokenKind::OpenParen:
         case TokenKind::PlusPlus:
         case TokenKind::MinusMinus:
@@ -129,9 +142,24 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
     if (Match(TokenKind::While)) {
         return ParseWhile();
     }
+    if (Match(TokenKind::Do)) {
+        return ParseDoWhile();
+    }
     if (Match(TokenKind::For)) {
         bool is_for_await = Match(TokenKind::Await);
         return ParseFor(is_for_await);
+    }
+    if (Match(TokenKind::Break)) {
+        return ParseBreak();
+    }
+    if (Match(TokenKind::Continue)) {
+        return ParseContinue();
+    }
+    if (Match(TokenKind::Switch)) {
+        return ParseSwitch();
+    }
+    if (Match(TokenKind::Debugger)) {
+        return ParseDebugger();
     }
     if (Match(TokenKind::Return)) {
         return ParseReturn();
@@ -170,75 +198,98 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
 }
 
 std::unique_ptr<Stmt> Parser::ParseVarDecl() {
-    // 1. Array destructuring: let [a, b, c] = expr;
-    if (Match(TokenKind::OpenBracket)) {
-        std::vector<std::string> names;
-        if (!Check(TokenKind::CloseBracket)) {
-            do {
-                Token elem_tok = Consume(TokenKind::Identifier, "Expected identifier in array destructuring");
-                names.push_back(elem_tok.text);
-            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
-        }
-        Consume(TokenKind::CloseBracket, "Expected ']' in array destructuring");
-        Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
-        auto rhs = ParseExpression();
-        Match(TokenKind::Semicolon);
+    auto parse_one_declarator = [&]() -> std::vector<std::unique_ptr<Stmt>> {
+        std::vector<std::unique_ptr<Stmt>> stmts;
+        // 1. Array destructuring: let [a, b, c] = expr;
+        if (Match(TokenKind::OpenBracket)) {
+            std::vector<std::string> names;
+            if (!Check(TokenKind::CloseBracket)) {
+                do {
+                    Token elem_tok = Consume(TokenKind::Identifier, "Expected identifier in array destructuring");
+                    names.push_back(elem_tok.text);
+                } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
+            }
+            Consume(TokenKind::CloseBracket, "Expected ']' in array destructuring");
+            Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
+            auto rhs = ParseExpression();
 
-        static uint32_t s_destruct_arr_id = 0;
-        std::string temp_var = "$d_arr_" + std::to_string(++s_destruct_arr_id);
-        auto block = std::make_unique<BlockStmt>();
-        block->AddStatement(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-        for (size_t i = 0; i < names.size(); ++i) {
-            auto idx_access = std::make_unique<IndexAccessExpr>(
-                std::make_unique<IdentifierExpr>(temp_var),
-                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
-            );
-            block->AddStatement(std::make_unique<VarDeclStmt>(names[i], std::move(idx_access)));
+            static uint32_t s_destruct_arr_id = 0;
+            std::string temp_var = "$d_arr_" + std::to_string(++s_destruct_arr_id);
+            stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
+            for (size_t i = 0; i < names.size(); ++i) {
+                auto idx_access = std::make_unique<IndexAccessExpr>(
+                    std::make_unique<IdentifierExpr>(temp_var),
+                    std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
+                );
+                stmts.push_back(std::make_unique<VarDeclStmt>(names[i], std::move(idx_access)));
+            }
+            return stmts;
         }
-        return block;
+
+        // 2. Object destructuring: let { a, b: c } = expr;
+        if (Match(TokenKind::OpenBrace)) {
+            std::vector<std::pair<std::string, std::string>> bindings;
+            if (!Check(TokenKind::CloseBrace)) {
+                do {
+                    Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
+                    std::string local_var = prop_tok.text;
+                    if (Match(TokenKind::Colon)) {
+                        Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
+                        local_var = alias_tok.text;
+                    }
+                    bindings.emplace_back(prop_tok.text, local_var);
+                } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+            }
+            Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
+            Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
+            auto rhs = ParseExpression();
+
+            static uint32_t s_destruct_obj_id = 0;
+            std::string temp_var = "$d_obj_" + std::to_string(++s_destruct_obj_id);
+            stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
+            for (const auto& [prop, local] : bindings) {
+                auto prop_access = std::make_unique<PropertyAccessExpr>(
+                    std::make_unique<IdentifierExpr>(temp_var),
+                    prop
+                );
+                stmts.push_back(std::make_unique<VarDeclStmt>(local, std::move(prop_access)));
+            }
+            return stmts;
+        }
+
+        // 3. Regular variable declaration: let x = expr;
+        Token name_tok = Consume(TokenKind::Identifier, "Expected identifier in variable declaration");
+        std::unique_ptr<Expr> init = nullptr;
+        if (Match(TokenKind::Equal)) {
+            init = ParseExpression();
+        }
+        stmts.push_back(std::make_unique<VarDeclStmt>(name_tok.text, std::move(init)));
+        return stmts;
+    };
+
+    std::vector<std::unique_ptr<Stmt>> all_stmts;
+    auto first = parse_one_declarator();
+    for (auto& s : first) {
+        all_stmts.push_back(std::move(s));
     }
 
-    // 2. Object destructuring: let { a, b: c } = expr;
-    if (Match(TokenKind::OpenBrace)) {
-        std::vector<std::pair<std::string, std::string>> bindings;
-        if (!Check(TokenKind::CloseBrace)) {
-            do {
-                Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
-                std::string local_var = prop_tok.text;
-                if (Match(TokenKind::Colon)) {
-                    Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
-                    local_var = alias_tok.text;
-                }
-                bindings.emplace_back(prop_tok.text, local_var);
-            } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
+    while (Match(TokenKind::Comma)) {
+        auto next = parse_one_declarator();
+        for (auto& s : next) {
+            all_stmts.push_back(std::move(s));
         }
-        Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
-        Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
-        auto rhs = ParseExpression();
-        Match(TokenKind::Semicolon);
-
-        static uint32_t s_destruct_obj_id = 0;
-        std::string temp_var = "$d_obj_" + std::to_string(++s_destruct_obj_id);
-        auto block = std::make_unique<BlockStmt>();
-        block->AddStatement(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-        for (const auto& [prop, local] : bindings) {
-            auto prop_access = std::make_unique<PropertyAccessExpr>(
-                std::make_unique<IdentifierExpr>(temp_var),
-                prop
-            );
-            block->AddStatement(std::make_unique<VarDeclStmt>(local, std::move(prop_access)));
-        }
-        return block;
     }
 
-    // 3. Regular variable declaration: let x = expr;
-    Token name_tok = Consume(TokenKind::Identifier, "Expected identifier in variable declaration");
-    std::unique_ptr<Expr> init = nullptr;
-    if (Match(TokenKind::Equal)) {
-        init = ParseExpression();
-    }
     Match(TokenKind::Semicolon); // Optional semicolon
-    return std::make_unique<VarDeclStmt>(name_tok.text, std::move(init));
+
+    if (all_stmts.size() == 1) {
+        return std::move(all_stmts[0]);
+    }
+    auto block = std::make_unique<BlockStmt>();
+    for (auto& s : all_stmts) {
+        block->AddStatement(std::move(s));
+    }
+    return block;
 }
 
 std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
@@ -303,6 +354,67 @@ std::unique_ptr<Stmt> Parser::ParseWhile() {
 
     auto body = ParseStatement();
     return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
+}
+
+std::unique_ptr<Stmt> Parser::ParseDoWhile() {
+    auto body = ParseStatement();
+    Consume(TokenKind::While, "Expected 'while' after do-while body");
+    Consume(TokenKind::OpenParen, "Expected '(' after 'while'");
+    auto cond = ParseExpression();
+    Consume(TokenKind::CloseParen, "Expected ')' after do-while condition");
+    Match(TokenKind::Semicolon);
+    return std::make_unique<DoWhileStmt>(std::move(body), std::move(cond));
+}
+
+std::unique_ptr<Stmt> Parser::ParseBreak() {
+    std::string label = "";
+    if (Check(TokenKind::Identifier)) {
+        label = Advance().text;
+    }
+    Match(TokenKind::Semicolon);
+    return std::make_unique<BreakStmt>(label);
+}
+
+std::unique_ptr<Stmt> Parser::ParseContinue() {
+    std::string label = "";
+    if (Check(TokenKind::Identifier)) {
+        label = Advance().text;
+    }
+    Match(TokenKind::Semicolon);
+    return std::make_unique<ContinueStmt>(label);
+}
+
+std::unique_ptr<Stmt> Parser::ParseSwitch() {
+    Consume(TokenKind::OpenParen, "Expected '(' after 'switch'");
+    auto discriminant = ParseExpression();
+    Consume(TokenKind::CloseParen, "Expected ')' after switch discriminant");
+    Consume(TokenKind::OpenBrace, "Expected '{' before switch cases");
+
+    std::vector<SwitchCase> cases;
+    while (!Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
+        SwitchCase sc;
+        if (Match(TokenKind::Case)) {
+            sc.test = ParseExpression();
+            Consume(TokenKind::Colon, "Expected ':' after case expression");
+        } else if (Match(TokenKind::Default)) {
+            Consume(TokenKind::Colon, "Expected ':' after default");
+            sc.test = nullptr;
+        } else {
+            throw std::runtime_error("Expected 'case' or 'default' in switch statement");
+        }
+
+        while (!Check(TokenKind::Case) && !Check(TokenKind::Default) && !Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
+            sc.statements.push_back(ParseStatement());
+        }
+        cases.push_back(std::move(sc));
+    }
+    Consume(TokenKind::CloseBrace, "Expected '}' after switch cases");
+    return std::make_unique<SwitchStmt>(std::move(discriminant), std::move(cases));
+}
+
+std::unique_ptr<Stmt> Parser::ParseDebugger() {
+    Match(TokenKind::Semicolon);
+    return std::make_unique<DebuggerStmt>();
 }
 
 std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
@@ -502,7 +614,7 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
 
     std::unique_ptr<Expr> update = nullptr;
     if (!Check(TokenKind::CloseParen)) {
-        update = ParseExpression();
+        update = ParseExpression(Precedence::Comma);
     }
     Consume(TokenKind::CloseParen, "Expected ')' after for loop update");
 
@@ -513,7 +625,7 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
 std::unique_ptr<Stmt> Parser::ParseReturn() {
     std::unique_ptr<Expr> val = nullptr;
     if (!Check(TokenKind::Semicolon) && !Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
-        val = ParseExpression();
+        val = ParseExpression(Precedence::Comma);
     }
     Match(TokenKind::Semicolon);
     return std::make_unique<ReturnStmt>(std::move(val));
@@ -584,7 +696,7 @@ std::unique_ptr<BlockStmt> Parser::ParseBlock() {
 }
 
 std::unique_ptr<Stmt> Parser::ParseExprStmt() {
-    auto expr = ParseExpression();
+    auto expr = ParseExpression(Precedence::Comma);
     Match(TokenKind::Semicolon);
     return std::make_unique<ExprStmt>(std::move(expr));
 }
@@ -898,7 +1010,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             // Fallback: restore lexer and current token, parse parenthesized expression
             lexer_ = saved_lexer;
             current_token_ = saved_tok;
-            auto expr = ParseExpression();
+            auto expr = ParseExpression(Precedence::Comma);
             Consume(TokenKind::CloseParen, "Expected ')' after expression");
             return expr;
         }
@@ -1030,23 +1142,15 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<UnaryExpr>(UnaryOp::TypeOf, ParseExpression(Precedence::Unary));
         case TokenKind::Delete:
             return std::make_unique<UnaryExpr>(UnaryOp::Delete, ParseExpression(Precedence::Unary));
+        case TokenKind::Void:
+            return std::make_unique<UnaryExpr>(UnaryOp::Void, ParseExpression(Precedence::Unary));
         case TokenKind::PlusPlus: {
             Token id_tok = Consume(TokenKind::Identifier, "Expected identifier after '++'");
-            auto plus_one = std::make_unique<BinaryExpr>(
-                BinaryOp::Add,
-                std::make_unique<IdentifierExpr>(id_tok.text),
-                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
-            );
-            return std::make_unique<AssignExpr>(id_tok.text, std::move(plus_one));
+            return std::make_unique<UpdateExpr>(UpdateOp::Increment, id_tok.text, /*is_prefix=*/true);
         }
         case TokenKind::MinusMinus: {
             Token id_tok = Consume(TokenKind::Identifier, "Expected identifier after '--'");
-            auto minus_one = std::make_unique<BinaryExpr>(
-                BinaryOp::Sub,
-                std::make_unique<IdentifierExpr>(id_tok.text),
-                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
-            );
-            return std::make_unique<AssignExpr>(id_tok.text, std::move(minus_one));
+            return std::make_unique<UpdateExpr>(UpdateOp::Decrement, id_tok.text, /*is_prefix=*/true);
         }
         case TokenKind::This:
             return std::make_unique<IdentifierExpr>("this");
@@ -1258,6 +1362,14 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         op_token.kind == TokenKind::MinusEqual ||
         op_token.kind == TokenKind::StarEqual ||
         op_token.kind == TokenKind::SlashEqual ||
+        op_token.kind == TokenKind::PercentEqual ||
+        op_token.kind == TokenKind::StarStarEqual ||
+        op_token.kind == TokenKind::LessLessEqual ||
+        op_token.kind == TokenKind::GreaterGreaterEqual ||
+        op_token.kind == TokenKind::GreaterGreaterGreaterEqual ||
+        op_token.kind == TokenKind::AmpersandEqual ||
+        op_token.kind == TokenKind::BarEqual ||
+        op_token.kind == TokenKind::CaretEqual ||
         op_token.kind == TokenKind::AmpAmpEqual ||
         op_token.kind == TokenKind::BarBarEqual ||
         op_token.kind == TokenKind::QuestionQuestionEqual) {
@@ -1283,13 +1395,21 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
 
         BinaryOp bin_op;
         switch (op_token.kind) {
-            case TokenKind::PlusEqual:               bin_op = BinaryOp::Add; break;
-            case TokenKind::MinusEqual:              bin_op = BinaryOp::Sub; break;
-            case TokenKind::StarEqual:               bin_op = BinaryOp::Mul; break;
-            case TokenKind::SlashEqual:              bin_op = BinaryOp::Div; break;
-            case TokenKind::AmpAmpEqual:             bin_op = BinaryOp::LogicalAnd; break;
-            case TokenKind::BarBarEqual:             bin_op = BinaryOp::LogicalOr; break;
-            case TokenKind::QuestionQuestionEqual:   bin_op = BinaryOp::NullishCoalescing; break;
+            case TokenKind::PlusEqual:                    bin_op = BinaryOp::Add; break;
+            case TokenKind::MinusEqual:                   bin_op = BinaryOp::Sub; break;
+            case TokenKind::StarEqual:                    bin_op = BinaryOp::Mul; break;
+            case TokenKind::SlashEqual:                   bin_op = BinaryOp::Div; break;
+            case TokenKind::PercentEqual:                 bin_op = BinaryOp::Mod; break;
+            case TokenKind::StarStarEqual:                bin_op = BinaryOp::Exp; break;
+            case TokenKind::LessLessEqual:                bin_op = BinaryOp::ShiftLeft; break;
+            case TokenKind::GreaterGreaterEqual:          bin_op = BinaryOp::ShiftRight; break;
+            case TokenKind::GreaterGreaterGreaterEqual:   bin_op = BinaryOp::ShiftRightUnsigned; break;
+            case TokenKind::AmpersandEqual:               bin_op = BinaryOp::BitwiseAnd; break;
+            case TokenKind::BarEqual:                     bin_op = BinaryOp::BitwiseOr; break;
+            case TokenKind::CaretEqual:                   bin_op = BinaryOp::BitwiseXor; break;
+            case TokenKind::AmpAmpEqual:                  bin_op = BinaryOp::LogicalAnd; break;
+            case TokenKind::BarBarEqual:                  bin_op = BinaryOp::LogicalOr; break;
+            case TokenKind::QuestionQuestionEqual:        bin_op = BinaryOp::NullishCoalescing; break;
             default: throw std::runtime_error("Unhandled compound assignment");
         }
 
@@ -1300,13 +1420,12 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         if (auto* prop = dynamic_cast<PropertyAccessExpr*>(lhs.get())) {
             std::string prop_name = prop->Property();
             auto obj = prop->ReleaseObject();
-            if (auto* obj_id = dynamic_cast<IdentifierExpr*>(obj.get())) {
-                auto get_prop = std::make_unique<PropertyAccessExpr>(std::make_unique<IdentifierExpr>(obj_id->Name()), prop_name);
-                auto bin_expr = std::make_unique<BinaryExpr>(bin_op, std::move(get_prop), std::move(rhs));
-                return std::make_unique<PropertyAssignExpr>(std::move(obj), prop_name, std::move(bin_expr));
-            }
-            auto bin_expr = std::make_unique<BinaryExpr>(bin_op, std::make_unique<PropertyAccessExpr>(std::move(obj), prop_name), std::move(rhs));
-            return std::make_unique<PropertyAssignExpr>(nullptr, prop_name, std::move(bin_expr));
+            return std::make_unique<CompoundPropertyAssignExpr>(bin_op, std::move(obj), prop_name, std::move(rhs));
+        }
+        if (auto* idx = dynamic_cast<IndexAccessExpr*>(lhs.get())) {
+            auto obj = idx->ReleaseObject();
+            auto index = idx->ReleaseIndex();
+            return std::make_unique<CompoundIndexAssignExpr>(bin_op, std::move(obj), std::move(index), std::move(rhs));
         }
         throw std::runtime_error("Invalid left-hand side in compound assignment");
     }
@@ -1363,26 +1482,14 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
 
     if (op_token.kind == TokenKind::PlusPlus) {
         if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
-            std::string name = id->Name();
-            auto plus_one = std::make_unique<BinaryExpr>(
-                BinaryOp::Add,
-                std::make_unique<IdentifierExpr>(name),
-                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
-            );
-            return std::make_unique<AssignExpr>(name, std::move(plus_one));
+            return std::make_unique<UpdateExpr>(UpdateOp::Increment, id->Name(), /*is_prefix=*/false);
         }
         throw std::runtime_error("Invalid left-hand side in postfix ++");
     }
 
     if (op_token.kind == TokenKind::MinusMinus) {
         if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
-            std::string name = id->Name();
-            auto minus_one = std::make_unique<BinaryExpr>(
-                BinaryOp::Sub,
-                std::make_unique<IdentifierExpr>(name),
-                std::make_unique<LiteralExpr>(TaggedValue::FromSmi(1))
-            );
-            return std::make_unique<AssignExpr>(name, std::move(minus_one));
+            return std::make_unique<UpdateExpr>(UpdateOp::Decrement, id->Name(), /*is_prefix=*/false);
         }
         throw std::runtime_error("Invalid left-hand side in postfix --");
     }
@@ -1392,6 +1499,17 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         Consume(TokenKind::Colon, "Expected ':' in conditional expression");
         auto else_expr = ParseExpression(Precedence::Conditional);
         return std::make_unique<ConditionalExpr>(std::move(lhs), std::move(then_expr), std::move(else_expr));
+    }
+
+    if (op_token.kind == TokenKind::Comma) {
+        auto rhs = ParseExpression(Precedence::Comma);
+        return std::make_unique<BinaryExpr>(BinaryOp::Comma, std::move(lhs), std::move(rhs));
+    }
+
+    if (op_token.kind == TokenKind::StarStar) {
+        // Exponentiation is right-associative: 2 ** 3 ** 2 is 2 ** (3 ** 2)
+        auto rhs = ParseExpression(Precedence::Exponentiation);
+        return std::make_unique<BinaryExpr>(BinaryOp::Exp, std::move(lhs), std::move(rhs));
     }
 
     Precedence prec = GetPrecedence(op_token.kind);
@@ -1409,6 +1527,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         case TokenKind::Caret:              op = BinaryOp::BitwiseXor; break;
         case TokenKind::LessLess:           op = BinaryOp::ShiftLeft; break;
         case TokenKind::GreaterGreater:     op = BinaryOp::ShiftRight; break;
+        case TokenKind::GreaterGreaterGreater: op = BinaryOp::ShiftRightUnsigned; break;
         case TokenKind::EqualEqual:         op = BinaryOp::Equal; break;
         case TokenKind::StrictEqual:        op = BinaryOp::StrictEqual; break;
         case TokenKind::NotEqual:           op = BinaryOp::NotEqual; break;

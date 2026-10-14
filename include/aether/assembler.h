@@ -111,6 +111,7 @@ public:
     void CmpRegReg(X86Reg r1, X86Reg r2);
     void CmpRegReg32(X86Reg r1, X86Reg r2);
     void CmpRegImm32(X86Reg r, int32_t imm);
+    void CmpRegImm64(X86Reg r, int32_t imm);
     void TestRegReg(X86Reg r1, X86Reg r2);
 
     // Branching & Labels
