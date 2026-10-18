@@ -57,6 +57,7 @@ enum class Opcode : uint8_t {
     TestGreaterThanOrEqual, // [Op, reg: u8]           acc = (acc >= Reg[reg])
     TestInstanceOf,         // [Op, reg: u8]           acc = (acc instanceof Reg[reg])
     TestIn,                 // [Op, reg: u8]           acc = (Reg[reg] in acc)
+    TestInWith,             // [Op, reg: u8]           acc = HasBindingWith(acc, Reg[reg])
 
     // Control Flow
     Jump,               // [Op, offset: i32]           pc += offset
@@ -68,6 +69,8 @@ enum class Opcode : uint8_t {
     // Object & Property Access (Inline Cache enabled)
     LdaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  acc = obj.name
     StaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  obj.name = acc
+    LdaPrivate,         // [Op, obj: u8, name_idx: u16]              acc = obj.#name
+    StaPrivate,         // [Op, obj: u8, name_idx: u16]              obj.#name = acc
     LdaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        acc = obj[key]
     StaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        obj[key] = acc
     DeleteNamed,        // [Op, obj: u8, name_idx: u16]             acc = delete obj.name
@@ -78,6 +81,18 @@ enum class Opcode : uint8_t {
     Negate,                 // [Op]                    acc = -acc
     BitwiseNot,             // [Op]                    acc = ~acc
     TypeOf,                 // [Op]                    acc = typeof acc
+    TypeOfGlobal,           // [Op, name_idx: u16]     acc = typeof global[name]
+    LdaGlobal,              // [Op, name_idx: u16]     acc = global[name] (throws ReferenceError)
+    StaGlobal,              // [Op, name_idx: u16]     global[name] = acc
+    ToString,               // [Op]                    acc = ToString(acc)
+    ToNumber,               // [Op]                    acc = ToNumber(acc)
+    ToNumeric,              // [Op]                    acc = ToNumeric(acc)
+    ToPropertyKey,          // [Op]                    acc = ToPropertyKey(acc)
+    CheckObjectCoercible,   // [Op, reg: u8]           throws TypeError if reg is null or undefined
+    PushWith,               // [Op, reg: u8]           push with_stack
+    PopWith,                // [Op]                    pop with_stack
+    Inc,                    // [Op]                    acc = Inc(acc)
+    Dec,                    // [Op]                    acc = Dec(acc)
 
     // Function Calls & Object Instantiation
     Call,                   // [Op, callee: u8, args: u8, count: u8, slot: u16]
@@ -195,6 +210,7 @@ public:
           constants_(std::move(other.constants_)),
           register_count_(other.register_count_),
           parameter_count_(other.parameter_count_),
+          is_strict_(other.is_strict_),
           invocation_count_(other.invocation_count_.load(std::memory_order_relaxed)),
           is_compiling_tier2_(other.is_compiling_tier2_.load(std::memory_order_relaxed)),
           feedback_(std::move(other.feedback_)) {
@@ -209,6 +225,7 @@ public:
             constants_ = std::move(other.constants_);
             register_count_ = other.register_count_;
             parameter_count_ = other.parameter_count_;
+            is_strict_ = other.is_strict_;
             invocation_count_.store(other.invocation_count_.load(std::memory_order_relaxed));
             is_compiling_tier2_.store(other.is_compiling_tier2_.load(std::memory_order_relaxed));
             feedback_ = std::move(other.feedback_);
@@ -226,9 +243,16 @@ public:
     const std::vector<TaggedValue>& Constants() const noexcept { return constants_; }
     uint32_t RegisterCount() const noexcept { return register_count_; }
     uint32_t ParameterCount() const noexcept { return parameter_count_; }
+    uint32_t Length() const noexcept { return length_; }
+    bool IsStrict() const noexcept { return is_strict_; }
 
     void SetRegisterCount(uint32_t count) noexcept { register_count_ = count; }
-    void SetParameterCount(uint32_t count) noexcept { parameter_count_ = count; }
+    void SetParameterCount(uint32_t count) noexcept { 
+        parameter_count_ = count; 
+        if (length_ == 0) length_ = count;
+    }
+    void SetLength(uint32_t len) noexcept { length_ = len; }
+    void SetStrict(bool s) noexcept { is_strict_ = s; }
 
     // Emission primitives
     size_t CurrentOffset() const noexcept { return bytes_.size(); }
@@ -304,6 +328,8 @@ private:
     std::vector<TaggedValue> constants_;
     uint32_t register_count_{0};
     uint32_t parameter_count_{0};
+    uint32_t length_{0};
+    bool is_strict_{false};
     mutable std::atomic<uint32_t> invocation_count_{0};
     mutable std::atomic<bool> is_compiling_tier2_{false};
     mutable std::mutex tier_mutex_;

@@ -10,6 +10,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <limits>
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -305,6 +306,40 @@ void TestTier2TypeGuardsAndOverflowDeopt() {
     std::cout << "  -> Tier 2 CheckSmi guards, overflow checks, and deoptimization fallback verified.\n" << std::flush;
 }
 
+void TestTier2RepresentationGating() {
+    std::cout << "[Test 9] Verifying Tier 2 Representation and Control-Flow Gating...\n" << std::flush;
+
+    BytecodeArray bool_return(0, 0);
+    bool_return.EmitOpcode(Opcode::LdaTrue);
+    bool_return.EmitOpcode(Opcode::Return);
+    assert(!OptimizingJIT::CanCompile(bool_return));
+
+    BytecodeArray null_return(0, 0);
+    null_return.EmitOpcode(Opcode::LdaNull);
+    null_return.EmitOpcode(Opcode::Return);
+    assert(!OptimizingJIT::CanCompile(null_return));
+
+    BytecodeArray early_return(0, 0);
+    early_return.EmitOpcode(Opcode::LdaSmi);
+    early_return.EmitI32(1);
+    early_return.EmitOpcode(Opcode::Return);
+    early_return.EmitOpcode(Opcode::LdaSmi);
+    early_return.EmitI32(2);
+    early_return.EmitOpcode(Opcode::Return);
+    assert(!OptimizingJIT::CanCompile(early_return));
+
+    Graph graph;
+    Node* max_value = graph.NewConstantInt32(std::numeric_limits<int32_t>::max());
+    Node* one = graph.NewConstantInt32(1);
+    Node* add = graph.NewNode(NodeOp::Int32Add);
+    add->AddInput(max_value);
+    add->AddInput(one);
+    SeaOfNodesOptimizer::ConstantFolding(graph);
+    assert(add->Op() == NodeOp::Int32Add && "overflowing constants must not wrap into a Smi");
+
+    std::cout << "  -> Non-tag-compatible returns, multiple returns, and overflowing folds are gated.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 5 (Tier 2 Sea-of-Nodes JIT) Tests  \n"
@@ -325,9 +360,11 @@ int main() {
     TestUnsupportedBytecodeGating();
     std::cout << "\n" << std::flush;
     TestTier2TypeGuardsAndOverflowDeopt();
+    std::cout << "\n" << std::flush;
+    TestTier2RepresentationGating();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (8/8)         \n"
+              << "   ALL TIER 2 OPTIMIZING JIT TESTS PASSED (9/9)         \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

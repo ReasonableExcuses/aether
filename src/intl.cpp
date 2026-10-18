@@ -1,5 +1,6 @@
 #include "aether/intl.h"
 #include "aether/runtime.h"
+#include "aether/interpreter.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1597,6 +1598,17 @@ void InitializeDate(Realm& realm) {
     realm.SetDatePrototype(date_proto);
 
     auto* date_ctor = make_native("Date", [&realm, date_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
+        bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (!is_construct) {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            DateTimeFormatOptions opts;
+            opts.locale = "en-US";
+            opts.date_style = "full";
+            opts.time_style = "medium";
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(FormatDateTimeInternal(static_cast<double>(ms), opts)));
+        }
+
         auto* instance = AllocateRuntime<JSObject>(root);
         instance->SetPrototype(date_proto);
 
@@ -1761,6 +1773,138 @@ void InitializeDate(Realm& realm) {
             return TaggedValue::FromSmi(EpochMsToUTC(t).second);
         })), next_sid);
 
+    auto make_date_getter = [date_proto, root, &next_sid, &make_native](std::string_view name, auto fn) {
+        date_proto->SetNamedProperty(name, TaggedValue::FromHeapObject(
+            make_native(name, [fn](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+                if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+                auto* inst = static_cast<JSObject*>(this_val.AsHeapObject());
+                double t = inst->HasNamedProperty("__time__") ? inst->GetNamedProperty("__time__").AsNumber() : 0.0;
+                return TaggedValue::FromSmi(fn(EpochMsToUTC(t)));
+            })), next_sid);
+    };
+
+    make_date_getter("getUTCFullYear", [](const BrokenDownDate& d) { return d.year; });
+    make_date_getter("getUTCMonth", [](const BrokenDownDate& d) { return d.month - 1; });
+    make_date_getter("getUTCDate", [](const BrokenDownDate& d) { return d.day; });
+    make_date_getter("getUTCDay", [](const BrokenDownDate& d) { return d.weekday; });
+    make_date_getter("getUTCHours", [](const BrokenDownDate& d) { return d.hour; });
+    make_date_getter("getUTCMinutes", [](const BrokenDownDate& d) { return d.minute; });
+    make_date_getter("getUTCSeconds", [](const BrokenDownDate& d) { return d.second; });
+    make_date_getter("getUTCMilliseconds", [](const BrokenDownDate& d) { return d.ms; });
+    make_date_getter("getMilliseconds", [](const BrokenDownDate& d) { return d.ms; });
+
+    auto make_date_setter = [date_proto, root, &next_sid, &make_native](std::string_view name, auto fn) {
+        date_proto->SetNamedProperty(name, TaggedValue::FromHeapObject(
+            make_native(name, [fn, &next_sid](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+                if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+                auto* inst = static_cast<JSObject*>(this_val.AsHeapObject());
+                double t = inst->HasNamedProperty("__time__") ? inst->GetNamedProperty("__time__").AsNumber() : 0.0;
+                if (!std::isnan(t) && !args.empty()) {
+                    BrokenDownDate bd = EpochMsToUTC(t);
+                    fn(bd, args);
+                    std::tm tm_struct{};
+                    tm_struct.tm_year = bd.year - 1900;
+                    tm_struct.tm_mon = bd.month - 1;
+                    tm_struct.tm_mday = bd.day;
+                    tm_struct.tm_hour = bd.hour;
+                    tm_struct.tm_min = bd.minute;
+                    tm_struct.tm_sec = bd.second;
+#ifdef _WIN32
+                    t = static_cast<double>(_mkgmtime(&tm_struct)) * 1000.0 + bd.ms;
+#else
+                    t = static_cast<double>(timegm(&tm_struct)) * 1000.0 + bd.ms;
+#endif
+                    inst->SetNamedProperty("__time__", TaggedValue::FromDouble(t), next_sid);
+                }
+                return TaggedValue::FromDouble(t);
+            })), next_sid);
+    };
+
+    make_date_setter("setFullYear", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.year = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.month = static_cast<int>(a[1].ToDouble()) + 1;
+        if (a.size() > 2) bd.day = static_cast<int>(a[2].ToDouble());
+    });
+    make_date_setter("setUTCFullYear", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.year = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.month = static_cast<int>(a[1].ToDouble()) + 1;
+        if (a.size() > 2) bd.day = static_cast<int>(a[2].ToDouble());
+    });
+    make_date_setter("setMonth", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.month = static_cast<int>(a[0].ToDouble()) + 1;
+        if (a.size() > 1) bd.day = static_cast<int>(a[1].ToDouble());
+    });
+    make_date_setter("setUTCMonth", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.month = static_cast<int>(a[0].ToDouble()) + 1;
+        if (a.size() > 1) bd.day = static_cast<int>(a[1].ToDouble());
+    });
+    make_date_setter("setDate", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.day = static_cast<int>(a[0].ToDouble());
+    });
+    make_date_setter("setUTCDate", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.day = static_cast<int>(a[0].ToDouble());
+    });
+    make_date_setter("setHours", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.hour = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.minute = static_cast<int>(a[1].ToDouble());
+        if (a.size() > 2) bd.second = static_cast<int>(a[2].ToDouble());
+        if (a.size() > 3) bd.ms = static_cast<int>(a[3].ToDouble());
+    });
+    make_date_setter("setUTCHours", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.hour = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.minute = static_cast<int>(a[1].ToDouble());
+        if (a.size() > 2) bd.second = static_cast<int>(a[2].ToDouble());
+        if (a.size() > 3) bd.ms = static_cast<int>(a[3].ToDouble());
+    });
+    make_date_setter("setMinutes", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.minute = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.second = static_cast<int>(a[1].ToDouble());
+        if (a.size() > 2) bd.ms = static_cast<int>(a[2].ToDouble());
+    });
+    make_date_setter("setUTCMinutes", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.minute = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.second = static_cast<int>(a[1].ToDouble());
+        if (a.size() > 2) bd.ms = static_cast<int>(a[2].ToDouble());
+    });
+    make_date_setter("setSeconds", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.second = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.ms = static_cast<int>(a[1].ToDouble());
+    });
+    make_date_setter("setUTCSeconds", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.second = static_cast<int>(a[0].ToDouble());
+        if (a.size() > 1) bd.ms = static_cast<int>(a[1].ToDouble());
+    });
+    make_date_setter("setMilliseconds", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.ms = static_cast<int>(a[0].ToDouble());
+    });
+    make_date_setter("setUTCMilliseconds", [](BrokenDownDate& bd, const std::vector<TaggedValue>& a) {
+        bd.ms = static_cast<int>(a[0].ToDouble());
+    });
+    date_proto->SetNamedProperty("setTime", TaggedValue::FromHeapObject(
+        make_native("setTime", [&next_sid](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+            if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) return TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+            auto* inst = static_cast<JSObject*>(this_val.AsHeapObject());
+            double t = args.empty() ? std::numeric_limits<double>::quiet_NaN() : args[0].ToDouble();
+            inst->SetNamedProperty("__time__", TaggedValue::FromDouble(t), next_sid);
+            return TaggedValue::FromDouble(t);
+        })), next_sid);
+    date_proto->SetNamedProperty("toUTCString", TaggedValue::FromHeapObject(
+        make_native("toUTCString", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) return TaggedValue::Undefined();
+            auto* inst = static_cast<JSObject*>(this_val.AsHeapObject());
+            double t = inst->HasNamedProperty("__time__") ? inst->GetNamedProperty("__time__").AsNumber() : 0.0;
+            BrokenDownDate d = EpochMsToUTC(t);
+            static const char* const kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+            static const char* const kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                          kWeekdays[std::clamp(d.weekday, 0, 6)],
+                          d.day,
+                          kMonths[std::clamp(d.month - 1, 0, 11)],
+                          d.year, d.hour, d.minute, d.second);
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(buf)));
+        })), next_sid);
+
     // Localized Date prototype methods per ECMA-402
     date_proto->SetNamedProperty("toLocaleString", TaggedValue::FromHeapObject(
         make_native("toLocaleString", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
@@ -1885,7 +2029,60 @@ void InitializeDate(Realm& realm) {
             return TaggedValue::FromDouble(static_cast<double>(t_val) * 1000.0 + ms);
         })), next_sid);
 
+    date_proto->SetNamedProperty("@@toPrimitive", TaggedValue::FromHeapObject(
+        make_native("[Symbol.toPrimitive]", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+            if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Date.prototype[@@toPrimitive] called on non-object")));
+                }
+                return TaggedValue::Undefined();
+            }
+            auto* this_obj = static_cast<JSObject*>(this_val.AsHeapObject());
+            std::string hint = "default";
+            if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsString()) {
+                hint = static_cast<JSString*>(args[0].AsHeapObject())->Value();
+            }
+            const char* first_method = nullptr;
+            const char* second_method = nullptr;
+            if (hint == "string" || hint == "default") {
+                first_method = "toString";
+                second_method = "valueOf";
+            } else if (hint == "number") {
+                first_method = "valueOf";
+                second_method = "toString";
+            } else {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Invalid hint in Date.prototype[@@toPrimitive]")));
+                }
+                return TaggedValue::Undefined();
+            }
+
+            for (const char* m_name : {first_method, second_method}) {
+                TaggedValue method = this_obj->GetNamedProperty(m_name);
+                if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                    return TaggedValue::Undefined();
+                }
+                if (method.IsHeapObject() && method.AsHeapObject()->IsFunction()) {
+                    TaggedValue res = CallFunction(method, this_val, {});
+                    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                        return TaggedValue::Undefined();
+                    }
+                    if (!res.IsHeapObject() || (!res.AsHeapObject()->IsJSObject() && !res.AsHeapObject()->IsProxy())) {
+                        return res;
+                    }
+                }
+            }
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    new JSError("TypeError", "Cannot convert object to primitive value")));
+            }
+            return TaggedValue::Undefined();
+        })), next_sid);
+
     date_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(date_proto), next_sid);
+    date_ctor->SetNamedProperty("length", TaggedValue::FromSmi(7), next_sid);
     date_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(date_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Date", TaggedValue::FromHeapObject(date_ctor), next_sid);
 }
@@ -1902,8 +2099,17 @@ void InitializeNumber(Realm& realm) {
     realm.SetNumberPrototype(number_proto);
 
     auto* number_ctor = make_native("Number", [number_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
-        if (args.empty()) return TaggedValue::FromSmi(0);
-        double d = args[0].ToDouble();
+        double d = 0.0;
+        if (!args.empty()) {
+            d = args[0].ToDouble();
+        }
+        bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (is_construct) {
+            auto* obj = AllocateRuntime<JSObject>(root);
+            obj->SetPrototype(number_proto);
+            obj->SetNamedProperty("__number_data__", TaggedValue::FromDouble(d), next_sid);
+            return TaggedValue::FromHeapObject(obj);
+        }
         if (std::isnan(d)) return TaggedValue::FromDouble(d);
         if (std::floor(d) == d && d >= -1073741824.0 && d <= 1073741823.0 && (d != 0.0 || !std::signbit(d))) {
             return TaggedValue::FromSmi(static_cast<int32_t>(d));
@@ -1939,7 +2145,19 @@ void InitializeNumber(Realm& realm) {
 
     number_proto->SetNamedProperty("toFixed", TaggedValue::FromHeapObject(
         make_native("toFixed", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
-            double val = this_val.AsNumber();
+            double val = 0.0;
+            if (this_val.IsNumber()) {
+                val = this_val.AsNumber();
+            } else if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__number_data__")) {
+                    val = o->GetNamedProperty("__number_data__").AsNumber();
+                } else {
+                    val = this_val.ToDouble();
+                }
+            } else {
+                val = this_val.ToDouble();
+            }
             int digits = args.empty() ? 0 : static_cast<int>(args[0].AsNumber());
             if (digits < 0) digits = 0;
             if (digits > 100) digits = 100;
@@ -1951,12 +2169,29 @@ void InitializeNumber(Realm& realm) {
 
     number_proto->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(
         make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            if (this_val.IsNumber()) return this_val;
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__number_data__")) return o->GetNamedProperty("__number_data__");
+            }
             return TaggedValue::FromDouble(this_val.AsNumber());
         })), next_sid);
 
     number_proto->SetNamedProperty("toString", TaggedValue::FromHeapObject(
         make_native("toString", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
-            double val = this_val.AsNumber();
+            double val = 0.0;
+            if (this_val.IsNumber()) {
+                val = this_val.AsNumber();
+            } else if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__number_data__")) {
+                    val = o->GetNamedProperty("__number_data__").AsNumber();
+                } else {
+                    val = this_val.AsNumber();
+                }
+            } else {
+                val = this_val.AsNumber();
+            }
             if (std::isnan(val)) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("NaN"));
             if (std::isinf(val)) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(val < 0 ? "-Infinity" : "Infinity"));
             if (val == 0.0) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("0"));
@@ -2044,16 +2279,235 @@ void InitializeNumber(Realm& realm) {
             })), next_sid);
     }
 
+    if (realm.GetStringPrototype()) {
+        realm.GetStringPrototype()->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(
+            make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+                if (this_val.IsString()) return this_val;
+                if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                    auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                    if (o->HasNamedProperty("__string_data__")) return o->GetNamedProperty("__string_data__");
+                }
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(this_val.ToString()));
+            })), next_sid);
+        realm.GetStringPrototype()->SetNamedProperty("toString", TaggedValue::FromHeapObject(
+            make_native("toString", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+                if (this_val.IsString()) return this_val;
+                if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                    auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                    if (o->HasNamedProperty("__string_data__")) return o->GetNamedProperty("__string_data__");
+                }
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(this_val.ToString()));
+            })), next_sid);
+    }
+
     // String Constructor on global if not already present
-    auto* string_ctor = make_native("String", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* string_ctor = make_native("String", [&realm, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
         std::string s = args.empty() ? "" : args[0].ToString();
+        bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (is_construct) {
+            auto* obj = AllocateRuntime<JSObject>(root);
+            if (realm.GetStringPrototype()) {
+                obj->SetPrototype(realm.GetStringPrototype());
+            }
+            obj->SetNamedProperty("__string_data__", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s)), next_sid);
+            obj->SetNamedProperty("length", TaggedValue::FromSmi(static_cast<int32_t>(s.length())), next_sid);
+            return TaggedValue::FromHeapObject(obj);
+        }
         return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
     });
+    auto* str_from_char_code = make_native("fromCharCode", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        std::string result;
+        result.reserve(args.size());
+        for (const auto& arg : args) {
+            uint32_t cu = static_cast<uint32_t>(arg.ToDouble()) & 0xFFFF;
+            if (cu < 128) {
+                result.push_back(static_cast<char>(cu));
+            } else if (cu < 2048) {
+                result.push_back(static_cast<char>(0xC0 | (cu >> 6)));
+                result.push_back(static_cast<char>(0x80 | (cu & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xE0 | (cu >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((cu >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (cu & 0x3F)));
+            }
+        }
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(result));
+    });
+    string_ctor->SetNamedProperty("fromCharCode", TaggedValue::FromHeapObject(str_from_char_code), next_sid);
+    string_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
     if (realm.GetStringPrototype()) {
         string_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(realm.GetStringPrototype()), next_sid);
         realm.GetStringPrototype()->SetNamedProperty("constructor", TaggedValue::FromHeapObject(string_ctor), next_sid);
     }
     realm.GetGlobalObject()->SetNamedProperty("String", TaggedValue::FromHeapObject(string_ctor), next_sid);
+}
+
+void InitializeBoolean(Realm& realm) {
+    Shape* root = realm.GetRootShape();
+    uint32_t& next_sid = realm.NextShapeId();
+
+    auto make_native = [&realm, root](std::string_view name, auto cb) -> JSNativeFunction* {
+        return AllocateRuntime<JSNativeFunction>(name, cb, root);
+    };
+
+    auto* boolean_proto = AllocateRuntime<JSObject>(root);
+    if (realm.GetObjectPrototype()) {
+        boolean_proto->SetPrototype(realm.GetObjectPrototype());
+    }
+    realm.SetBooleanPrototype(boolean_proto);
+    boolean_proto->SetNamedProperty("__boolean_data__", TaggedValue::FromBoolean(false), next_sid);
+
+    boolean_proto->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(
+        make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            if (this_val.IsBoolean()) return this_val;
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__boolean_data__")) return o->GetNamedProperty("__boolean_data__");
+            }
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.valueOf called on incompatible receiver")));
+            }
+            return TaggedValue::Undefined();
+        })), next_sid);
+
+    boolean_proto->SetNamedProperty("toString", TaggedValue::FromHeapObject(
+        make_native("toString", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            bool b = false;
+            if (this_val.IsBoolean()) {
+                b = this_val.AsBoolean();
+            } else if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__boolean_data__")) {
+                    b = o->GetNamedProperty("__boolean_data__").AsBoolean();
+                } else {
+                    if (Interpreter::Current()) {
+                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
+                    }
+                    return TaggedValue::Undefined();
+                }
+            } else {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
+                }
+                return TaggedValue::Undefined();
+            }
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(b ? "true" : "false"));
+        })), next_sid);
+
+    auto* boolean_ctor = make_native("Boolean", [boolean_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
+        bool b = args.empty() ? false : args[0].ToBoolean();
+        bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (is_construct) {
+            auto* obj = AllocateRuntime<JSObject>(root);
+            obj->SetPrototype(boolean_proto);
+            obj->SetNamedProperty("__boolean_data__", TaggedValue::FromBoolean(b), next_sid);
+            return TaggedValue::FromHeapObject(obj);
+        }
+        return TaggedValue::FromBoolean(b);
+    });
+
+    boolean_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(boolean_proto), next_sid);
+    boolean_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
+    realm.GetGlobalObject()->SetNamedProperty("Boolean", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
+}
+
+void InitializeBigInt(Realm& realm) {
+    Shape* root = realm.GetRootShape();
+    uint32_t& next_sid = realm.NextShapeId();
+
+    auto make_native = [&realm, root](std::string_view name, auto cb) -> JSNativeFunction* {
+        return AllocateRuntime<JSNativeFunction>(name, cb, root);
+    };
+
+    auto* bigint_proto = AllocateRuntime<JSObject>(root);
+    if (realm.GetObjectPrototype()) {
+        bigint_proto->SetPrototype(realm.GetObjectPrototype());
+    }
+    bigint_proto->SetNamedProperty("__bigint_data__", TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(0)), next_sid);
+
+    bigint_proto->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(
+        make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsBigInt()) return this_val;
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__bigint_data__")) return o->GetNamedProperty("__bigint_data__");
+            }
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method BigInt.prototype.valueOf called on incompatible receiver")));
+            }
+            return TaggedValue::Undefined();
+        })), next_sid);
+
+    bigint_proto->SetNamedProperty("toString", TaggedValue::FromHeapObject(
+        make_native("toString", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsBigInt()) {
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(static_cast<JSBigInt*>(this_val.AsHeapObject())->StringValue()));
+            }
+            if (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject()) {
+                auto* o = static_cast<JSObject*>(this_val.AsHeapObject());
+                if (o->HasNamedProperty("__bigint_data__")) {
+                    TaggedValue val = o->GetNamedProperty("__bigint_data__");
+                    if (val.IsHeapObject() && val.AsHeapObject()->IsBigInt()) {
+                        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(static_cast<JSBigInt*>(val.AsHeapObject())->StringValue()));
+                    }
+                }
+            }
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method BigInt.prototype.toString called on incompatible receiver")));
+            }
+            return TaggedValue::Undefined();
+        })), next_sid);
+
+    auto* bigint_ctor = make_native("BigInt", [bigint_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
+        bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (is_construct) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "BigInt is not a constructor")));
+            }
+            return TaggedValue::Undefined();
+        }
+        if (args.empty()) {
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(0));
+        }
+        TaggedValue v = args[0];
+        if (v.IsHeapObject() && v.AsHeapObject()->IsBigInt()) {
+            return v;
+        }
+        if (v.IsSmi()) {
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(static_cast<int64_t>(v.AsSmi())));
+        }
+        if (v.IsDouble()) {
+            double d = v.AsDouble();
+            if (std::isnan(d) || std::isinf(d) || std::trunc(d) != d) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("RangeError", "The number cannot be converted to a BigInt because it is not an integer")));
+                }
+                return TaggedValue::Undefined();
+            }
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(static_cast<int64_t>(d)));
+        }
+        if (v.IsBoolean()) {
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(v.ToBoolean() ? 1 : 0));
+        }
+        if (v.IsHeapObject() && v.AsHeapObject()->IsString()) {
+            std::string s = static_cast<JSString*>(v.AsHeapObject())->Value();
+            try {
+                int64_t n = std::stoll(s, nullptr, 0);
+                return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(n));
+            } catch (...) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("SyntaxError", "Cannot convert to BigInt")));
+                }
+                return TaggedValue::Undefined();
+            }
+        }
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(0));
+    });
+
+    bigint_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(bigint_proto), next_sid);
+    bigint_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(bigint_ctor), next_sid);
+    realm.SetBigIntPrototype(bigint_proto);
+    realm.GetGlobalObject()->SetNamedProperty("BigInt", TaggedValue::FromHeapObject(bigint_ctor), next_sid);
 }
 
 } // namespace aether

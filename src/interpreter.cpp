@@ -8,6 +8,496 @@
 
 namespace aether {
 
+static bool StringLessThanUtf16(std::string_view s1, std::string_view s2) {
+    bool has_high1 = false;
+    for (char c : s1) {
+        if (static_cast<uint8_t>(c) >= 0xF0) { has_high1 = true; break; }
+    }
+    bool has_high2 = false;
+    for (char c : s2) {
+        if (static_cast<uint8_t>(c) >= 0xF0) { has_high2 = true; break; }
+    }
+    if (!has_high1 && !has_high2) {
+        return s1 < s2;
+    }
+    auto to_u16 = [](std::string_view utf8) {
+        std::vector<uint16_t> u16;
+        size_t i = 0;
+        while (i < utf8.size()) {
+            uint8_t c = static_cast<uint8_t>(utf8[i++]);
+            uint32_t cp = 0;
+            if (c < 0x80) {
+                cp = c;
+            } else if ((c & 0xE0) == 0xC0) {
+                if (i < utf8.size()) {
+                    cp = ((c & 0x1F) << 6) | (static_cast<uint8_t>(utf8[i++]) & 0x3F);
+                }
+            } else if ((c & 0xF0) == 0xE0) {
+                if (i + 1 < utf8.size()) {
+                    cp = ((c & 0x0F) << 12) |
+                         ((static_cast<uint8_t>(utf8[i]) & 0x3F) << 6) |
+                         (static_cast<uint8_t>(utf8[i + 1]) & 0x3F);
+                    i += 2;
+                }
+            } else if ((c & 0xF8) == 0xF0) {
+                if (i + 2 < utf8.size()) {
+                    cp = ((c & 0x07) << 18) |
+                         ((static_cast<uint8_t>(utf8[i]) & 0x3F) << 12) |
+                         ((static_cast<uint8_t>(utf8[i + 1]) & 0x3F) << 6) |
+                         (static_cast<uint8_t>(utf8[i + 2]) & 0x3F);
+                    i += 3;
+                }
+            }
+            if (cp < 0x10000) {
+                u16.push_back(static_cast<uint16_t>(cp));
+            } else {
+                cp -= 0x10000;
+                u16.push_back(static_cast<uint16_t>(0xD800 + (cp >> 10)));
+                u16.push_back(static_cast<uint16_t>(0xDC00 + (cp & 0x3FF)));
+            }
+        }
+        return u16;
+    };
+    std::vector<uint16_t> u1 = to_u16(s1);
+    std::vector<uint16_t> u2 = to_u16(s2);
+    return u1 < u2;
+}
+
+static JSBigInt* StringToBigInt(std::string_view s) {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\n' || s.front() == '\r' || s.front() == '\f' || s.front() == '\v')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\n' || s.back() == '\r' || s.back() == '\f' || s.back() == '\v')) {
+        s.remove_suffix(1);
+    }
+    if (s.empty()) return new JSBigInt(0);
+    bool is_neg = false;
+    if (s.front() == '+') {
+        s.remove_prefix(1);
+    } else if (s.front() == '-') {
+        is_neg = true;
+        s.remove_prefix(1);
+    }
+    if (s.empty()) return nullptr;
+    int base = 10;
+    if (s.size() >= 2 && s[0] == '0') {
+        char prefix = s[1];
+        if (prefix == 'x' || prefix == 'X') {
+            if (is_neg) return nullptr;
+            base = 16;
+            s.remove_prefix(2);
+        } else if (prefix == 'o' || prefix == 'O') {
+            if (is_neg) return nullptr;
+            base = 8;
+            s.remove_prefix(2);
+        } else if (prefix == 'b' || prefix == 'B') {
+            if (is_neg) return nullptr;
+            base = 2;
+            s.remove_prefix(2);
+        }
+    }
+    if (s.empty()) return nullptr;
+    for (char c : s) {
+        if (base == 10 && (c < '0' || c > '9')) return nullptr;
+        else if (base == 16 && !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return nullptr;
+        else if (base == 8 && (c < '0' || c > '7')) return nullptr;
+        else if (base == 2 && (c != '0' && c != '1')) return nullptr;
+    }
+    std::string full_str;
+    if (is_neg) full_str += '-';
+    if (base == 16) full_str += "0x";
+    else if (base == 8) full_str += "0o";
+    else if (base == 2) full_str += "0b";
+    full_str.append(s);
+    return new JSBigInt(full_str);
+}
+
+static JSBigInt* DoubleToBigInt(double d) {
+    if (d == 0.0) return new JSBigInt(0);
+    bool is_neg = (d < 0.0);
+    d = std::abs(d);
+    int exp = 0;
+    double mant = std::frexp(d, &exp);
+    uint64_t mant_int = static_cast<uint64_t>(mant * 9007199254740992.0); // 2^53
+    int shift = exp - 53;
+    std::vector<uint32_t> limbs;
+    limbs.push_back(static_cast<uint32_t>(mant_int & 0xFFFFFFFFULL));
+    limbs.push_back(static_cast<uint32_t>(mant_int >> 32));
+    if (shift > 0) {
+        int word_shift = shift / 32;
+        int bit_shift = shift % 32;
+        std::vector<uint32_t> res(word_shift, 0);
+        uint64_t carry = 0;
+        for (uint32_t l : limbs) {
+            uint64_t val = (static_cast<uint64_t>(l) << bit_shift) | carry;
+            res.push_back(static_cast<uint32_t>(val & 0xFFFFFFFFULL));
+            carry = val >> 32;
+        }
+        if (carry) res.push_back(static_cast<uint32_t>(carry));
+        limbs = std::move(res);
+    } else if (shift < 0) {
+        int rshift = -shift;
+        if (rshift >= 64) {
+            limbs.clear();
+        } else {
+            uint64_t val = mant_int >> rshift;
+            limbs.clear();
+            limbs.push_back(static_cast<uint32_t>(val & 0xFFFFFFFFULL));
+            limbs.push_back(static_cast<uint32_t>(val >> 32));
+        }
+    }
+    return new JSBigInt(is_neg, std::move(limbs));
+}
+
+static int CompareBigIntAndNumber(const JSBigInt& bi, double d) {
+    if (std::isnan(d)) return 2; // unordered
+    if (std::isinf(d)) {
+        return (d > 0.0) ? -1 : 1;
+    }
+    if (d == std::trunc(d)) {
+        JSBigInt* bi_d = DoubleToBigInt(d);
+        int res = 0;
+        if (bi.LessThan(*bi_d)) res = -1;
+        else if (bi_d->LessThan(bi)) res = 1;
+        delete bi_d;
+        return res;
+    }
+    double d_int = std::trunc(d);
+    double d_frac = d - d_int;
+    JSBigInt* bi_d = DoubleToBigInt(d_int);
+    int res = 0;
+    if (bi.LessThan(*bi_d)) res = -1;
+    else if (bi_d->LessThan(bi)) res = 1;
+    else {
+        res = (d_frac > 0.0) ? -1 : 1;
+    }
+    delete bi_d;
+    return res;
+}
+
+static inline int32_t ToInt32(TaggedValue v) {
+    if (AETHER_LIKELY(v.IsSmi())) return v.AsSmi();
+    double d = v.ToDouble();
+    if (std::isnan(d) || std::isinf(d) || d == 0.0) return 0;
+    d = std::trunc(d);
+    double two32 = 4294967296.0;
+    double int32_bit = std::fmod(d, two32);
+    if (int32_bit < 0.0) int32_bit += two32;
+    if (int32_bit >= 2147483648.0) return static_cast<int32_t>(int32_bit - two32);
+    return static_cast<int32_t>(int32_bit);
+}
+
+static inline uint32_t ToUint32(TaggedValue v) {
+    return static_cast<uint32_t>(ToInt32(v));
+}
+
+TaggedValue Interpreter::ToPrimitive(TaggedValue input, const char* hint) {
+    if (!input.IsHeapObject()) return input;
+    HeapObject* ho = input.AsHeapObject();
+    if (!ho->IsJSObject() && !ho->IsProxy()) return input;
+
+    std::string prim_key = "@@toPrimitive";
+    TaggedValue to_prim_fn;
+    if (ho->IsProxy()) {
+        to_prim_fn = ProxyGet(static_cast<JSProxy*>(ho), prim_key, input);
+    } else {
+        to_prim_fn = static_cast<JSObject*>(ho)->GetNamedProperty(prim_key);
+    }
+    if (has_pending_exception_) return TaggedValue::Undefined();
+
+    if (!to_prim_fn.IsUndefined() && !to_prim_fn.IsNull()) {
+        if (!to_prim_fn.IsHeapObject() || !to_prim_fn.AsHeapObject()->IsFunction()) {
+            SetPendingException(TaggedValue::FromHeapObject(
+                new JSError("TypeError", "Symbol.toPrimitive is not a function")));
+            return TaggedValue::Undefined();
+        }
+        TaggedValue hint_val = TaggedValue::FromHeapObject(new JSString(hint));
+        TaggedValue res = CallFunction(to_prim_fn, input, {hint_val});
+        if (has_pending_exception_) return TaggedValue::Undefined();
+        if (!res.IsHeapObject() || (!res.AsHeapObject()->IsJSObject() && !res.AsHeapObject()->IsProxy())) {
+            return res;
+        }
+        SetPendingException(TaggedValue::FromHeapObject(
+            new JSError("TypeError", "Cannot convert object to primitive value")));
+        return TaggedValue::Undefined();
+    }
+
+    const char* first_method = (std::strcmp(hint, "string") == 0) ? "toString" : "valueOf";
+    const char* second_method = (std::strcmp(hint, "string") == 0) ? "valueOf" : "toString";
+
+    for (const char* m_name : {first_method, second_method}) {
+        TaggedValue method;
+        if (ho->IsProxy()) {
+            method = ProxyGet(static_cast<JSProxy*>(ho), m_name, input);
+        } else {
+            method = static_cast<JSObject*>(ho)->GetNamedProperty(m_name);
+        }
+        if (has_pending_exception_) return TaggedValue::Undefined();
+        if (method.IsHeapObject() && method.AsHeapObject()->IsFunction()) {
+            TaggedValue res = CallFunction(method, input, {});
+            if (has_pending_exception_) return TaggedValue::Undefined();
+            if (!res.IsHeapObject() || (!res.AsHeapObject()->IsJSObject() && !res.AsHeapObject()->IsProxy())) {
+                return res;
+            }
+        }
+    }
+
+    SetPendingException(TaggedValue::FromHeapObject(
+        new JSError("TypeError", "Cannot convert object to primitive value")));
+    return TaggedValue::Undefined();
+}
+
+TaggedValue Interpreter::ToStringOp(TaggedValue val) {
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->IsString()) return val;
+        if (ho->IsSymbol()) {
+            SetPendingException(TaggedValue::FromHeapObject(
+                new JSError("TypeError", "Cannot convert a Symbol value to a string")));
+            return TaggedValue::Undefined();
+        }
+        if (ho->IsJSObject() || ho->IsProxy()) {
+            TaggedValue prim = ToPrimitive(val, "string");
+            if (has_pending_exception_) return TaggedValue::Undefined();
+            if (prim.IsHeapObject() && prim.AsHeapObject()->IsString()) return prim;
+            if (prim.IsHeapObject() && prim.AsHeapObject()->IsSymbol()) {
+                SetPendingException(TaggedValue::FromHeapObject(
+                    new JSError("TypeError", "Cannot convert a Symbol value to a string")));
+                return TaggedValue::Undefined();
+            }
+            return TaggedValue::FromHeapObject(new JSString(prim.ToString()));
+        }
+    }
+    return TaggedValue::FromHeapObject(new JSString(val.ToString()));
+}
+
+TaggedValue Interpreter::ToNumeric(TaggedValue val) {
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->IsJSObject() || ho->IsProxy()) {
+            val = ToPrimitive(val, "number");
+            if (has_pending_exception_) return TaggedValue::Undefined();
+        }
+    }
+    if (val.IsBigInt()) {
+        return val;
+    }
+    if (val.IsSymbol()) {
+        SetPendingException(TaggedValue::FromHeapObject(
+            new JSError("TypeError", "Cannot convert a Symbol value to a number")));
+        return TaggedValue::Undefined();
+    }
+    if (val.IsSmi() || val.IsDouble()) {
+        return val;
+    }
+    return TaggedValue::FromDouble(val.ToDouble());
+}
+
+TaggedValue Interpreter::ToPropertyKey(TaggedValue val) {
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->IsString() || ho->IsSymbol()) {
+            return val;
+        }
+        TaggedValue prim = ToPrimitive(val, "string");
+        if (has_pending_exception_) return TaggedValue::Undefined();
+        if (prim.IsHeapObject() && prim.AsHeapObject()->IsSymbol()) {
+            return prim;
+        }
+        return ToStringOp(prim);
+    }
+    if (val.IsSmi()) {
+        return val;
+    }
+    return ToStringOp(val);
+}
+
+Interpreter::RelationalResult Interpreter::AbstractRelationalComparison(TaggedValue x, TaggedValue y, bool left_first) {
+    TaggedValue px, py;
+    if (left_first) {
+        px = ToPrimitive(x, "number");
+        if (has_pending_exception_) return RelationalResult::Undefined;
+        py = ToPrimitive(y, "number");
+        if (has_pending_exception_) return RelationalResult::Undefined;
+    } else {
+        py = ToPrimitive(y, "number");
+        if (has_pending_exception_) return RelationalResult::Undefined;
+        px = ToPrimitive(x, "number");
+        if (has_pending_exception_) return RelationalResult::Undefined;
+    }
+
+    if (px.IsHeapObject() && px.AsHeapObject()->IsString() &&
+        py.IsHeapObject() && py.AsHeapObject()->IsString()) {
+        std::string_view s1 = static_cast<JSString*>(px.AsHeapObject())->View();
+        std::string_view s2 = static_cast<JSString*>(py.AsHeapObject())->View();
+        return StringLessThanUtf16(s1, s2) ? RelationalResult::True : RelationalResult::False;
+    }
+
+    if (px.IsBigInt() && py.IsHeapObject() && py.AsHeapObject()->IsString()) {
+        std::string_view s = static_cast<JSString*>(py.AsHeapObject())->View();
+        JSBigInt* ny = StringToBigInt(s);
+        if (!ny) return RelationalResult::Undefined;
+        auto* bx = static_cast<JSBigInt*>(px.AsHeapObject());
+        bool res = bx->LessThan(*ny);
+        delete ny;
+        return res ? RelationalResult::True : RelationalResult::False;
+    }
+
+    if (px.IsHeapObject() && px.AsHeapObject()->IsString() && py.IsBigInt()) {
+        std::string_view s = static_cast<JSString*>(px.AsHeapObject())->View();
+        JSBigInt* nx = StringToBigInt(s);
+        if (!nx) return RelationalResult::Undefined;
+        auto* by = static_cast<JSBigInt*>(py.AsHeapObject());
+        bool res = nx->LessThan(*by);
+        delete nx;
+        return res ? RelationalResult::True : RelationalResult::False;
+    }
+
+    TaggedValue nx = ToNumeric(px);
+    if (has_pending_exception_) return RelationalResult::Undefined;
+    TaggedValue ny = ToNumeric(py);
+    if (has_pending_exception_) return RelationalResult::Undefined;
+
+    if (nx.IsBigInt() && ny.IsBigInt()) {
+        auto* bx = static_cast<JSBigInt*>(nx.AsHeapObject());
+        auto* by = static_cast<JSBigInt*>(ny.AsHeapObject());
+        return bx->LessThan(*by) ? RelationalResult::True : RelationalResult::False;
+    }
+
+    if (nx.IsBigInt() && !ny.IsBigInt()) {
+        auto* bx = static_cast<JSBigInt*>(nx.AsHeapObject());
+        double dy = ny.ToDouble();
+        int cmp = CompareBigIntAndNumber(*bx, dy);
+        if (cmp == 2) return RelationalResult::Undefined;
+        return (cmp == -1) ? RelationalResult::True : RelationalResult::False;
+    }
+
+    if (!nx.IsBigInt() && ny.IsBigInt()) {
+        auto* by = static_cast<JSBigInt*>(ny.AsHeapObject());
+        double dx = nx.ToDouble();
+        int cmp = CompareBigIntAndNumber(*by, dx);
+        if (cmp == 2) return RelationalResult::Undefined;
+        return (cmp == 1) ? RelationalResult::True : RelationalResult::False;
+    }
+
+    double dx = nx.ToDouble();
+    double dy = ny.ToDouble();
+    if (std::isnan(dx) || std::isnan(dy)) return RelationalResult::Undefined;
+    return (dx < dy) ? RelationalResult::True : RelationalResult::False;
+}
+
+bool Interpreter::IsStrictlyEqual(TaggedValue x, TaggedValue y) {
+    if (x.IsSmi() && y.IsSmi()) return x.AsSmi() == y.AsSmi();
+    if (x.IsNumber() && y.IsNumber()) {
+        double d1 = x.ToDouble();
+        double d2 = y.ToDouble();
+        if (std::isnan(d1) || std::isnan(d2)) return false;
+        return d1 == d2;
+    }
+    if (x.IsBoolean() && y.IsBoolean()) return x.ToBoolean() == y.ToBoolean();
+    if (x.IsNull() && y.IsNull()) return true;
+    if (x.IsUndefined() && y.IsUndefined()) return true;
+    if (x.IsHeapObject() && y.IsHeapObject()) {
+        HeapObject* h1 = x.AsHeapObject();
+        HeapObject* h2 = y.AsHeapObject();
+        if (h1 == h2) return true;
+        if (h1->IsString() && h2->IsString()) {
+            return static_cast<JSString*>(h1)->View() == static_cast<JSString*>(h2)->View();
+        }
+        if (h1->IsBigInt() && h2->IsBigInt()) {
+            return static_cast<JSBigInt*>(h1)->Equals(*static_cast<JSBigInt*>(h2));
+        }
+        if (h1->IsSymbol() && h2->IsSymbol()) {
+            return h1 == h2;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool Interpreter::IsLooselyEqual(TaggedValue x, TaggedValue y) {
+    // 1. Same type
+    if ((x.IsNumber() && y.IsNumber()) ||
+        (x.IsBoolean() && y.IsBoolean()) ||
+        (x.IsNull() && y.IsNull()) ||
+        (x.IsUndefined() && y.IsUndefined()) ||
+        (x.IsHeapObject() && y.IsHeapObject() && x.AsHeapObject()->GetType() == y.AsHeapObject()->GetType())) {
+        return IsStrictlyEqual(x, y);
+    }
+
+    // 2 & 3. null and undefined
+    if (x.IsNull() && y.IsUndefined()) return true;
+    if (x.IsUndefined() && y.IsNull()) return true;
+
+    // 5 & 6. Number and String
+    if (x.IsNumber() && y.IsHeapObject() && y.AsHeapObject()->IsString()) {
+        return IsLooselyEqual(x, TaggedValue::FromDouble(y.ToDouble()));
+    }
+    if (x.IsHeapObject() && x.AsHeapObject()->IsString() && y.IsNumber()) {
+        return IsLooselyEqual(TaggedValue::FromDouble(x.ToDouble()), y);
+    }
+
+    // 7 & 8. BigInt and String
+    if (x.IsBigInt() && y.IsHeapObject() && y.AsHeapObject()->IsString()) {
+        std::string_view s = static_cast<JSString*>(y.AsHeapObject())->View();
+        JSBigInt* n = StringToBigInt(s);
+        if (!n) return false;
+        bool res = static_cast<JSBigInt*>(x.AsHeapObject())->Equals(*n);
+        delete n;
+        return res;
+    }
+    if (x.IsHeapObject() && x.AsHeapObject()->IsString() && y.IsBigInt()) {
+        return IsLooselyEqual(y, x);
+    }
+
+    // 9 & 10. Boolean
+    if (x.IsBoolean()) {
+        return IsLooselyEqual(TaggedValue::FromDouble(x.ToBoolean() ? 1.0 : 0.0), y);
+    }
+    if (y.IsBoolean()) {
+        return IsLooselyEqual(x, TaggedValue::FromDouble(y.ToBoolean() ? 1.0 : 0.0));
+    }
+
+    // 11 & 12. Primitive and Object
+    auto is_prim = [](TaggedValue v) {
+        if (!v.IsHeapObject()) return true;
+        auto t = v.AsHeapObject()->GetType();
+        return t == HeapObjectType::String || t == HeapObjectType::Symbol || t == HeapObjectType::JSBigInt;
+    };
+    auto is_obj = [](TaggedValue v) {
+        if (!v.IsHeapObject()) return false;
+        auto* ho = v.AsHeapObject();
+        return ho->IsJSObject() || ho->IsProxy();
+    };
+
+    if (is_prim(x) && is_obj(y)) {
+        TaggedValue py = ToPrimitive(y, "default");
+        if (has_pending_exception_) return false;
+        return IsLooselyEqual(x, py);
+    }
+    if (is_obj(x) && is_prim(y)) {
+        TaggedValue px = ToPrimitive(x, "default");
+        if (has_pending_exception_) return false;
+        return IsLooselyEqual(px, y);
+    }
+
+    // 13. BigInt and Number
+    if (x.IsBigInt() && y.IsNumber()) {
+        double d = y.ToDouble();
+        if (std::isnan(d) || std::isinf(d)) return false;
+        if (d != std::trunc(d)) return false;
+        JSBigInt* bi_d = DoubleToBigInt(d);
+        bool eq = static_cast<JSBigInt*>(x.AsHeapObject())->Equals(*bi_d);
+        delete bi_d;
+        return eq;
+    }
+    if (x.IsNumber() && y.IsBigInt()) {
+        return IsLooselyEqual(y, x);
+    }
+
+    return false;
+}
+
 TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env) {
     struct InterpreterScope {
         Interpreter* prev;
@@ -19,6 +509,16 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         }
     };
     InterpreterScope current_scope(this);
+
+    if (call_depth_ >= kMaxCallDepth) {
+        SetPendingException(TaggedValue::FromHeapObject(new JSError("RangeError", "Maximum call stack size exceeded")));
+        return pending_exception_;
+    }
+    struct CallDepthGuard {
+        uint32_t& depth;
+        explicit CallDepthGuard(uint32_t& d) : depth(d) { depth++; }
+        ~CallDepthGuard() { depth--; }
+    } depth_guard(call_depth_);
 
     // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
     if (auto t2 = bytecode.GetTier2SharedCode()) {
@@ -72,7 +572,20 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         }
     }
 
-    ExecutionFrame frame(bytecode, args, this_val, env);
+    bool prev_strict = is_strict_mode_;
+    is_strict_mode_ = bytecode.IsStrict();
+    struct StrictGuard {
+        Interpreter* interp;
+        bool prev;
+        ~StrictGuard() { interp->is_strict_mode_ = prev; }
+    } strict_guard{this, prev_strict};
+
+    TaggedValue effective_this = this_val;
+    if (!is_strict_mode_ && (effective_this.IsUndefined() || effective_this.IsNull()) && Realm::Current() && Realm::Current()->GetGlobalObject()) {
+        effective_this = TaggedValue::FromHeapObject(Realm::Current()->GetGlobalObject());
+    }
+
+    ExecutionFrame frame(bytecode, args, effective_this, env);
     acc_ = TaggedValue::Undefined();
     return RunExecutionLoop(frame, bytecode.Code().data(), nullptr);
 }
@@ -122,6 +635,14 @@ TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sen
             return pending_exception_;
         }
     }
+
+    bool prev_strict = is_strict_mode_;
+    is_strict_mode_ = bytecode.IsStrict();
+    struct StrictGuard {
+        Interpreter* interp;
+        bool prev;
+        ~StrictGuard() { interp->is_strict_mode_ = prev; }
+    } strict_guard{this, prev_strict};
 
     bool yielded = false;
     TaggedValue result = RunExecutionLoop(frame, start_pc, &yielded, out_is_await);
@@ -329,6 +850,16 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
         }
     } env_guard{*this, frame};
 
+    struct WithGuard {
+        Interpreter& interp;
+        size_t initial_depth;
+        ~WithGuard() {
+            if (initial_depth < interp.with_stack_.size()) {
+                interp.with_stack_.resize(initial_depth);
+            }
+        }
+    } with_guard{*this, with_stack_.size()};
+
     const uint8_t* code_start = bytecode.Code().data();
     const uint8_t* pc = start_pc;
     const uint8_t* code_end = code_start + bytecode.Code().size();
@@ -340,7 +871,42 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             case Opcode::LdaConstant: {
                 uint16_t idx = pc[0] | (pc[1] << 8);
                 pc += 2;
-                acc_ = bytecode.Constants()[idx];
+                TaggedValue const_val = bytecode.Constants()[idx];
+                if (const_val.IsHeapObject() && const_val.AsHeapObject()->IsFunction()) {
+                    auto* fn = static_cast<JSFunction*>(const_val.AsHeapObject());
+                    if (!fn->GetEnvironment() && frame.GetEnvironment()) {
+                        fn->SetEnvironment(frame.GetEnvironment());
+                        if (fn->GetOrCreateConstructorPrototype()) {
+                            auto* proto = fn->GetOrCreateConstructorPrototype();
+                            for (const auto& name : proto->GetOwnPropertyNames()) {
+                                if (proto->HasAccessor(name)) continue;
+                                TaggedValue prop_val = proto->GetNamedProperty(name);
+                                if (prop_val.IsHeapObject() && prop_val.AsHeapObject()->IsFunction()) {
+                                    auto* m_fn = static_cast<JSFunction*>(prop_val.AsHeapObject());
+                                    if (!m_fn->GetEnvironment()) {
+                                        m_fn->SetEnvironment(frame.GetEnvironment());
+                                    }
+                                }
+                            }
+                            for (const auto& [acc_name, acc_desc] : proto->GetAccessors()) {
+                                (void)acc_name;
+                                if (acc_desc.getter.IsHeapObject() && acc_desc.getter.AsHeapObject()->IsFunction()) {
+                                    auto* g_fn = static_cast<JSFunction*>(acc_desc.getter.AsHeapObject());
+                                    if (!g_fn->GetEnvironment()) {
+                                        g_fn->SetEnvironment(frame.GetEnvironment());
+                                    }
+                                }
+                                if (acc_desc.setter.IsHeapObject() && acc_desc.setter.AsHeapObject()->IsFunction()) {
+                                    auto* s_fn = static_cast<JSFunction*>(acc_desc.setter.AsHeapObject());
+                                    if (!s_fn->GetEnvironment()) {
+                                        s_fn->SetEnvironment(frame.GetEnvironment());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                acc_ = const_val;
                 break;
             }
             case Opcode::LdaZero: {
@@ -405,14 +971,107 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(sum));
                     }
-                } else if ((acc_.IsHeapObject() && acc_.AsHeapObject()->IsString()) ||
-                           (rhs.IsHeapObject() && rhs.AsHeapObject()->IsString())) {
-                    // String concatenation
-                    std::string s1 = acc_.ToString();
-                    std::string s2 = rhs.ToString();
-                    acc_ = TaggedValue::FromHeapObject(new JSString(s1 + s2));
                 } else {
-                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() + rhs.ToDouble());
+                    TaggedValue lval = acc_;
+                    TaggedValue rval = rhs;
+                    if (lval.IsHeapObject() && (lval.AsHeapObject()->IsJSObject() || lval.AsHeapObject()->IsProxy())) {
+                        lval = ToPrimitive(lval, "default");
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                    }
+                    if (rval.IsHeapObject() && (rval.AsHeapObject()->IsJSObject() || rval.AsHeapObject()->IsProxy())) {
+                        rval = ToPrimitive(rval, "default");
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                    }
+                    if ((lval.IsHeapObject() && lval.AsHeapObject()->IsString()) ||
+                        (rval.IsHeapObject() && rval.AsHeapObject()->IsString())) {
+                        // String concatenation
+                        TaggedValue s1_val = ToStringOp(lval);
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        TaggedValue s2_val = ToStringOp(rval);
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        std::string s1 = static_cast<JSString*>(s1_val.AsHeapObject())->Value();
+                        std::string s2 = static_cast<JSString*>(s2_val.AsHeapObject())->Value();
+                        acc_ = TaggedValue::FromHeapObject(new JSString(s1 + s2));
+                    } else {
+                        if (lval.IsSymbol() || rval.IsSymbol()) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                new JSError("TypeError", "Cannot convert a Symbol value to a number")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        if (lval.IsBigInt() && rval.IsBigInt()) {
+                            auto* b1 = static_cast<JSBigInt*>(lval.AsHeapObject());
+                            auto* b2 = static_cast<JSBigInt*>(rval.AsHeapObject());
+                            acc_ = TaggedValue::FromHeapObject(b1->Add(*b2));
+                        } else if (lval.IsBigInt() || rval.IsBigInt()) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        } else {
+                            acc_ = TaggedValue::FromDouble(lval.ToDouble() + rval.ToDouble());
+                        }
+                    }
                 }
                 break;
             }
@@ -436,7 +1095,55 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         acc_ = TaggedValue::FromDouble(static_cast<double>(diff));
                     }
                 } else {
-                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() - rhs.ToDouble());
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    TaggedValue rnum = ToNumeric(rhs);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt()) {
+                        auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                        auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                        acc_ = TaggedValue::FromHeapObject(b1->Subtract(*b2));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(lnum.ToDouble() - rnum.ToDouble());
+                    }
                 }
                 break;
             }
@@ -462,7 +1169,55 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         acc_ = TaggedValue::FromDouble(static_cast<double>(prod));
                     }
                 } else {
-                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() * rhs.ToDouble());
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    TaggedValue rnum = ToNumeric(rhs);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt()) {
+                        auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                        auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                        acc_ = TaggedValue::FromHeapObject(b1->Multiply(*b2));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(lnum.ToDouble() * rnum.ToDouble());
+                    }
                 }
                 break;
             }
@@ -474,15 +1229,79 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi() && rhs.AsSmi() != 0)) {
-                    int32_t n = acc_.AsSmi();
-                    int32_t d = rhs.AsSmi();
-                    if (n % d == 0 && !(n == 0 && d < 0)) {
-                        acc_ = TaggedValue::FromSmi(n / d);
+                    const int64_t n = acc_.AsSmi();
+                    const int64_t d = rhs.AsSmi();
+                    const int64_t quotient = n / d;
+                    if (n % d == 0 && quotient >= INT32_MIN && quotient <= INT32_MAX && !(n == 0 && d < 0)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(quotient));
                     } else {
                         acc_ = TaggedValue::FromDouble(static_cast<double>(n) / static_cast<double>(d));
                     }
                 } else {
-                    acc_ = TaggedValue::FromDouble(acc_.ToDouble() / rhs.ToDouble());
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    TaggedValue rnum = ToNumeric(rhs);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt()) {
+                        auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                        auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                        JSBigInt* res = b1->Divide(*b2);
+                        if (!res) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                new JSError("RangeError", "Division by zero")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        acc_ = TaggedValue::FromHeapObject(res);
+                    } else {
+                        acc_ = TaggedValue::FromDouble(lnum.ToDouble() / rnum.ToDouble());
+                    }
                 }
                 break;
             }
@@ -494,9 +1313,84 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 TaggedValue rhs = frame.GetRegister(reg);
                 if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi() && rhs.AsSmi() != 0)) {
-                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() % rhs.AsSmi());
+                    const int32_t n = acc_.AsSmi();
+                    const int32_t d = rhs.AsSmi();
+                    // ECMAScript remainder preserves the dividend sign. The
+                    // INT32_MIN/-1 pair is -0 and must not execute the
+                    // overflowing C++ signed remainder operation.
+                    if (n == INT32_MIN && d == -1) {
+                        acc_ = TaggedValue::FromDouble(-0.0);
+                    } else {
+                        const int32_t rem = n % d;
+                        acc_ = (rem == 0 && n < 0)
+                            ? TaggedValue::FromDouble(-0.0)
+                            : TaggedValue::FromSmi(rem);
+                    }
                 } else {
-                    acc_ = TaggedValue::FromDouble(std::fmod(acc_.ToDouble(), rhs.ToDouble()));
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    TaggedValue rnum = ToNumeric(rhs);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    if (lnum.IsBigInt()) {
+                        auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                        auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                        JSBigInt* res = b1->Remainder(*b2);
+                        if (!res) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                new JSError("RangeError", "Division by zero")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        acc_ = TaggedValue::FromHeapObject(res);
+                    } else {
+                        acc_ = TaggedValue::FromDouble(std::fmod(lnum.ToDouble(), rnum.ToDouble()));
+                    }
                 }
                 break;
             }
@@ -507,56 +1401,419 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 (void)slot_id;
 
                 TaggedValue rhs = frame.GetRegister(reg);
-                double base = acc_.IsSmi() ? acc_.AsSmi() : (acc_.IsNumber() ? acc_.AsNumber() : 0.0);
-                double exp = rhs.IsSmi() ? rhs.AsSmi() : (rhs.IsNumber() ? rhs.AsNumber() : 0.0);
-                acc_ = TaggedValue::FromDouble(std::pow(base, exp));
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    JSBigInt* res = b1->Exponentiate(*b2);
+                    if (!res) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("RangeError", "Cannot exponentiate BigInt with negative exponent")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromHeapObject(res);
+                } else {
+                    double base = lnum.ToDouble();
+                    double exp = rnum.ToDouble();
+                    if (std::isnan(exp)) {
+                        acc_ = TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+                    } else if (exp == 0.0) {
+                        acc_ = TaggedValue::FromDouble(1.0);
+                    } else if (std::isnan(base)) {
+                        acc_ = TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+                    } else if (std::abs(base) == 1.0 && std::isinf(exp)) {
+                        acc_ = TaggedValue::FromDouble(std::numeric_limits<double>::quiet_NaN());
+                    } else {
+                        acc_ = TaggedValue::FromDouble(std::pow(base, exp));
+                    }
+                }
                 break;
             }
             case Opcode::BitwiseAnd: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                int32_t a = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                int32_t b = rhs.IsSmi() ? rhs.AsSmi() : static_cast<int32_t>(rhs.AsNumber());
-                acc_ = TaggedValue::FromSmi(a & b);
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    acc_ = TaggedValue::FromHeapObject(b1->BitwiseAnd(*b2));
+                } else {
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) & ToInt32(rnum));
+                }
                 break;
             }
             case Opcode::BitwiseOr: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                int32_t a = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                int32_t b = rhs.IsSmi() ? rhs.AsSmi() : static_cast<int32_t>(rhs.AsNumber());
-                acc_ = TaggedValue::FromSmi(a | b);
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    acc_ = TaggedValue::FromHeapObject(b1->BitwiseOr(*b2));
+                } else {
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) | ToInt32(rnum));
+                }
                 break;
             }
             case Opcode::BitwiseXor: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                int32_t a = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                int32_t b = rhs.IsSmi() ? rhs.AsSmi() : static_cast<int32_t>(rhs.AsNumber());
-                acc_ = TaggedValue::FromSmi(a ^ b);
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    acc_ = TaggedValue::FromHeapObject(b1->BitwiseXor(*b2));
+                } else {
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) ^ ToInt32(rnum));
+                }
                 break;
             }
             case Opcode::ShiftLeft: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                int32_t a = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                uint32_t shift = (rhs.IsSmi() ? rhs.AsSmi() : static_cast<int32_t>(rhs.AsNumber())) & 0x1F;
-                acc_ = TaggedValue::FromSmi(a << shift);
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    JSBigInt* res = b1->ShiftLeft(*b2);
+                    if (!res) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("RangeError", "Maximum BigInt size exceeded")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromHeapObject(res);
+                } else {
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) << (ToUint32(rnum) & 0x1F));
+                }
                 break;
             }
             case Opcode::ShiftRight: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                int32_t a = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                uint32_t shift = (rhs.IsSmi() ? rhs.AsSmi() : static_cast<int32_t>(rhs.AsNumber())) & 0x1F;
-                acc_ = TaggedValue::FromSmi(a >> shift);
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() != rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt()) {
+                    auto* b1 = static_cast<JSBigInt*>(lnum.AsHeapObject());
+                    auto* b2 = static_cast<JSBigInt*>(rnum.AsHeapObject());
+                    JSBigInt* res = b1->ShiftRight(*b2);
+                    if (!res) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            new JSError("RangeError", "Maximum BigInt size exceeded")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromHeapObject(res);
+                } else {
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) >> (ToUint32(rnum) & 0x1F));
+                }
                 break;
             }
             case Opcode::ShiftRightUnsigned: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                uint32_t a = static_cast<uint32_t>(acc_.IsSmi() ? acc_.AsSmi() : (acc_.IsNumber() ? static_cast<int64_t>(acc_.AsNumber()) : 0));
-                uint32_t shift = (rhs.IsSmi() ? rhs.AsSmi() : (rhs.IsNumber() ? static_cast<int32_t>(rhs.AsNumber()) : 0)) & 0x1F;
+                TaggedValue lnum = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                TaggedValue rnum = ToNumeric(rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (lnum.IsBigInt() || rnum.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(
+                        new JSError("TypeError", "BigInts have no unsigned right shift, use >> instead")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                uint32_t a = ToUint32(lnum);
+                uint32_t shift = ToUint32(rnum) & 0x1F;
                 uint32_t res = a >> shift;
                 if (res <= static_cast<uint32_t>(INT32_MAX)) {
                     acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
@@ -568,119 +1825,121 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             case Opcode::TestEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (acc_.IsSmi() && rhs.IsSmi()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() == rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() == rhs.AsNumber());
-                } else if ((acc_.IsNull() || acc_.IsUndefined()) && (rhs.IsNull() || rhs.IsUndefined())) {
-                    acc_ = TaggedValue::FromBoolean(true);
-                } else if (acc_.IsHeapObject() && rhs.IsHeapObject() &&
-                           acc_.AsHeapObject()->IsString() && rhs.AsHeapObject()->IsString()) {
-                    auto* s1 = static_cast<JSString*>(acc_.AsHeapObject());
-                    auto* s2 = static_cast<JSString*>(rhs.AsHeapObject());
-                    acc_ = TaggedValue::FromBoolean(s1->View() == s2->View());
-                } else if ((acc_.IsNumber() || acc_.IsBoolean()) && (rhs.IsString() || rhs.IsBoolean())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.ToDouble() == rhs.ToDouble());
-                } else if (acc_.IsString() && (rhs.IsNumber() || rhs.IsBoolean())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.ToDouble() == rhs.ToDouble());
-                } else {
-                    acc_ = TaggedValue::FromBoolean(acc_ == rhs);
+                bool eq = IsLooselyEqual(acc_, rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
                 }
+                acc_ = TaggedValue::FromBoolean(eq);
                 break;
             }
             case Opcode::TestStrictEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (acc_.IsSmi() && rhs.IsSmi()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() == rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() == rhs.AsNumber());
-                } else if (acc_.IsHeapObject() && rhs.IsHeapObject() &&
-                           acc_.AsHeapObject()->IsString() && rhs.AsHeapObject()->IsString()) {
-                    auto* s1 = static_cast<JSString*>(acc_.AsHeapObject());
-                    auto* s2 = static_cast<JSString*>(rhs.AsHeapObject());
-                    acc_ = TaggedValue::FromBoolean(s1->View() == s2->View());
-                } else {
-                    acc_ = TaggedValue::FromBoolean(acc_ == rhs);
-                }
+                acc_ = TaggedValue::FromBoolean(IsStrictlyEqual(acc_, rhs));
                 break;
             }
             case Opcode::TestLessThan: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() < rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() < rhs.AsNumber());
+                RelationalResult res = AbstractRelationalComparison(acc_, rhs, true);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
                 }
+                acc_ = TaggedValue::FromBoolean(res == RelationalResult::True);
                 break;
             }
             case Opcode::TestGreaterThan: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() > rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() > rhs.AsNumber());
+                RelationalResult res = AbstractRelationalComparison(rhs, acc_, false);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
                 }
+                acc_ = TaggedValue::FromBoolean(res == RelationalResult::True);
                 break;
             }
             case Opcode::TestLessThanOrEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() <= rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() <= rhs.AsNumber());
+                RelationalResult res = AbstractRelationalComparison(rhs, acc_, false);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
                 }
+                acc_ = TaggedValue::FromBoolean(res == RelationalResult::False);
                 break;
             }
             case Opcode::TestGreaterThanOrEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (AETHER_LIKELY(acc_.IsSmi() && rhs.IsSmi())) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsSmi() >= rhs.AsSmi());
-                } else if (acc_.IsNumber() && rhs.IsNumber()) {
-                    acc_ = TaggedValue::FromBoolean(acc_.AsNumber() >= rhs.AsNumber());
+                RelationalResult res = AbstractRelationalComparison(acc_, rhs, true);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
                 }
+                acc_ = TaggedValue::FromBoolean(res == RelationalResult::False);
                 break;
             }
             case Opcode::TestInstanceOf: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
-                if (!acc_.IsHeapObject() || !rhs.IsHeapObject()) {
-                    acc_ = TaggedValue::FromBoolean(false);
+                TaggedValue res = InstanceofOperator(acc_, rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
                     break;
                 }
-                TaggedValue target_proto = TaggedValue::Undefined();
-                HeapObject* rhs_obj = rhs.AsHeapObject();
-                if (rhs_obj->GetType() == HeapObjectType::JSFunction) {
-                    auto* fn = static_cast<JSFunction*>(rhs_obj);
-                    if (!fn->GetPrototype()) {
-                        fn->SetPrototype(new JSObject(GetRootShape()));
-                    }
-                    target_proto = TaggedValue::FromHeapObject(fn->GetPrototype());
-                } else if (rhs_obj->IsNativeFunction()) {
-                    target_proto = static_cast<JSNativeFunction*>(rhs_obj)->GetNamedProperty("prototype");
-                } else if (rhs_obj->IsProxy()) {
-                    target_proto = GetProperty(rhs, "prototype");
-                } else if (rhs_obj->IsJSObject()) {
-                    target_proto = static_cast<JSObject*>(rhs_obj)->GetNamedProperty("prototype");
-                }
-
-                JSObject* curr = nullptr;
-                if (acc_.AsHeapObject()->IsJSObject()) {
-                    curr = static_cast<JSObject*>(acc_.AsHeapObject())->GetPrototype();
-                }
-                bool found = false;
-                while (curr) {
-                    if (TaggedValue::FromHeapObject(curr) == target_proto) {
-                        found = true;
-                        break;
-                    }
-                    curr = curr->GetPrototype();
-                }
-                acc_ = TaggedValue::FromBoolean(found);
+                acc_ = res;
                 break;
             }
             case Opcode::TestIn: {
@@ -716,6 +1975,30 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         return pending_exception_;
                     }
                     break;
+                }
+                acc_ = TaggedValue::FromBoolean(res);
+                break;
+            }
+            case Opcode::TestInWith: {
+                uint8_t rhs_reg = *pc++;
+                TaggedValue rhs_val = frame.GetRegister(rhs_reg);
+                TaggedValue prop_val = acc_;
+
+                if (!rhs_val.IsHeapObject() || !rhs_val.AsHeapObject()->IsJSObject()) {
+                    acc_ = TaggedValue::FromBoolean(false);
+                    break;
+                }
+
+                std::string prop_name = prop_val.ToString();
+                bool res = HasProperty(rhs_val, prop_name);
+                if (res) {
+                    TaggedValue unscopables = GetProperty(rhs_val, "@@unscopables");
+                    if (unscopables.IsHeapObject() && unscopables.AsHeapObject()->IsJSObject()) {
+                        TaggedValue blocked = GetProperty(unscopables, prop_name);
+                        if (blocked.ToBoolean()) {
+                            res = false;
+                        }
+                    }
                 }
                 acc_ = TaggedValue::FromBoolean(res);
                 break;
@@ -775,6 +2058,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         acc_ = Realm::Current()->GetNumberPrototype()->GetNamedProperty(prop_key);
                         break;
                     }
+                    if (obj_val.IsBoolean() && Realm::Current() && Realm::Current()->GetBooleanPrototype()) {
+                        acc_ = Realm::Current()->GetBooleanPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
                     if (obj_val.IsString() && Realm::Current() && Realm::Current()->GetStringPrototype()) {
                         if (prop_key == "length") {
                             acc_ = TaggedValue::FromSmi(static_cast<int32_t>(obj_val.ToString().length()));
@@ -801,6 +2088,24 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     break;
                 }
 
+                if (obj_val.AsHeapObject()->IsSymbol()) {
+                    if (Realm::Current() && Realm::Current()->GetSymbolPrototype()) {
+                        acc_ = Realm::Current()->GetSymbolPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
+                    acc_ = TaggedValue::Undefined();
+                    break;
+                }
+
+                if (obj_val.AsHeapObject()->IsBigInt()) {
+                    if (Realm::Current() && Realm::Current()->GetBigIntPrototype()) {
+                        acc_ = Realm::Current()->GetBigIntPrototype()->GetNamedProperty(prop_key);
+                        break;
+                    }
+                    acc_ = TaggedValue::Undefined();
+                    break;
+                }
+
                 if (obj_val.AsHeapObject()->IsProxy()) {
                     acc_ = ProxyGet(static_cast<JSProxy*>(obj_val.AsHeapObject()), prop_key, obj_val);
                     if (has_pending_exception_) {
@@ -817,38 +2122,41 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     break;
                 }
 
+                if (prop_key == "new.target") {
+                    acc_ = current_new_target_;
+                    break;
+                }
+
                 if (obj_val.AsHeapObject()->IsFunction()) {
-                    if (prop_key == "call") {
-                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("call", [callee = obj_val](const std::vector<TaggedValue>& args) -> TaggedValue {
-                            TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
-                            std::vector<TaggedValue> fn_args;
-                            if (args.size() > 1) {
-                                fn_args.assign(args.begin() + 1, args.end());
-                            }
-                            return CallFunction(callee, this_arg, fn_args);
-                        }));
-                        break;
+                    if (prop_key == "name") {
+                        if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
+                            acc_ = TaggedValue::FromHeapObject(new JSString(static_cast<JSFunction*>(obj_val.AsHeapObject())->Name()));
+                            break;
+                        } else if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSNativeFunction) {
+                            acc_ = TaggedValue::FromHeapObject(new JSString(static_cast<JSNativeFunction*>(obj_val.AsHeapObject())->Name()));
+                            break;
+                        }
                     }
-                    if (prop_key == "apply") {
-                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSNativeFunction>("apply", [callee = obj_val](const std::vector<TaggedValue>& args) -> TaggedValue {
-                            TaggedValue this_arg = args.empty() ? TaggedValue::Undefined() : args[0];
-                            std::vector<TaggedValue> fn_args;
-                            if (args.size() > 1 && args[1].IsHeapObject() && args[1].AsHeapObject()->IsArray()) {
-                                auto* arr = static_cast<JSArray*>(args[1].AsHeapObject());
-                                for (size_t i = 0; i < arr->Length(); ++i) fn_args.push_back(arr->GetElement(i));
-                            }
-                            return CallFunction(callee, this_arg, fn_args);
-                        }));
-                        break;
+                    if (prop_key == "length") {
+                        if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
+                            auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
+                            uint32_t len = fn->GetBytecode() ? fn->GetBytecode()->Length() : 0;
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(len));
+                            break;
+                        }
                     }
+
                     if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                         auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
                         if (prop_key == "prototype") {
-                            if (!fn->GetPrototype()) {
-                                fn->SetPrototype(new JSObject(GetRootShape()));
+                            if (!fn->IsArrow() && !fn->IsAsync()) {
+                                if (fn->GetConstructorPrototype().IsEmpty()) {
+                                    acc_ = TaggedValue::FromHeapObject(fn->GetOrCreateConstructorPrototype());
+                                } else {
+                                    acc_ = fn->GetConstructorPrototype();
+                                }
+                                break;
                             }
-                            acc_ = TaggedValue::FromHeapObject(fn->GetPrototype());
-                            break;
                         }
                     }
                 }
@@ -929,8 +2237,12 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 // Inline Cache check
                 FeedbackSlot& ic_slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                 Shape* obj_shape = js_obj->GetShape();
+                if (obj_shape == nullptr && Realm::Current()) {
+                    obj_shape = Realm::Current()->GetRootShape();
+                    js_obj->SetShape(obj_shape);
+                }
 
-                if (AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape)) {
+                if (obj_shape && AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape)) {
                     // Monomorphic IC Hit: Direct O(1) slot read
                     acc_ = js_obj->GetFastSlot(ic_slot.cached_slot, ic_slot.cached_in_object);
                 } else {
@@ -938,11 +2250,64 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = js_obj->GetNamedProperty(prop_key);
 
                     // Update IC to Monomorphic
-                    if (const PropertyDescriptor* desc = obj_shape->LookupProperty(prop_key)) {
-                        ic_slot.state = FeedbackSlot::State::Monomorphic;
-                        ic_slot.cached_shape = obj_shape;
-                        ic_slot.cached_slot = desc->slot_index;
-                        ic_slot.cached_in_object = desc->is_in_object;
+                    if (obj_shape) {
+                        if (const PropertyDescriptor* desc = obj_shape->LookupProperty(prop_key)) {
+                            ic_slot.state = FeedbackSlot::State::Monomorphic;
+                            ic_slot.cached_shape = obj_shape;
+                            ic_slot.cached_slot = desc->slot_index;
+                            ic_slot.cached_in_object = desc->is_in_object;
+                        }
+                    }
+                }
+                break;
+            }
+            case Opcode::LdaPrivate: {
+                uint8_t obj_reg = *pc++;
+                uint16_t name_idx = pc[0] | (pc[1] << 8); pc += 2;
+                TaggedValue obj = frame.GetRegister(obj_reg);
+                std::string key = "__private__" + static_cast<JSString*>(bytecode.Constants()[name_idx].AsHeapObject())->Value();
+                if (!obj.IsHeapObject() || !obj.AsHeapObject()->IsJSObject()) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Private member access on non-object")));
+                    return pending_exception_;
+                }
+                acc_ = static_cast<JSObject*>(obj.AsHeapObject())->GetNamedProperty(key);
+                break;
+            }
+            case Opcode::StaPrivate: {
+                uint8_t obj_reg = *pc++;
+                uint16_t name_idx = pc[0] | (pc[1] << 8); pc += 2;
+                TaggedValue obj = frame.GetRegister(obj_reg);
+                std::string key = "__private__" + static_cast<JSString*>(bytecode.Constants()[name_idx].AsHeapObject())->Value();
+                if (!obj.IsHeapObject() || !obj.AsHeapObject()->IsJSObject()) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Private member access on non-object")));
+                    return pending_exception_;
+                }
+                JSObject* js_obj = static_cast<JSObject*>(obj.AsHeapObject());
+                if (!js_obj->HasNamedProperty(key) && !HasProperty(obj, key)) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot write private member to an object whose class did not declare it"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
+                uint32_t sid = 10000;
+                js_obj->SetNamedProperty(key, acc_, sid);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
                     }
                 }
                 break;
@@ -955,10 +2320,40 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
-                assert(obj_val.IsHeapObject());
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (!obj_val.IsHeapObject()) {
+                    if (obj_val.IsNullOrUndefined()) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot set property '" + std::string(prop_key) + "' of " + (obj_val.IsNull() ? "null" : "undefined")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
+                    if (is_strict_mode_) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot create property '" + std::string(prop_key) + "' on primitive"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                    }
+                    break;
+                }
 
                 if (obj_val.AsHeapObject()->IsProxy()) {
                     ProxySet(static_cast<JSProxy*>(obj_val.AsHeapObject()), prop_key, acc_, obj_val);
@@ -978,14 +2373,27 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                     auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
-                    if (prop_key == "prototype" && acc_.IsHeapObject() && acc_.AsHeapObject()->IsJSObject()) {
-                        fn->SetPrototype(static_cast<JSObject*>(acc_.AsHeapObject()));
+                    if (prop_key == "prototype") {
+                        fn->SetConstructorPrototype(acc_);
                         break;
                     }
                 }
 
-                if (obj_val.AsHeapObject()->IsString()) {
-                    // String primitives are immutable in ECMAScript
+                if (obj_val.AsHeapObject()->IsString() || obj_val.AsHeapObject()->IsSymbol()) {
+                    // String and Symbol primitives are immutable in ECMAScript
+                    if (is_strict_mode_) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot assign to read only property of primitive"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                    }
                     break;
                 }
 
@@ -996,19 +2404,33 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 FeedbackSlot& ic_slot = bytecode.GetFeedbackVector().GetSlot(slot_id);
                 Shape* obj_shape = js_obj->GetShape();
 
-                if (AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape)) {
+                if (AETHER_LIKELY(ic_slot.state == FeedbackSlot::State::Monomorphic && ic_slot.cached_shape == obj_shape && !js_obj->IsFrozen() && js_obj->IsExtensible())) {
                     // Monomorphic IC Hit: Direct O(1) slot write
                     js_obj->SetFastSlot(ic_slot.cached_slot, ic_slot.cached_in_object, acc_);
                 } else {
                     // IC Miss: Set property and update Shape / IC
                     js_obj->SetNamedProperty(prop_key, acc_, next_shape_id_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
 
                     Shape* new_shape = js_obj->GetShape();
-                    if (const PropertyDescriptor* desc = new_shape->LookupProperty(prop_key)) {
-                        ic_slot.state = FeedbackSlot::State::Monomorphic;
-                        ic_slot.cached_shape = new_shape;
-                        ic_slot.cached_slot = desc->slot_index;
-                        ic_slot.cached_in_object = desc->is_in_object;
+                    if (new_shape) {
+                        if (const PropertyDescriptor* desc = new_shape->LookupProperty(prop_key)) {
+                            ic_slot.state = FeedbackSlot::State::Monomorphic;
+                            ic_slot.cached_shape = new_shape;
+                            ic_slot.cached_slot = desc->slot_index;
+                            ic_slot.cached_in_object = desc->is_in_object;
+                        }
                     }
                 }
                 break;
@@ -1018,6 +2440,42 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 break;
             }
             case Opcode::Negate: {
+                if (acc_.IsHeapObject()) {
+                    auto* ho = acc_.AsHeapObject();
+                    if (ho->IsJSObject() || ho->IsProxy()) {
+                        acc_ = ToPrimitive(acc_, "number");
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (acc_.IsBigInt()) {
+                    auto* b = static_cast<JSBigInt*>(acc_.AsHeapObject());
+                    acc_ = TaggedValue::FromHeapObject(b->Negate());
+                    break;
+                }
+                if (acc_.IsSymbol()) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert a Symbol value to a number")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
                 if (AETHER_LIKELY(acc_.IsSmi())) {
                     int32_t val = acc_.AsSmi();
                     if (val == 0) {
@@ -1033,8 +2491,26 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 break;
             }
             case Opcode::BitwiseNot: {
-                int32_t val = acc_.IsSmi() ? acc_.AsSmi() : static_cast<int32_t>(acc_.AsNumber());
-                acc_ = TaggedValue::FromSmi(~val);
+                TaggedValue num = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (num.IsBigInt()) {
+                    auto* b = static_cast<JSBigInt*>(num.AsHeapObject());
+                    acc_ = TaggedValue::FromHeapObject(b->BitwiseNot());
+                } else {
+                    int32_t val = ToInt32(num);
+                    acc_ = TaggedValue::FromSmi(~val);
+                }
                 break;
             }
             case Opcode::TypeOf: {
@@ -1052,13 +2528,371 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* h = acc_.AsHeapObject();
                     if (h->IsString()) {
                         acc_ = TaggedValue::FromHeapObject(new JSString("string"));
-                    } else if (h->IsFunction() || h->IsNativeFunction()) {
+                    } else if (h->IsBigInt()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("bigint"));
+                    } else if (h->IsFunction() || h->IsNativeFunction() || (h->IsProxy() && static_cast<JSProxy*>(h)->IsCallable())) {
                         acc_ = TaggedValue::FromHeapObject(new JSString("function"));
                     } else {
                         acc_ = TaggedValue::FromHeapObject(new JSString("object"));
                     }
                 } else {
                     acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                }
+                break;
+            }
+            case Opcode::TypeOfGlobal: {
+                uint16_t name_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                JSObject* glob = Realm::Current() ? Realm::Current()->GetGlobalObject() : nullptr;
+                bool has_prop = false;
+                TaggedValue val = TaggedValue::Undefined();
+                if (prop_key == "new.target") {
+                    has_prop = true;
+                    val = current_new_target_;
+                } else if (glob) {
+                    std::string key_str(prop_key);
+                    if (glob->GetAccessor(key_str) != nullptr) {
+                        has_prop = true;
+                        val = glob->GetNamedProperty(key_str);
+                    } else if (glob->GetShape() && glob->GetShape()->LookupProperty(key_str) != nullptr) {
+                        has_prop = true;
+                        val = glob->GetNamedProperty(key_str);
+                    } else if (glob->HasNamedProperty(key_str)) {
+                        has_prop = true;
+                        val = glob->GetNamedProperty(key_str);
+                    } else if (HasProperty(TaggedValue::FromHeapObject(glob), key_str)) {
+                        has_prop = true;
+                        val = GetProperty(TaggedValue::FromHeapObject(glob), key_str);
+                    }
+                }
+                if (has_prop) {
+                    if (val.IsSmi() || val.IsDouble()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("number"));
+                    } else if (val.IsBoolean()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("boolean"));
+                    } else if (val.IsUndefined()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                    } else if (val.IsNull()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("object"));
+                    } else if (val.IsSymbol()) {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("symbol"));
+                    } else if (val.IsHeapObject()) {
+                        auto* h = val.AsHeapObject();
+                        if (h->IsString()) {
+                            acc_ = TaggedValue::FromHeapObject(new JSString("string"));
+                        } else if (h->IsBigInt()) {
+                            acc_ = TaggedValue::FromHeapObject(new JSString("bigint"));
+                        } else if (h->IsFunction() || h->IsNativeFunction() || (h->IsProxy() && static_cast<JSProxy*>(h)->IsCallable())) {
+                            acc_ = TaggedValue::FromHeapObject(new JSString("function"));
+                        } else {
+                            acc_ = TaggedValue::FromHeapObject(new JSString("object"));
+                        }
+                    } else {
+                        acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                    }
+                } else {
+                    acc_ = TaggedValue::FromHeapObject(new JSString("undefined"));
+                }
+                break;
+            }
+            case Opcode::LdaGlobal: {
+                uint16_t name_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+
+                if (prop_key == "new.target") {
+                    acc_ = current_new_target_;
+                    break;
+                }
+
+                JSObject* glob = Realm::Current() ? Realm::Current()->GetGlobalObject() : nullptr;
+                std::string key_str(prop_key);
+                bool found_in_with = false;
+                for (auto it = with_stack_.rbegin(); it != with_stack_.rend(); ++it) {
+                    JSObject* w = *it;
+                    if (w && (w->HasNamedProperty(key_str) || HasProperty(TaggedValue::FromHeapObject(w), key_str))) {
+                        TaggedValue unscopables = GetProperty(TaggedValue::FromHeapObject(w), "@@unscopables");
+                        if (unscopables.IsHeapObject() && unscopables.AsHeapObject()->IsJSObject()) {
+                            TaggedValue blocked = GetProperty(unscopables, key_str);
+                            if (blocked.ToBoolean()) {
+                                continue;
+                            }
+                        }
+                        acc_ = w->GetNamedProperty(key_str);
+                        found_in_with = true;
+                        break;
+                    }
+                }
+                if (found_in_with) {
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
+
+                if (glob && (glob->HasNamedProperty(key_str) || HasProperty(TaggedValue::FromHeapObject(glob), key_str))) {
+                    acc_ = glob->GetNamedProperty(key_str);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
+                TaggedValue exc = TaggedValue::FromHeapObject(new JSError("ReferenceError", key_str + " is not defined"));
+                if (frame.HasExceptionHandler()) {
+                    auto h = frame.PopExceptionHandler();
+                    pc = h.target_pc;
+                    frame.SetEnvironment(h.env);
+                    acc_ = exc;
+                } else {
+                    has_pending_exception_ = true;
+                    pending_exception_ = exc;
+                    return exc;
+                }
+                break;
+            }
+            case Opcode::StaGlobal: {
+                uint16_t name_idx = pc[0] | (pc[1] << 8);
+                pc += 2;
+                TaggedValue prop_name_val = bytecode.Constants()[name_idx];
+                assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
+                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string key_str(prop_key);
+
+                bool found_in_with = false;
+                for (auto it = with_stack_.rbegin(); it != with_stack_.rend(); ++it) {
+                    JSObject* w = *it;
+                    if (w && (w->HasNamedProperty(key_str) || HasProperty(TaggedValue::FromHeapObject(w), key_str))) {
+                        TaggedValue unscopables = GetProperty(TaggedValue::FromHeapObject(w), "@@unscopables");
+                        if (unscopables.IsHeapObject() && unscopables.AsHeapObject()->IsJSObject()) {
+                            TaggedValue blocked = GetProperty(unscopables, key_str);
+                            if (blocked.ToBoolean()) {
+                                continue;
+                            }
+                        }
+                        w->SetNamedProperty(key_str, acc_, next_shape_id_);
+                        found_in_with = true;
+                        break;
+                    } else if (w) {
+                        if (is_strict_mode_) {
+                            TaggedValue exc = TaggedValue::FromHeapObject(new JSError("ReferenceError", key_str + " is not defined"));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = exc;
+                            } else {
+                                has_pending_exception_ = true;
+                                pending_exception_ = exc;
+                                return exc;
+                            }
+                            found_in_with = true;
+                            break;
+                        }
+                    }
+                }
+                if (found_in_with) {
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                    }
+                    break;
+                }
+
+                JSObject* glob = Realm::Current() ? Realm::Current()->GetGlobalObject() : nullptr;
+                if (glob) {
+                    if (is_strict_mode_ && !glob->HasNamedProperty(key_str) && !HasProperty(TaggedValue::FromHeapObject(glob), key_str)) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("ReferenceError", key_str + " is not defined"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
+                    glob->SetNamedProperty(key_str, acc_, next_shape_id_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+            case Opcode::ToString: {
+                acc_ = ToStringOp(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                }
+                break;
+            }
+            case Opcode::ToNumeric: {
+                acc_ = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                }
+                break;
+            }
+            case Opcode::ToPropertyKey: {
+                acc_ = ToPropertyKey(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                }
+                break;
+            }
+            case Opcode::CheckObjectCoercible: {
+                uint8_t reg = *pc++;
+                TaggedValue val = frame.GetRegister(reg);
+                if (val.IsNull() || val.IsUndefined()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot read properties of " + std::string(val.IsNull() ? "null" : "undefined")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                }
+                break;
+            }
+            case Opcode::PushWith: {
+                uint8_t reg = *pc++;
+                TaggedValue val = frame.GetRegister(reg);
+                if (val.IsHeapObject() && val.AsHeapObject()->IsJSObject()) {
+                    with_stack_.push_back(static_cast<JSObject*>(val.AsHeapObject()));
+                }
+                break;
+            }
+            case Opcode::PopWith: {
+                if (!with_stack_.empty()) {
+                    with_stack_.pop_back();
+                }
+                break;
+            }
+            case Opcode::Inc: {
+                TaggedValue num = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (num.IsBigInt()) {
+                    auto* b = static_cast<JSBigInt*>(num.AsHeapObject());
+                    JSBigInt one(1);
+                    acc_ = TaggedValue::FromHeapObject(b->Add(one));
+                } else if (num.IsSmi()) {
+                    int32_t val = num.AsSmi();
+                    if (val < INT32_MAX) {
+                        acc_ = TaggedValue::FromSmi(val + 1);
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(val) + 1.0);
+                    }
+                } else {
+                    acc_ = TaggedValue::FromDouble(num.AsNumber() + 1.0);
+                }
+                break;
+            }
+            case Opcode::Dec: {
+                TaggedValue num = ToNumeric(acc_);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (num.IsBigInt()) {
+                    auto* b = static_cast<JSBigInt*>(num.AsHeapObject());
+                    JSBigInt one(1);
+                    acc_ = TaggedValue::FromHeapObject(b->Subtract(one));
+                } else if (num.IsSmi()) {
+                    int32_t val = num.AsSmi();
+                    if (val > INT32_MIN) {
+                        acc_ = TaggedValue::FromSmi(val - 1);
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(val) - 1.0);
+                    }
+                } else {
+                    acc_ = TaggedValue::FromDouble(num.AsNumber() - 1.0);
                 }
                 break;
             }
@@ -1101,24 +2935,156 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue src_val = frame.GetRegister(src_reg);
                 if (target_val.IsHeapObject() && target_val.AsHeapObject()->IsArray()) {
                     auto* target_arr = static_cast<JSArray*>(target_val.AsHeapObject());
-                    if (src_val.IsHeapObject()) {
-                        HeapObject* src_obj = src_val.AsHeapObject();
-                        if (src_obj->IsArray()) {
-                            auto* src_arr = static_cast<JSArray*>(src_obj);
-                            for (size_t i = 0; i < src_arr->Length(); ++i) {
-                                target_arr->Push(src_arr->GetElement(i));
-                            }
-                        } else if (src_obj->IsTypedArray()) {
-                            auto* src_ta = static_cast<JSTypedArray*>(src_obj);
-                            for (size_t i = 0; i < src_ta->Length(); ++i) {
-                                target_arr->Push(src_ta->GetElement(i));
-                            }
-                        } else if (src_obj->IsString()) {
-                            auto* src_str = static_cast<JSString*>(src_obj);
-                            for (size_t i = 0; i < src_str->Length(); ++i) {
-                                target_arr->Push(TaggedValue::FromHeapObject(new JSString(src_str->View().substr(i, 1))));
-                            }
+                    if (!src_val.IsHeapObject() && !src_val.IsString()) {
+                        SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Spread target is not iterable")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
                         }
+                        break;
+                    }
+                    HeapObject* src_ho = src_val.IsHeapObject() ? src_val.AsHeapObject() : nullptr;
+                    // Fast path: untampered JSArray without own @@iterator
+                    bool has_own_iter = src_ho && ((src_ho->GetShape() && src_ho->GetShape()->LookupProperty("@@iterator")) || static_cast<JSObject*>(src_ho)->HasAccessor("@@iterator"));
+                    if (src_ho && src_ho->IsArray() && !has_own_iter) {
+                        auto* src_arr = static_cast<JSArray*>(src_ho);
+                        for (size_t i = 0; i < src_arr->Length(); ++i) {
+                            target_arr->Push(src_arr->GetElement(i));
+                        }
+                        break;
+                    }
+                    if (src_ho && src_ho->IsTypedArray()) {
+                        auto* src_ta = static_cast<JSTypedArray*>(src_ho);
+                        for (size_t i = 0; i < src_ta->Length(); ++i) {
+                            target_arr->Push(src_ta->GetElement(i));
+                        }
+                        break;
+                    }
+                    if (src_ho && src_ho->IsString()) {
+                        auto* src_str = static_cast<JSString*>(src_ho);
+                        for (size_t i = 0; i < src_str->Length(); ++i) {
+                            target_arr->Push(TaggedValue::FromHeapObject(new JSString(src_str->View().substr(i, 1))));
+                        }
+                        break;
+                    }
+
+                    // Generic iterator protocol
+                    TaggedValue iter_fn = TaggedValue::Undefined();
+                    if (src_ho) {
+                        if (src_ho->IsProxy()) {
+                            iter_fn = ProxyGet(static_cast<JSProxy*>(src_ho), "@@iterator", src_val);
+                        } else if (src_ho->IsJSObject()) {
+                            iter_fn = static_cast<JSObject*>(src_ho)->GetNamedProperty("@@iterator");
+                        }
+                    }
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (!iter_fn.IsHeapObject() || !iter_fn.AsHeapObject()->IsFunction()) {
+                        SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Spread target is not iterable")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    TaggedValue iterator = CallFunction(iter_fn, src_val, {});
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (!iterator.IsHeapObject() || (!iterator.AsHeapObject()->IsJSObject() && !iterator.AsHeapObject()->IsProxy())) {
+                        SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Iterator is not an object")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+
+                    // Iterate calling next()
+                    while (true) {
+                        TaggedValue next_fn;
+                        if (iterator.AsHeapObject()->IsProxy()) {
+                            next_fn = ProxyGet(static_cast<JSProxy*>(iterator.AsHeapObject()), "next", iterator);
+                        } else {
+                            next_fn = static_cast<JSObject*>(iterator.AsHeapObject())->GetNamedProperty("next");
+                        }
+                        if (has_pending_exception_) break;
+                        if (!next_fn.IsHeapObject() || !next_fn.AsHeapObject()->IsFunction()) {
+                            SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "iterator.next is not a function")));
+                            break;
+                        }
+                        TaggedValue next_res = CallFunction(next_fn, iterator, {});
+                        if (has_pending_exception_) break;
+                        if (!next_res.IsHeapObject() || (!next_res.AsHeapObject()->IsJSObject() && !next_res.AsHeapObject()->IsProxy())) {
+                            SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Iterator result is not an object")));
+                            break;
+                        }
+                        TaggedValue done_val;
+                        if (next_res.AsHeapObject()->IsProxy()) {
+                            done_val = ProxyGet(static_cast<JSProxy*>(next_res.AsHeapObject()), "done", next_res);
+                        } else {
+                            done_val = static_cast<JSObject*>(next_res.AsHeapObject())->GetNamedProperty("done");
+                        }
+                        if (has_pending_exception_) break;
+                        if (done_val.ToBoolean()) {
+                            break;
+                        }
+                        TaggedValue item_val;
+                        if (next_res.AsHeapObject()->IsProxy()) {
+                            item_val = ProxyGet(static_cast<JSProxy*>(next_res.AsHeapObject()), "value", next_res);
+                        } else {
+                            item_val = static_cast<JSObject*>(next_res.AsHeapObject())->GetNamedProperty("value");
+                        }
+                        if (has_pending_exception_) break;
+                        target_arr->Push(item_val);
+                    }
+
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
                     }
                 }
                 break;
@@ -1131,13 +3097,28 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (target_val.IsHeapObject() && target_val.AsHeapObject()->IsJSObject() &&
                     src_val.IsHeapObject() && src_val.AsHeapObject()->IsJSObject()) {
                     auto* target_obj = static_cast<JSObject*>(target_val.AsHeapObject());
+                    auto* src_obj = static_cast<JSObject*>(src_val.AsHeapObject());
                     TaggedValue keys_val = GetOwnKeys(src_val);
                     if (keys_val.IsHeapObject() && keys_val.AsHeapObject()->IsArray()) {
                         auto* k_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
                         for (size_t i = 0; i < k_arr->Length(); ++i) {
                             std::string k_str = k_arr->GetElement(i).ToString();
-                            TaggedValue val = GetProperty(src_val, k_str);
-                            target_obj->SetNamedProperty(k_str, val, next_shape_id_);
+                            bool is_enumerable = false;
+                            if (src_obj->IsProxy()) {
+                                TaggedValue desc = ProxyGetOwnPropertyDescriptor(static_cast<JSProxy*>(src_obj), k_str);
+                                if (desc.IsHeapObject() && desc.AsHeapObject()->IsJSObject()) {
+                                    TaggedValue enum_val = static_cast<JSObject*>(desc.AsHeapObject())->GetNamedProperty("enumerable");
+                                    is_enumerable = enum_val.IsUndefined() || enum_val.ToBoolean();
+                                } else {
+                                    is_enumerable = true;
+                                }
+                            } else {
+                                is_enumerable = (src_obj->GetOwnPropertyAttributes(k_str) & PropertyAttributes::Enumerable) != 0;
+                            }
+                            if (is_enumerable) {
+                                TaggedValue val = GetProperty(src_val, k_str);
+                                target_obj->SetNamedProperty(k_str, val, next_shape_id_);
+                            }
                         }
                     }
                 }
@@ -1169,6 +3150,47 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue key_val = frame.GetRegister(key_reg);
 
                 if (!obj_val.IsHeapObject()) {
+                    if (obj_val.IsNullOrUndefined()) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot read properties of undefined or null"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
+                    std::string key_str;
+                    if (key_val.IsSymbol()) {
+                        key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
+                    } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
+                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                    } else if (key_val.IsSmi()) {
+                        key_str = std::to_string(key_val.AsSmi());
+                    } else {
+                        key_str = key_val.ToString();
+                    }
+
+                    if (obj_val.IsNumber() && Realm::Current() && Realm::Current()->GetNumberPrototype()) {
+                        acc_ = Realm::Current()->GetNumberPrototype()->GetNamedProperty(key_str);
+                        break;
+                    }
+                    if (obj_val.IsBoolean() && Realm::Current() && Realm::Current()->GetBooleanPrototype()) {
+                        acc_ = Realm::Current()->GetBooleanPrototype()->GetNamedProperty(key_str);
+                        break;
+                    }
+                    if (obj_val.IsString() && Realm::Current() && Realm::Current()->GetStringPrototype()) {
+                        if (key_str == "length") {
+                            acc_ = TaggedValue::FromSmi(static_cast<int32_t>(obj_val.ToString().length()));
+                            break;
+                        }
+                        acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(key_str);
+                        break;
+                    }
                     acc_ = TaggedValue::Undefined();
                     break;
                 }
@@ -1224,11 +3246,15 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         acc_ = idx >= 0 ? arr->GetElement(static_cast<size_t>(idx)) : TaggedValue::Undefined();
                     } else if (key_val.IsNumber()) {
                         double d = key_val.AsNumber();
-                        acc_ = (d >= 0.0 && std::floor(d) == d) ? arr->GetElement(static_cast<size_t>(d)) : TaggedValue::Undefined();
+                        if (d >= 0.0 && std::floor(d) == d) {
+                            acc_ = arr->GetElement(static_cast<size_t>(d));
+                        } else {
+                            acc_ = arr->GetNamedProperty(key_val.ToString());
+                        }
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
                         acc_ = arr->GetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View());
                     } else {
-                        acc_ = TaggedValue::Undefined();
+                        acc_ = arr->GetNamedProperty(key_val.ToString());
                     }
                 } else if (h_obj->IsString()) {
                     auto* str_obj = static_cast<JSString*>(h_obj);
@@ -1302,6 +3328,21 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
                 TaggedValue key_val = frame.GetRegister(key_reg);
 
+                if (!obj_val.IsHeapObject() && obj_val.IsNullOrUndefined()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot set properties of undefined or null"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
+
                 if (obj_val.IsHeapObject()) {
                     HeapObject* h_obj = obj_val.AsHeapObject();
                     if (h_obj->IsProxy()) {
@@ -1340,14 +3381,36 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     }
                     if (h_obj->IsArray()) {
                         auto* arr = static_cast<JSArray*>(h_obj);
+                        if (arr->IsFrozen()) {
+                            if (is_strict_mode_) {
+                                TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot assign to read only property"));
+                                if (frame.HasExceptionHandler()) {
+                                    auto h = frame.PopExceptionHandler();
+                                    pc = h.target_pc;
+                                    frame.SetEnvironment(h.env);
+                                    acc_ = exc;
+                                } else {
+                                    has_pending_exception_ = true;
+                                    pending_exception_ = exc;
+                                    return exc;
+                                }
+                            }
+                            break;
+                        }
                         if (key_val.IsSmi()) {
                             int32_t idx = key_val.AsSmi();
                             if (idx >= 0) arr->SetElement(static_cast<size_t>(idx), acc_);
                         } else if (key_val.IsNumber()) {
                             double d = key_val.AsNumber();
-                            if (d >= 0.0 && std::floor(d) == d) arr->SetElement(static_cast<size_t>(d), acc_);
+                            if (d >= 0.0 && std::floor(d) == d) {
+                                arr->SetElement(static_cast<size_t>(d), acc_);
+                            } else {
+                                arr->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
+                            }
                         } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
                             arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                        } else {
+                            arr->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
                         }
                     } else if (h_obj->IsTypedArray()) {
                         auto* t_arr = static_cast<JSTypedArray*>(h_obj);
@@ -1370,6 +3433,19 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             js_obj->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
                         }
                     }
+
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
                 }
                 break;
             }
@@ -1379,6 +3455,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
+                if (obj_val.IsNull() || obj_val.IsUndefined()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot delete property of null or undefined"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
                 std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
@@ -1396,6 +3486,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     }
                     break;
                 }
+                if (bytecode.IsStrict() && !success) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot delete property in strict mode"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
                 acc_ = TaggedValue::FromBoolean(success);
                 break;
             }
@@ -1404,6 +3508,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 uint8_t key_reg = *pc++;
 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
+                if (obj_val.IsNull() || obj_val.IsUndefined()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot delete property of null or undefined"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
                 TaggedValue key_val = frame.GetRegister(key_reg);
 
                 std::string key_str;
@@ -1430,6 +3548,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     }
                     break;
                 }
+                if (bytecode.IsStrict() && !success) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot delete property in strict mode"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
+                }
                 acc_ = TaggedValue::FromBoolean(success);
                 break;
             }
@@ -1453,6 +3585,14 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 closure->SetGenerator(proto_fn->IsGenerator());
                 closure->SetAsync(proto_fn->IsAsync());
+                closure->SetArrow(proto_fn->IsArrow());
+                if (proto_fn->IsArrow()) {
+                    closure->SetLexicalThis(frame.GetThis());
+                    closure->SetLexicalNewTarget(current_new_target_);
+                }
+                if (!with_stack_.empty()) {
+                    closure->SetWithStack(with_stack_);
+                }
                 acc_ = TaggedValue::FromHeapObject(closure);
                 break;
             }
@@ -1530,7 +3670,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (ctor_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(ctor_val.AsHeapObject());
+                    TaggedValue prev_target = current_new_target_;
+                    current_new_target_ = ctor_val;
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
+                    current_new_target_ = prev_target;
                     if (has_pending_exception_) {
                         if (frame.HasExceptionHandler()) {
                             auto h = frame.PopExceptionHandler();
@@ -1546,14 +3689,42 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
 
                 auto* ctor_fn = static_cast<JSFunction*>(ctor_val.AsHeapObject());
-                if (!ctor_fn->GetPrototype()) {
-                    ctor_fn->SetPrototype(new JSObject(GetRootShape()));
+                if (ctor_fn->IsArrow() || ctor_fn->IsAsync() || ctor_fn->IsGenerator()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(new JSError("TypeError", "Function is not a constructor"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                    break;
                 }
+                if (!ctor_fn->GetEnvironment() && frame.GetEnvironment()) {
+                    ctor_fn->SetEnvironment(frame.GetEnvironment());
+                }
+                JSObject* proto = ctor_fn->GetOrCreateConstructorPrototype();
                 auto* instance = new JSObject(GetRootShape());
-                instance->SetPrototype(ctor_fn->GetPrototype());
+                if (proto != nullptr) {
+                    instance->SetPrototype(proto);
+                } else if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
+                    instance->SetPrototype(Realm::Current()->GetObjectPrototype());
+                }
                 TaggedValue instance_val = TaggedValue::FromHeapObject(instance);
+                uint32_t field_sid = 11000;
+                for (const auto& [name, initial] : ctor_fn->InstanceFields()) {
+                    std::string property = name.size() > 0 && name[0] == '#'
+                        ? "__private__" + name.substr(1) : name;
+                    instance->SetNamedProperty(property, initial, field_sid);
+                }
 
+                TaggedValue prev_target = current_new_target_;
+                current_new_target_ = ctor_val;
                 TaggedValue ret = Execute(*ctor_fn->GetBytecode(), call_args, instance_val, ctor_fn->GetEnvironment());
+                current_new_target_ = prev_target;
                 if (has_pending_exception_) {
                     if (frame.HasExceptionHandler()) {
                         auto h = frame.PopExceptionHandler();
@@ -1611,20 +3782,24 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = native_fn->Invoke(rec_this, call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
+                    if (!func->GetEnvironment() && frame.GetEnvironment()) {
+                        func->SetEnvironment(frame.GetEnvironment());
+                    }
+                    TaggedValue effective_this = func->IsArrow() ? func->GetLexicalThis() : rec_this;
                     if (func->IsAsyncGenerator()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetAsyncGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetAsyncGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
                     } else if (func->IsGenerator()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
                     } else if (func->IsAsync()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, rec_this, func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         auto* promise = new JSPromise(GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
                             promise->SetPrototype(Realm::Current()->GetPromisePrototype());
@@ -1633,7 +3808,17 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         RunAsyncStep(gen_obj, TaggedValue::Undefined(), false);
                         acc_ = TaggedValue::FromHeapObject(promise);
                     } else {
-                        acc_ = Execute(*func->GetBytecode(), call_args, rec_this, func->GetEnvironment());
+                        size_t prev_with_size = with_stack_.size();
+                        if (func->HasWithStack()) {
+                            for (auto* obj : func->GetWithStack()) {
+                                with_stack_.push_back(obj);
+                            }
+                        }
+                        TaggedValue prev_target = current_new_target_;
+                        current_new_target_ = func->IsArrow() ? func->GetLexicalNewTarget() : TaggedValue::Undefined();
+                        acc_ = Execute(*func->GetBytecode(), call_args, effective_this, func->GetEnvironment());
+                        current_new_target_ = prev_target;
+                        with_stack_.resize(prev_with_size);
                     }
                 }
 
@@ -1647,6 +3832,56 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     } else {
                         return pending_exception_;
                     }
+                }
+                break;
+            }
+            case Opcode::ToNumber: {
+                if (acc_.IsHeapObject()) {
+                    auto* ho = acc_.AsHeapObject();
+                    if (ho->IsJSObject() || ho->IsProxy()) {
+                        acc_ = ToPrimitive(acc_, "number");
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (acc_.IsBigInt()) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert a BigInt value to a number")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (acc_.IsSymbol()) {
+                    SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert a Symbol value to a number")));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                if (AETHER_UNLIKELY(!acc_.IsNumber())) {
+                    acc_ = TaggedValue::FromDouble(acc_.ToDouble());
                 }
                 break;
             }
@@ -1683,23 +3918,28 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = ProxyApply(static_cast<JSProxy*>(callee_val.AsHeapObject()), TaggedValue::Undefined(), call_args);
                 } else if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
-                    acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);
+                    TaggedValue this_arg = (native_fn->Name() == "eval") ? frame.GetThis() : TaggedValue::Undefined();
+                    acc_ = native_fn->Invoke(this_arg, call_args);
                 } else {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
+                    if (!func->GetEnvironment() && frame.GetEnvironment()) {
+                        func->SetEnvironment(frame.GetEnvironment());
+                    }
+                    TaggedValue effective_this = func->IsArrow() ? func->GetLexicalThis() : TaggedValue::Undefined();
                     if (func->IsAsyncGenerator()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetAsyncGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetAsyncGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
                     } else if (func->IsGenerator()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetGeneratorPrototype()) {
                             gen_obj->SetPrototype(Realm::Current()->GetGeneratorPrototype());
                         }
                         acc_ = TaggedValue::FromHeapObject(gen_obj);
                     } else if (func->IsAsync()) {
-                        auto* gen_obj = new JSGeneratorObject(func, call_args, TaggedValue::Undefined(), func->GetEnvironment(), GetRootShape());
+                        auto* gen_obj = new JSGeneratorObject(func, call_args, effective_this, func->GetEnvironment(), GetRootShape());
                         auto* promise = new JSPromise(GetRootShape());
                         if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
                             promise->SetPrototype(Realm::Current()->GetPromisePrototype());
@@ -1708,7 +3948,17 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         RunAsyncStep(gen_obj, TaggedValue::Undefined(), false);
                         acc_ = TaggedValue::FromHeapObject(promise);
                     } else {
-                        acc_ = Execute(*func->GetBytecode(), call_args, TaggedValue::Undefined(), func->GetEnvironment());
+                        size_t prev_with_size = with_stack_.size();
+                        if (func->HasWithStack()) {
+                            for (auto* obj : func->GetWithStack()) {
+                                with_stack_.push_back(obj);
+                            }
+                        }
+                        TaggedValue prev_target = current_new_target_;
+                        current_new_target_ = func->IsArrow() ? func->GetLexicalNewTarget() : TaggedValue::Undefined();
+                        acc_ = Execute(*func->GetBytecode(), call_args, effective_this, func->GetEnvironment());
+                        current_new_target_ = prev_target;
+                        with_stack_.resize(prev_with_size);
                     }
                 }
 

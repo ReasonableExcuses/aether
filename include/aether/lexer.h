@@ -145,8 +145,12 @@ struct Token {
     bool is_bigint{false};
     SourceLocation location;
     std::vector<std::string> template_quasis;
+    std::vector<std::string> template_raw_quasis;
+    std::vector<bool> template_has_invalid_escape;
     std::vector<std::string> template_exprs;
     std::string regex_flags;
+    bool has_escape{false};
+    bool has_leading_newline{false};
 };
 
 class Lexer {
@@ -163,12 +167,13 @@ private:
     bool Match(char expected) noexcept;
     bool IsAtEnd() const noexcept;
 
-    void SkipWhitespaceAndComments();
+    bool SkipWhitespaceAndComments();
     Token ScanIdentifierOrKeyword();
     Token ScanNumber();
     Token ScanString(char quote);
     Token ScanTemplateLiteral();
     Token ScanRegExp();
+    Token ScanToken();
     Token NextTokenImpl();
 
     std::string_view source_;

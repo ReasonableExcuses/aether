@@ -143,6 +143,16 @@ void InitializeDate(Realm& realm);
  */
 void InitializeNumber(Realm& realm);
 
+/**
+ * @brief Initializes the Boolean constructor and prototype methods.
+ */
+void InitializeBoolean(Realm& realm);
+
+/**
+ * @brief Initializes the BigInt constructor and prototype methods.
+ */
+void InitializeBigInt(Realm& realm);
+
 } // namespace aether
 
 #endif // AETHER_INTL_H

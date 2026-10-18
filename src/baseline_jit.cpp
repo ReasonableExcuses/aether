@@ -75,7 +75,17 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
 
     // Initialize parameters from RCX into virtual register slots
     for (uint32_t i = 0; i < bytecode.ParameterCount(); ++i) {
+        // Missing arguments are represented as undefined.  Check the
+        // argument count before touching the caller-owned argument vector.
+        JITLabel missing_parameter;
+        JITLabel parameter_ready;
+        masm.CmpRegImm32(X86Reg::RDX, static_cast<int32_t>(i + 1));
+        masm.Jcc(Condition::Less, missing_parameter);
         masm.MovMemToReg(X86Reg::RAX, X86Reg::RCX, static_cast<int32_t>(i * 8));
+        masm.Jmp(parameter_ready);
+        masm.Bind(missing_parameter);
+        masm.MovRegImm64(X86Reg::RAX, TaggedValue::Undefined().RawBits());
+        masm.Bind(parameter_ready);
         masm.MovRegToMem(X86Reg::RBP, GetRegisterOffset(static_cast<uint8_t>(i)), X86Reg::RAX);
     }
 
@@ -243,6 +253,14 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.CmpRegImm32(X86Reg::RDX, 0);
                 masm.Jcc(Condition::Equal, deopt_bailout_label);
                 masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
+                // x86 idiv faults for INT32_MIN % -1.  Deopt so the
+                // interpreter can produce ECMAScript's numeric result.
+                masm.CmpRegImm32(X86Reg::RDX, -1);
+                JITLabel safe_mod;
+                masm.Jcc(Condition::NotEqual, safe_mod);
+                masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.Bind(safe_mod);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
                 masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);

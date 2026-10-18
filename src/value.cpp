@@ -24,6 +24,9 @@ bool TaggedValue::ToBoolean() const noexcept {
         if (obj->IsString()) {
             return static_cast<JSString*>(obj)->Length() > 0;
         }
+        if (obj->IsBigInt()) {
+            return !static_cast<JSBigInt*>(obj)->IsZero();
+        }
         // In ECMAScript, all objects (except document.all legacy) are truthy
         return true;
     }
@@ -44,6 +47,54 @@ double TaggedValue::ToDouble() const {
             if (start == std::string_view::npos) return 0.0;
             size_t end = sv.find_last_not_of(" \t\n\r");
             std::string trimmed(sv.substr(start, end - start + 1));
+
+            // Check for Infinity with exact case sensitivity
+            if (trimmed.find('i') != std::string::npos || trimmed.find('I') != std::string::npos) {
+                std::string_view sv_inf = trimmed;
+                bool neg = false;
+                if (!sv_inf.empty() && sv_inf.front() == '+') {
+                    sv_inf.remove_prefix(1);
+                } else if (!sv_inf.empty() && sv_inf.front() == '-') {
+                    neg = true;
+                    sv_inf.remove_prefix(1);
+                }
+                size_t s = sv_inf.find_first_not_of(" \t\n\r");
+                if (s != std::string_view::npos) sv_inf.remove_prefix(s);
+                if (sv_inf == "Infinity") {
+                    return neg ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
+                }
+                return std::numeric_limits<double>::quiet_NaN();
+            }
+
+            // Check for binary, octal, hex integer literals (signs not allowed in StringNumericLiteral for 0b/0o/0x)
+            if (trimmed.size() >= 3 && trimmed[0] == '0') {
+                char type = trimmed[1];
+                if (type == 'b' || type == 'B') {
+                    try {
+                        size_t idx = 0;
+                        unsigned long long v = std::stoull(trimmed.substr(2), &idx, 2);
+                        if (idx == trimmed.size() - 2) return static_cast<double>(v);
+                    } catch (...) {}
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                if (type == 'o' || type == 'O') {
+                    try {
+                        size_t idx = 0;
+                        unsigned long long v = std::stoull(trimmed.substr(2), &idx, 8);
+                        if (idx == trimmed.size() - 2) return static_cast<double>(v);
+                    } catch (...) {}
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+                if (type == 'x' || type == 'X') {
+                    try {
+                        size_t idx = 0;
+                        unsigned long long v = std::stoull(trimmed.substr(2), &idx, 16);
+                        if (idx == trimmed.size() - 2) return static_cast<double>(v);
+                    } catch (...) {}
+                    return std::numeric_limits<double>::quiet_NaN();
+                }
+            }
+
             try {
                 size_t idx = 0;
                 double val = std::stod(trimmed, &idx);
@@ -67,6 +118,10 @@ bool TaggedValue::IsString() const noexcept {
 
 bool TaggedValue::IsGeneratorObject() const noexcept {
     return IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::JSGenerator;
+}
+
+bool TaggedValue::IsBigInt() const noexcept {
+    return IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::JSBigInt;
 }
 
 std::string TaggedValue::ToString() const {
@@ -98,6 +153,9 @@ std::string TaggedValue::ToString() const {
         if (obj->IsString()) {
             return static_cast<JSString*>(obj)->Value();
         }
+        if (obj->IsBigInt()) {
+            return static_cast<JSBigInt*>(obj)->StringValue();
+        }
         if (obj->GetType() == HeapObjectType::Symbol) {
             return "Symbol(" + static_cast<JSSymbol*>(obj)->Description() + ")";
         }
@@ -117,6 +175,19 @@ std::string TaggedValue::ToString() const {
             return p->GetTarget().ToString();
         }
         if (obj->IsJSObject()) {
+            auto* jso = static_cast<JSObject*>(obj);
+            if (jso->HasNamedProperty("__string_data__")) {
+                return jso->GetNamedProperty("__string_data__").ToString();
+            }
+            if (jso->HasNamedProperty("__boolean_data__")) {
+                return jso->GetNamedProperty("__boolean_data__").ToString();
+            }
+            if (jso->HasNamedProperty("__number_data__")) {
+                return jso->GetNamedProperty("__number_data__").ToString();
+            }
+            if (jso->HasNamedProperty("__bigint_data__")) {
+                return jso->GetNamedProperty("__bigint_data__").ToString();
+            }
             return "[object Object]";
         }
         return "[HeapObject]";

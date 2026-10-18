@@ -36,6 +36,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::TestGreaterThanOrEqual: return "TestGreaterThanOrEqual";
         case Opcode::TestInstanceOf:     return "TestInstanceOf";
         case Opcode::TestIn:             return "TestIn";
+        case Opcode::TestInWith:         return "TestInWith";
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
@@ -51,6 +52,18 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";
         case Opcode::TypeOf:             return "TypeOf";
+        case Opcode::TypeOfGlobal:       return "TypeOfGlobal";
+        case Opcode::LdaGlobal:          return "LdaGlobal";
+        case Opcode::StaGlobal:          return "StaGlobal";
+        case Opcode::ToString:           return "ToString";
+        case Opcode::ToNumber:           return "ToNumber";
+        case Opcode::ToNumeric:          return "ToNumeric";
+        case Opcode::ToPropertyKey:      return "ToPropertyKey";
+        case Opcode::CheckObjectCoercible: return "CheckObjectCoercible";
+        case Opcode::PushWith:           return "PushWith";
+        case Opcode::PopWith:            return "PopWith";
+        case Opcode::Inc:                return "Inc";
+        case Opcode::Dec:                return "Dec";
         case Opcode::Call:               return "Call";
         case Opcode::CallMethod:         return "CallMethod";
         case Opcode::CreateObject:       return "CreateObject";
@@ -138,7 +151,9 @@ std::string BytecodeArray::Disassemble() const {
                 break;
             }
             case Opcode::Ldar:
-            case Opcode::Star: {
+            case Opcode::Star:
+            case Opcode::CheckObjectCoercible:
+            case Opcode::PushWith: {
                 uint8_t reg = bytes_[pc++];
                 ss << "r" << static_cast<int>(reg);
                 break;
@@ -275,6 +290,14 @@ std::string BytecodeArray::Disassemble() const {
                 uint16_t idx = bytes_[pc] | (bytes_[pc + 1] << 8);
                 pc += 2;
                 ss << "const[" << idx << "]";
+                break;
+            }
+            case Opcode::TypeOfGlobal:
+            case Opcode::LdaGlobal:
+            case Opcode::StaGlobal: {
+                uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "const[" << name_idx << "]";
                 break;
             }
             case Opcode::CreateFunctionContext: {

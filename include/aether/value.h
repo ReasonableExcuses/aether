@@ -127,6 +127,7 @@ public:
     bool IsSymbol() const noexcept;
     bool IsString() const noexcept;
     bool IsGeneratorObject() const noexcept;
+    bool IsBigInt() const noexcept;
 
     AETHER_ALWAYS_INLINE bool IsTrue() const noexcept {
         return raw_ == (kTagBoolean | 1ULL);

@@ -1,5 +1,6 @@
 #include "aether/sea_of_nodes.h"
 #include <iomanip>
+#include <limits>
 
 namespace aether {
 
@@ -645,9 +646,13 @@ void SeaOfNodesOptimizer::ConstantFolding(Graph& graph) {
                 Node* lhs = node->Input(0);
                 Node* rhs = node->Input(1);
                 if (lhs && rhs && lhs->Op() == NodeOp::ConstantInt32 && rhs->Op() == NodeOp::ConstantInt32) {
-                    node->SetOp(NodeOp::ConstantInt32);
-                    node->SetIntValue(lhs->IntValue() + rhs->IntValue());
-                    node->ClearInputs();
+                    const int64_t value = lhs->IntValue() + rhs->IntValue();
+                    if (value >= std::numeric_limits<int32_t>::min() &&
+                        value <= std::numeric_limits<int32_t>::max()) {
+                        node->SetOp(NodeOp::ConstantInt32);
+                        node->SetIntValue(value);
+                        node->ClearInputs();
+                    }
                 }
                 break;
             }
@@ -655,9 +660,13 @@ void SeaOfNodesOptimizer::ConstantFolding(Graph& graph) {
                 Node* lhs = node->Input(0);
                 Node* rhs = node->Input(1);
                 if (lhs && rhs && lhs->Op() == NodeOp::ConstantInt32 && rhs->Op() == NodeOp::ConstantInt32) {
-                    node->SetOp(NodeOp::ConstantInt32);
-                    node->SetIntValue(lhs->IntValue() - rhs->IntValue());
-                    node->ClearInputs();
+                    const int64_t value = lhs->IntValue() - rhs->IntValue();
+                    if (value >= std::numeric_limits<int32_t>::min() &&
+                        value <= std::numeric_limits<int32_t>::max()) {
+                        node->SetOp(NodeOp::ConstantInt32);
+                        node->SetIntValue(value);
+                        node->ClearInputs();
+                    }
                 }
                 break;
             }
@@ -665,9 +674,13 @@ void SeaOfNodesOptimizer::ConstantFolding(Graph& graph) {
                 Node* lhs = node->Input(0);
                 Node* rhs = node->Input(1);
                 if (lhs && rhs && lhs->Op() == NodeOp::ConstantInt32 && rhs->Op() == NodeOp::ConstantInt32) {
-                    node->SetOp(NodeOp::ConstantInt32);
-                    node->SetIntValue(lhs->IntValue() * rhs->IntValue());
-                    node->ClearInputs();
+                    const int64_t value = lhs->IntValue() * rhs->IntValue();
+                    if (value >= std::numeric_limits<int32_t>::min() &&
+                        value <= std::numeric_limits<int32_t>::max()) {
+                        node->SetOp(NodeOp::ConstantInt32);
+                        node->SetIntValue(value);
+                        node->ClearInputs();
+                    }
                 }
                 break;
             }

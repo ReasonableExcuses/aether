@@ -13,6 +13,7 @@ namespace aether {
 struct ExceptionHandler {
     const uint8_t* target_pc{nullptr};
     LexicalEnvironment* env{nullptr};
+    size_t with_depth{0};
 };
 
 /**
@@ -51,20 +52,11 @@ public:
     LexicalEnvironment* GetEnvironment() const noexcept { return environment_; }
     void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
 
-    void PushExceptionHandler(const uint8_t* target, LexicalEnvironment* env) {
-        handlers_.push_back({target, env});
-    }
-
+    void PushExceptionHandler(const uint8_t* target, LexicalEnvironment* env, size_t with_depth = 0);
     bool HasExceptionHandler() const noexcept {
         return !handlers_.empty();
     }
-
-    ExceptionHandler PopExceptionHandler() {
-        assert(!handlers_.empty());
-        ExceptionHandler h = handlers_.back();
-        handlers_.pop_back();
-        return h;
-    }
+    ExceptionHandler PopExceptionHandler();
 
     std::vector<ExceptionHandler>& Handlers() noexcept { return handlers_; }
     const std::vector<ExceptionHandler>& Handlers() const noexcept { return handlers_; }
@@ -133,23 +125,67 @@ public:
         pending_exception_ = TaggedValue::Undefined();
     }
 
+    TaggedValue ToPrimitive(TaggedValue input, const char* hint = "default");
+    TaggedValue ToStringOp(TaggedValue val);
+    TaggedValue ToNumeric(TaggedValue val);
+    TaggedValue ToPropertyKey(TaggedValue val);
+
+    enum class RelationalResult {
+        True,
+        False,
+        Undefined
+    };
+    RelationalResult AbstractRelationalComparison(TaggedValue x, TaggedValue y, bool left_first);
+
+    bool IsStrictlyEqual(TaggedValue x, TaggedValue y);
+    bool IsLooselyEqual(TaggedValue x, TaggedValue y);
+
     static Interpreter* Current() noexcept { return s_current_interpreter_; }
     static void SetCurrent(Interpreter* interp) noexcept { s_current_interpreter_ = interp; }
     LexicalEnvironment* GetLastEnvironment() const noexcept { return last_environment_; }
+    TaggedValue GetNewTarget() const noexcept { return current_new_target_; }
+    void SetNewTarget(TaggedValue target) noexcept { current_new_target_ = target; }
+    bool IsStrictMode() const noexcept { return is_strict_mode_; }
+    void SetStrictMode(bool s) noexcept { is_strict_mode_ = s; }
+    const std::vector<JSObject*>& GetWithStack() const noexcept { return with_stack_; }
+    void PushWith(JSObject* obj) { with_stack_.push_back(obj); }
+    void PopWith() { if (!with_stack_.empty()) with_stack_.pop_back(); }
+    void PopWithToDepth(size_t depth) { if (depth < with_stack_.size()) with_stack_.resize(depth); }
 
 private:
     static inline thread_local Interpreter* s_current_interpreter_{nullptr};
     friend struct InterpreterScope;
+    std::vector<JSObject*> with_stack_;
     TaggedValue acc_{TaggedValue::Undefined()};
+    TaggedValue current_new_target_{TaggedValue::Undefined()};
     TypeFeedbackVector feedback_;
     uint32_t next_shape_id_{1};
     std::unique_ptr<Shape> root_shape_;
     bool has_pending_exception_{false};
     TaggedValue pending_exception_{TaggedValue::Undefined()};
     LexicalEnvironment* last_environment_{nullptr};
-
+    bool is_strict_mode_{false};
+    uint32_t call_depth_{0};
+    static constexpr uint32_t kMaxCallDepth = 5000;
     TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr, bool* out_is_await = nullptr);
 };
+
+inline void ExecutionFrame::PushExceptionHandler(const uint8_t* target, LexicalEnvironment* env, size_t with_depth) {
+    if (with_depth == 0 && Interpreter::Current()) {
+        with_depth = Interpreter::Current()->GetWithStack().size();
+    }
+    handlers_.push_back({target, env, with_depth});
+}
+
+inline ExceptionHandler ExecutionFrame::PopExceptionHandler() {
+    assert(!handlers_.empty());
+    ExceptionHandler h = handlers_.back();
+    handlers_.pop_back();
+    if (Interpreter::Current() && h.with_depth <= Interpreter::Current()->GetWithStack().size()) {
+        Interpreter::Current()->PopWithToDepth(h.with_depth);
+    }
+    return h;
+}
 
 } // namespace aether
 

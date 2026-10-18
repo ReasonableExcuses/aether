@@ -35,6 +35,7 @@ public:
     void VisitAssign(AssignExpr* node) override;
     void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* node) override;
     void VisitPropertyAccess(PropertyAccessExpr* node) override;
+    void VisitPrivateAccess(PrivateAccessExpr* node) override;
     void VisitPropertyAssign(PropertyAssignExpr* node) override;
     void VisitCall(CallExpr* node) override;
     void VisitNew(NewExpr* node) override;
@@ -43,9 +44,13 @@ public:
     void VisitArrayLiteral(ArrayLiteralExpr* node) override;
     void VisitIndexAccess(IndexAccessExpr* node) override;
     void VisitIndexAssign(IndexAssignExpr* node) override;
+    void VisitCompoundAssign(CompoundAssignExpr* node) override;
     void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* node) override;
+    void VisitCompoundPrivateAssign(CompoundPrivateAssignExpr* node) override;
     void VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) override;
     void VisitUpdate(UpdateExpr* node) override;
+    void VisitUpdateProperty(UpdatePropertyExpr* node) override;
+    void VisitUpdateIndex(UpdateIndexExpr* node) override;
     void VisitConditional(ConditionalExpr* node) override;
     void VisitTemplateLiteral(TemplateLiteralExpr* node) override;
     void VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* node) override;
@@ -72,6 +77,7 @@ public:
     void VisitClassDecl(ClassDeclStmt* node) override;
     void VisitImportDecl(ImportDeclStmt* node) override;
     void VisitExportDecl(ExportDeclStmt* node) override;
+    virtual void VisitWith(WithStmt* node) override;
     void VisitThrow(ThrowStmt* node) override;
     void VisitTryCatch(TryCatchStmt* node) override;
     void VisitReturn(ReturnStmt* node) override;
@@ -88,7 +94,7 @@ public:
     void FreeRegisterRange(uint8_t start, uint8_t count);
 
     struct VarResolution {
-        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, GlobalValue, ThisVar, ImportedBinding, ModuleLocal, NotFound } kind{NotFound};
+        enum Kind { LocalReg, ContextSlot, GlobalOrFunction, GlobalValue, ThisVar, ImportedBinding, ModuleLocal, GlobalProperty, Unresolved, NotFound } kind{NotFound};
         uint8_t reg{0};
         uint8_t depth{0};
         uint16_t slot{0};
@@ -99,7 +105,7 @@ public:
     };
 
     VarResolution ResolveVariable(std::string_view name);
-    void ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body);
+    void ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body, const std::vector<std::unique_ptr<Expr>>* defaults = nullptr);
 
     void SetModuleRecord(void* mod) noexcept { current_module_ = mod; }
     void* GetModuleRecord() const noexcept { return current_module_; }
@@ -123,20 +129,38 @@ private:
         Stmt* finally_block{nullptr};
     };
     std::vector<TryContext> try_stack_;
+    std::vector<uint8_t> with_object_stack_;
     uint8_t max_registers_{0};
     uint16_t next_feedback_slot_{0};
     void* current_module_{nullptr};
+    bool is_strict_{false};
+    bool uses_arguments_{false};
 
     // Function lookup
     JSFunction* LookupFunction(std::string_view name);
     void EmitBinaryOp(BinaryOp op, uint8_t rhs_reg);
 
     BytecodeEmitter* parent_emitter_{nullptr};
+    JSObject* super_proto_{nullptr};
     std::unordered_map<std::string, JSFunction*> functions_;
+    JSObject* LookupSuperProto() const {
+        if (super_proto_) return super_proto_;
+        if (parent_emitter_) return parent_emitter_->LookupSuperProto();
+        return nullptr;
+    }
+    std::unordered_set<std::string> uninitialized_params_;
     std::unordered_set<std::string> const_bindings_;
     bool IsConstBinding(std::string_view name) const {
         if (const_bindings_.count(std::string(name))) return true;
         if (parent_emitter_) return parent_emitter_->IsConstBinding(name);
+        return false;
+    }
+    bool HasEnclosingWith() const {
+        const BytecodeEmitter* cur = parent_emitter_;
+        while (cur != nullptr) {
+            if (!cur->with_object_stack_.empty()) return true;
+            cur = cur->parent_emitter_;
+        }
         return false;
     }
 

@@ -63,7 +63,9 @@ private:
     MethodCallbackType method_callback_{nullptr};
 };
 
-TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
+TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args, TaggedValue new_target = TaggedValue::Undefined());
+TaggedValue InstanceofOperator(TaggedValue V, TaggedValue target);
+TaggedValue OrdinaryHasInstance(TaggedValue C, TaggedValue O);
 JSObject* CreateIterResult(TaggedValue value, bool done);
 
 /**
@@ -139,6 +141,8 @@ public:
     JSObject* GetAsyncGeneratorPrototype() const noexcept { return async_generator_prototype_; }
     JSObject* GetNumberPrototype() const noexcept { return number_prototype_; }
     void SetNumberPrototype(JSObject* proto) noexcept { number_prototype_ = proto; }
+    JSObject* GetBooleanPrototype() const noexcept { return boolean_prototype_; }
+    void SetBooleanPrototype(JSObject* proto) noexcept { boolean_prototype_ = proto; }
     JSObject* GetDatePrototype() const noexcept { return date_prototype_; }
     void SetDatePrototype(JSObject* proto) noexcept { date_prototype_ = proto; }
     JSObject* GetObjectPrototype() const noexcept { return object_prototype_; }
@@ -150,11 +154,16 @@ public:
         if (heap_) heap_->RegisterExtraRoot(val.get());
         root_values_.push_back(std::move(val));
     }
+    JSObject* GetSymbolPrototype() const noexcept { return symbol_prototype_; }
+    void SetSymbolPrototype(JSObject* proto) noexcept { symbol_prototype_ = proto; }
+    JSObject* GetBigIntPrototype() const noexcept { return bigint_prototype_; }
+    void SetBigIntPrototype(JSObject* proto) noexcept { bigint_prototype_ = proto; }
     TaggedValue GetSymbolIterator() const noexcept { return symbol_iterator_; }
     TaggedValue GetSymbolAsyncIterator() const noexcept { return symbol_asyncIterator_; }
     TaggedValue GetSymbolToStringTag() const noexcept { return symbol_toStringTag_; }
     TaggedValue GetSymbolHasInstance() const noexcept { return symbol_hasInstance_; }
     TaggedValue GetSymbolToPrimitive() const noexcept { return symbol_toPrimitive_; }
+    TaggedValue GetSymbolUnscopables() const noexcept { return symbol_unscopables_; }
 
 private:
     void InitializeIntrinsics(Heap& heap);
@@ -173,7 +182,10 @@ private:
     JSObject* array_prototype_{nullptr};
     JSObject* string_prototype_{nullptr};
     JSObject* number_prototype_{nullptr};
+    JSObject* boolean_prototype_{nullptr};
     JSObject* date_prototype_{nullptr};
+    JSObject* symbol_prototype_{nullptr};
+    JSObject* bigint_prototype_{nullptr};
     JSObject* map_prototype_{nullptr};
     JSObject* set_prototype_{nullptr};
     JSObject* promise_prototype_{nullptr};
@@ -190,6 +202,7 @@ private:
     TaggedValue symbol_toStringTag_{TaggedValue::Undefined()};
     TaggedValue symbol_hasInstance_{TaggedValue::Undefined()};
     TaggedValue symbol_toPrimitive_{TaggedValue::Undefined()};
+    TaggedValue symbol_unscopables_{TaggedValue::Undefined()};
     std::unordered_map<std::string, JSSymbol*> symbol_registry_;
 };
 
@@ -218,9 +231,8 @@ class ModuleLoader;
 class JSProxy;
 
 /**
- * @brief Invokes a JavaScript or native function with the given receiver and argument list.
+ * @brief Meta-Object Protocol (MOP) and Proxy Operations
  */
-TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args);
 
 // Meta-Object Protocol (MOP) and Proxy Operations
 TaggedValue GetProperty(TaggedValue obj, std::string_view key, TaggedValue receiver = TaggedValue::Empty());
@@ -258,7 +270,7 @@ public:
     /**
      * @brief Evaluates an ECMAScript script string end-to-end through the AetherVM engine.
      */
-    TaggedValue EvaluateScript(std::string_view source);
+    TaggedValue EvaluateScript(std::string_view source, TaggedValue this_val = TaggedValue::Undefined());
 
     /**
      * @brief Evaluates a script and runs the event loop until all tasks, timers, and microtasks complete.

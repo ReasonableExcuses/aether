@@ -310,6 +310,22 @@ void TestBaselineJITTypeGuardsAndOverflow() {
     TaggedValue res_div_negzero = interp.Execute(*div_bc, { TaggedValue::FromSmi(0), TaggedValue::FromSmi(-1) });
     assert(res_div_negzero.IsDouble() && res_div_negzero.AsDouble() == 0.0 && std::signbit(res_div_negzero.AsDouble()));
 
+    // INT32_MIN % -1 must deopt before x86 idiv's hardware overflow trap and
+    // preserve the ECMAScript negative-zero result.
+    const char* mod_src =
+        "function modNums(a, b) {\n"
+        "    return a % b;\n"
+        "}\n";
+    Lexer lexer_mod(mod_src);
+    Parser parser_mod(lexer_mod);
+    auto mod_decl = parser_mod.ParseStatement();
+    auto mod_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(mod_decl.get()));
+    for (uint32_t i = 0; i < BaselineJIT::kInvocationThreshold + 5; ++i) {
+        interp.Execute(*mod_bc, { TaggedValue::FromSmi(10), TaggedValue::FromSmi(3) });
+    }
+    TaggedValue res_mod_overflow = interp.Execute(*mod_bc, { TaggedValue::FromSmi(INT32_MIN), TaggedValue::FromSmi(-1) });
+    assert(res_mod_overflow.IsDouble() && res_mod_overflow.AsDouble() == 0.0 && std::signbit(res_mod_overflow.AsDouble()));
+
     // 5. Multiplication: 0 * -1 produces -0.0, which deopts to double -0.0
     const char* mul_src =
         "function mulNums(a, b) {\n"
@@ -330,6 +346,24 @@ void TestBaselineJITTypeGuardsAndOverflow() {
     std::cout << "  -> Baseline JIT type guards, overflow checks, -0.0 preservation, and deoptimization fallback verified.\n" << std::flush;
 }
 
+void TestBaselineJITMissingArguments() {
+    std::cout << "[Test 7] Verifying Omitted Arguments Become Undefined Without Native Faults...\n" << std::flush;
+
+    const char* src =
+        "function identity(value) { return value; }\n";
+    Lexer lexer(src);
+    Parser parser(lexer);
+    auto func_decl = parser.ParseStatement();
+    BytecodeEmitter emitter;
+    auto func_bc = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+    auto jit_code = BaselineJIT::Compile(*func_bc);
+    assert(jit_code != nullptr);
+
+    TaggedValue result = BaselineJIT::Invoke(*jit_code, nullptr, 0);
+    assert(result.IsUndefined());
+    std::cout << "  -> Native entry handled an omitted parameter as undefined.\n" << std::flush;
+}
+
 int main() {
     std::cout << "========================================================\n"
               << "   AetherVM Milestone 4 (Tier 1 Baseline JIT) Test Suite\n"
@@ -346,9 +380,11 @@ int main() {
     TestBaselineJITTruthinessSemantics();
     std::cout << "\n" << std::flush;
     TestBaselineJITTypeGuardsAndOverflow();
+    std::cout << "\n" << std::flush;
+    TestBaselineJITMissingArguments();
 
     std::cout << "\n========================================================\n"
-              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (6/6)             \n"
+              << "   ALL TIER 1 JIT NATIVE TESTS PASSED (7/7)             \n"
               << "========================================================\n" << std::flush;
     return 0;
 }

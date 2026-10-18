@@ -83,6 +83,30 @@ public:
         node->Index()->Accept(this);
         node->Rhs()->Accept(this);
     }
+    void VisitPrivateAccess(PrivateAccessExpr* node) override {
+        node->Object()->Accept(this);
+    }
+    void VisitCompoundAssign(CompoundAssignExpr* node) override {
+        if (inside_nested_function) {
+            identifiers_in_nested_functions.insert(node->Target());
+        }
+        node->Rhs()->Accept(this);
+    }
+    void VisitCompoundPrivateAssign(CompoundPrivateAssignExpr* node) override {
+        node->Object()->Accept(this);
+        node->Rhs()->Accept(this);
+    }
+    void VisitUpdateProperty(UpdatePropertyExpr* node) override {
+        node->Object()->Accept(this);
+    }
+    void VisitUpdateIndex(UpdateIndexExpr* node) override {
+        node->Object()->Accept(this);
+        node->Index()->Accept(this);
+    }
+    void VisitWith(WithStmt* node) override {
+        node->Object()->Accept(this);
+        node->Body()->Accept(this);
+    }
     void VisitConditional(ConditionalExpr* node) override {
         node->Condition()->Accept(this);
         node->ThenBranch()->Accept(this);
@@ -181,10 +205,15 @@ public:
     }
 };
 
-void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body) {
+void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& params, ASTNode* body, const std::vector<std::unique_ptr<Expr>>* defaults) {
     context_slots_.clear();
     if (!body) return;
     CaptureScanner scanner;
+    if (defaults) {
+        for (const auto& d : *defaults) {
+            if (d) d->Accept(&scanner);
+        }
+    }
     body->Accept(&scanner);
 
     for (const auto& p : params) {
@@ -227,6 +256,9 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
 }
 
 BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view name) {
+    if (uninitialized_params_.count(std::string(name))) {
+        throw std::runtime_error("ReferenceError: Cannot access '" + std::string(name) + "' before initialization");
+    }
     if (name == "this") {
         return VarResolution{VarResolution::ThisVar, 0, 0, 0, nullptr};
     }
@@ -286,7 +318,7 @@ BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view
             return VarResolution{VarResolution::GlobalValue, 0, 0, 0, nullptr, g_val};
         }
     }
-    return VarResolution{VarResolution::NotFound, 0, 0, 0, nullptr, TaggedValue::Undefined()};
+    return VarResolution{VarResolution::GlobalProperty, 0, 0, 0, nullptr, TaggedValue::Undefined()};
 }
 
 std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
@@ -557,10 +589,28 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         return;
     }
 
+    if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+        bytecode_->EmitOpcode(Opcode::LdaGlobal);
+        bytecode_->EmitU16(name_idx);
+        return;
+    }
+
     assert(false && "Undeclared identifier in scope");
 }
 
 void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
+    if (node->Op() == UnaryOp::TypeOf) {
+        if (auto* id = dynamic_cast<IdentifierExpr*>(node->GetExpr())) {
+            auto res = ResolveVariable(id->Name());
+            if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
+                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(id->Name())));
+                bytecode_->EmitOpcode(Opcode::TypeOfGlobal);
+                bytecode_->EmitU16(name_idx);
+                return;
+            }
+        }
+    }
     if (node->Op() == UnaryOp::Delete) {
         if (auto* mem = dynamic_cast<PropertyAccessExpr*>(node->GetExpr())) {
             mem->Object()->Accept(this);
@@ -666,6 +716,12 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         FreeRegister(val_reg);
         return;
     }
+    if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Target())));
+        bytecode_->EmitOpcode(Opcode::StaGlobal);
+        bytecode_->EmitU16(name_idx);
+        return;
+    }
     assert(false && "Assignment to undeclared variable");
 }
 
@@ -761,6 +817,10 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         bytecode_->EmitU16(name_idx);
         bytecode_->EmitU16(slot);
         FreeRegister(obj_reg);
+    } else if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+        bytecode_->EmitOpcode(Opcode::LdaGlobal);
+        bytecode_->EmitU16(name_idx);
     } else {
         assert(false && "Update of undeclared variable");
     }
@@ -828,6 +888,10 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
 
         FreeRegister(env_reg);
         FreeRegister(val_reg);
+    } else if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+        bytecode_->EmitOpcode(Opcode::StaGlobal);
+        bytecode_->EmitU16(name_idx);
     }
 
     if (!node->IsPrefix()) {
@@ -838,7 +902,14 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
 }
 
 void BytecodeEmitter::VisitPropertyAccess(PropertyAccessExpr* node) {
-    node->Object()->Accept(this);
+    JSObject* sp = LookupSuperProto();
+    if (auto* id = dynamic_cast<IdentifierExpr*>(node->Object()); id && id->Name() == "super" && sp) {
+        uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(sp));
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(const_idx);
+    } else {
+        node->Object()->Accept(this);
+    }
     uint8_t obj_reg = AllocateRegister();
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
@@ -880,9 +951,61 @@ void BytecodeEmitter::VisitPropertyAssign(PropertyAssignExpr* node) {
 
 void BytecodeEmitter::VisitCall(CallExpr* node) {
     if (auto* prop = dynamic_cast<PropertyAccessExpr*>(node->Callee())) {
+        uint8_t this_reg = AllocateRegister();
+        if (auto* id = dynamic_cast<IdentifierExpr*>(prop->Object()); id && id->Name() == "super") {
+            bytecode_->EmitOpcode(Opcode::LdaThis);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(this_reg);
+
+            JSObject* sp = LookupSuperProto();
+            if (sp) {
+                uint16_t const_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(sp));
+                bytecode_->EmitOpcode(Opcode::LdaConstant);
+                bytecode_->EmitU16(const_idx);
+            } else {
+                prop->Object()->Accept(this);
+            }
+            uint8_t super_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(super_reg);
+
+            auto* s = new JSString(prop->Property());
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
+            uint16_t slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::LdaNamed);
+            bytecode_->EmitU8(super_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+
+            uint8_t callee_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(callee_reg);
+
+            uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+            uint8_t args_start = AllocateRegisterRange(arg_count);
+            for (uint8_t i = 0; i < arg_count; ++i) {
+                node->Args()[i]->Accept(this);
+                bytecode_->EmitOpcode(Opcode::Star);
+                bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+            }
+
+            uint16_t call_slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::CallMethod);
+            bytecode_->EmitU8(callee_reg);
+            bytecode_->EmitU8(this_reg);
+            bytecode_->EmitU8(args_start);
+            bytecode_->EmitU8(arg_count);
+            bytecode_->EmitU16(call_slot);
+
+            FreeRegisterRange(args_start, arg_count);
+            FreeRegister(callee_reg);
+            FreeRegister(super_reg);
+            FreeRegister(this_reg);
+            return;
+        }
+
         // 1. Evaluate receiver object
         prop->Object()->Accept(this);
-        uint8_t this_reg = AllocateRegister();
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(this_reg);
 
@@ -969,6 +1092,73 @@ void BytecodeEmitter::VisitCall(CallExpr* node) {
         FreeRegister(callee_reg);
         FreeRegister(key_reg);
         FreeRegister(this_reg);
+        return;
+    }
+
+    if (auto* id = dynamic_cast<IdentifierExpr*>(node->Callee()); id && id->Name() == "super") {
+        uint8_t this_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaThis);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(this_reg);
+
+        node->Callee()->Accept(this);
+        uint8_t callee_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(callee_reg);
+
+        uint8_t arg_count = static_cast<uint8_t>(node->Args().size());
+        uint8_t args_start = AllocateRegisterRange(arg_count);
+        for (uint8_t i = 0; i < arg_count; ++i) {
+            node->Args()[i]->Accept(this);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(static_cast<uint8_t>(args_start + i));
+        }
+
+        uint16_t call_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::Call);
+        bytecode_->EmitU8(callee_reg);
+        bytecode_->EmitU8(args_start);
+        bytecode_->EmitU8(arg_count);
+        bytecode_->EmitU16(call_slot);
+
+        FreeRegisterRange(args_start, arg_count);
+        FreeRegister(callee_reg);
+
+        uint8_t sc_reg = AllocateRegister();
+        auto* sc_str = new JSString("__super_called__");
+        uint16_t sc_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(sc_str));
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(sc_idx);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(sc_reg);
+
+        uint16_t lda_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaKeyed);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU8(sc_reg);
+        bytecode_->EmitU16(lda_slot);
+
+        Label not_yet_called;
+        EmitJump(Opcode::JumpIfNullish, not_yet_called);
+
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        uint16_t err_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(
+            new JSError("ReferenceError", "Super constructor may only be called once")));
+        bytecode_->EmitU16(err_idx);
+        bytecode_->EmitOpcode(Opcode::Throw);
+
+        Bind(not_yet_called);
+        bytecode_->EmitOpcode(Opcode::LdaTrue);
+        uint16_t sta_slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::StaKeyed);
+        bytecode_->EmitU8(this_reg);
+        bytecode_->EmitU8(sc_reg);
+        bytecode_->EmitU16(sta_slot);
+
+        FreeRegister(sc_reg);
+        FreeRegister(this_reg);
+
+        bytecode_->EmitOpcode(Opcode::LdaThis);
         return;
     }
 
@@ -1903,14 +2093,27 @@ void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
     }
     fn_obj->SetGenerator(node->IsGenerator());
     fn_obj->SetAsync(node->IsAsync());
+    fn_obj->SetArrow(node->IsArrow());
 
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
+    sub_emitter.is_strict_ = is_strict_;
+    if (node->IsArrow()) {
+        sub_emitter.super_proto_ = LookupSuperProto();
+        auto super_fn_it = functions_.find("super");
+        if (super_fn_it != functions_.end()) {
+            sub_emitter.functions_["super"] = super_fn_it->second;
+        } else if (parent_emitter_) {
+            auto p_super = parent_emitter_->LookupFunction("super");
+            if (p_super) sub_emitter.functions_["super"] = p_super;
+        }
+    }
     sub_emitter.bytecode_ = std::make_unique<BytecodeArray>();
     uint32_t param_count = static_cast<uint32_t>(node->Params().size());
     sub_emitter.bytecode_->SetParameterCount(param_count);
 
-    sub_emitter.ScanAndSetupContextSlots(node->Params(), node->Body());
+    const auto& defaults = node->ParamDefaults();
+    sub_emitter.ScanAndSetupContextSlots(node->Params(), node->Body(), &defaults);
 
     for (uint32_t i = 0; i < param_count; ++i) {
         uint8_t reg = sub_emitter.AllocateRegister();
@@ -1941,6 +2144,43 @@ void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
             }
         }
     }
+
+    for (const auto& p : node->Params()) {
+        sub_emitter.uninitialized_params_.insert(p);
+    }
+
+    for (size_t i = 0; i < defaults.size() && i < param_count; ++i) {
+        if (defaults[i]) {
+            uint8_t reg = sub_emitter.scope_[node->Params()[i]];
+            uint8_t undef_reg = sub_emitter.AllocateRegister();
+            sub_emitter.bytecode_->EmitOpcode(Opcode::LdaUndefined);
+            sub_emitter.bytecode_->EmitOpcode(Opcode::Star);
+            sub_emitter.bytecode_->EmitU8(undef_reg);
+
+            sub_emitter.bytecode_->EmitOpcode(Opcode::Ldar);
+            sub_emitter.bytecode_->EmitU8(reg);
+            sub_emitter.bytecode_->EmitOpcode(Opcode::TestStrictEqual);
+            sub_emitter.bytecode_->EmitU8(undef_reg);
+            sub_emitter.FreeRegister(undef_reg);
+
+            Label skip_default;
+            sub_emitter.EmitJump(Opcode::JumpIfFalse, skip_default);
+            defaults[i]->Accept(&sub_emitter);
+            sub_emitter.bytecode_->EmitOpcode(Opcode::Star);
+            sub_emitter.bytecode_->EmitU8(reg);
+
+            auto cs_it = sub_emitter.context_slots_.find(node->Params()[i]);
+            if (cs_it != sub_emitter.context_slots_.end()) {
+                sub_emitter.bytecode_->EmitOpcode(Opcode::StaContextSlot);
+                sub_emitter.bytecode_->EmitU8(0);
+                sub_emitter.bytecode_->EmitU16(cs_it->second);
+            }
+
+            sub_emitter.Bind(skip_default);
+        }
+        sub_emitter.uninitialized_params_.erase(node->Params()[i]);
+    }
+    sub_emitter.uninitialized_params_.clear();
 
     node->Body()->Accept(&sub_emitter);
 
@@ -1981,8 +2221,30 @@ void BytecodeEmitter::VisitClassDecl(ClassDeclStmt* node) {
     auto* ctor_fn = new JSFunction(node->Name(), nullptr);
     functions_[node->Name()] = ctor_fn;
 
+    auto* proto_shape = new Shape(0, nullptr, "", TaggedValue::Null());
+    auto* proto_obj = new JSObject(proto_shape);
+    if (!node->SuperName().empty()) {
+        JSFunction* super_fn = LookupFunction(node->SuperName());
+        if (super_fn) {
+            proto_obj->SetPrototype(super_fn->GetOrCreateConstructorPrototype());
+        }
+    }
+    uint32_t dummy_sid = 1;
+    ctor_fn->SetConstructorPrototype(TaggedValue::FromHeapObject(proto_obj));
+    ctor_fn->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto_obj), dummy_sid);
+    proto_obj->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor_fn), dummy_sid);
+    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+        ctor_fn->SetPrototype(Realm::Current()->GetFunctionPrototype());
+    }
+
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
+    sub_emitter.is_strict_ = true;
+    sub_emitter.super_proto_ = proto_obj->GetPrototype();
+    if (!node->SuperName().empty()) {
+        JSFunction* super_fn = LookupFunction(node->SuperName());
+        if (super_fn) sub_emitter.functions_["super"] = super_fn;
+    }
     auto ctor_bc = sub_emitter.EmitFunction(ctor_stmt);
     std::shared_ptr<BytecodeArray> shared_ctor_bc = std::move(ctor_bc);
     ctor_fn->SetBytecode(shared_ctor_bc);
@@ -1990,22 +2252,17 @@ void BytecodeEmitter::VisitClassDecl(ClassDeclStmt* node) {
         compiled_routines_.push_back(std::move(routine));
     }
 
-    auto* proto_shape = new Shape(0, nullptr, "", TaggedValue::Null());
-    auto* proto_obj = new JSObject(proto_shape);
-    if (!node->SuperName().empty()) {
-        JSFunction* super_fn = LookupFunction(node->SuperName());
-        if (super_fn && super_fn->GetPrototype()) {
-            proto_obj->SetPrototype(super_fn->GetPrototype());
-        }
-    }
-    ctor_fn->SetPrototype(proto_obj);
-
     uint32_t dummy_id = 1;
     for (const auto& m : node->Methods()) {
         if (m->Name() == "constructor") continue;
         auto* method_fn = new JSFunction(m->Name(), nullptr);
+        if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+            method_fn->SetPrototype(Realm::Current()->GetFunctionPrototype());
+        }
         BytecodeEmitter m_emitter;
         m_emitter.parent_emitter_ = this;
+        m_emitter.is_strict_ = true;
+        m_emitter.super_proto_ = proto_obj->GetPrototype();
         auto m_bc = m_emitter.EmitFunction(m.get());
         std::shared_ptr<BytecodeArray> shared_m_bc = std::move(m_bc);
         method_fn->SetBytecode(shared_m_bc);
@@ -2391,6 +2648,364 @@ void BytecodeEmitter::VisitExportDecl(ExportDeclStmt* node) {
     if (node->Declaration()) {
         node->Declaration()->Accept(this);
     }
+}
+
+void BytecodeEmitter::VisitWith(WithStmt* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    bytecode_->EmitOpcode(Opcode::PushWith);
+    bytecode_->EmitU8(obj_reg);
+    with_object_stack_.push_back(obj_reg);
+
+    node->Body()->Accept(this);
+
+    with_object_stack_.pop_back();
+    bytecode_->EmitOpcode(Opcode::PopWith);
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitPrivateAccess(PrivateAccessExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+    bytecode_->EmitOpcode(Opcode::LdaPrivate);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
+    if (IsConstBinding(node->Target())) {
+        throw std::runtime_error("TypeError: Assignment to constant variable.");
+    }
+    auto res = ResolveVariable(node->Target());
+    if (res.kind == VarResolution::ImportedBinding) {
+        throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Target() + "'");
+    }
+
+    // 1. Load current value
+    if (res.kind == VarResolution::LocalReg) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res.reg);
+    } else if (res.kind == VarResolution::ContextSlot) {
+        bytecode_->EmitOpcode(Opcode::LdaContextSlot);
+        bytecode_->EmitU8(res.depth);
+        bytecode_->EmitU16(res.slot);
+    } else if (res.kind == VarResolution::ModuleLocal) {
+        uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+        uint8_t obj_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::LdaConstant);
+        bytecode_->EmitU16(obj_const);
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(obj_reg);
+
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+        uint16_t slot = next_feedback_slot_++;
+        bytecode_->EmitOpcode(Opcode::LdaNamed);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitU16(slot);
+        FreeRegister(obj_reg);
+    } else {
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Target())));
+        bytecode_->EmitOpcode(Opcode::LdaGlobal);
+        bytecode_->EmitU16(name_idx);
+    }
+
+    auto emit_store = [&]() {
+        if (res.kind == VarResolution::LocalReg) {
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(res.reg);
+        } else if (res.kind == VarResolution::ContextSlot) {
+            bytecode_->EmitOpcode(Opcode::StaContextSlot);
+            bytecode_->EmitU8(res.depth);
+            bytecode_->EmitU16(res.slot);
+        } else if (res.kind == VarResolution::ModuleLocal) {
+            uint8_t val_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(val_reg);
+
+            uint16_t obj_const = bytecode_->AddConstant(TaggedValue::FromHeapObject(res.module_target_obj));
+            uint8_t env_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(obj_const);
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(env_reg);
+
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(res.property_name)));
+            uint16_t slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(val_reg);
+            bytecode_->EmitOpcode(Opcode::StaNamed);
+            bytecode_->EmitU8(env_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+            FreeRegister(env_reg);
+            FreeRegister(val_reg);
+        } else {
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Target())));
+            bytecode_->EmitOpcode(Opcode::StaGlobal);
+            bytecode_->EmitU16(name_idx);
+        }
+    };
+
+    if (node->Op() == BinaryOp::LogicalAnd) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfFalse, short_circuit);
+        node->Rhs()->Accept(this);
+        emit_store();
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::LogicalOr) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        emit_store();
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::NullishCoalescing) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfNotNullish, short_circuit);
+        node->Rhs()->Accept(this);
+        emit_store();
+        Bind(short_circuit);
+    } else {
+        uint8_t cur_val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(cur_val_reg);
+
+        node->Rhs()->Accept(this);
+        uint8_t rhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rhs_reg);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(cur_val_reg);
+
+        EmitBinaryOp(node->Op(), rhs_reg);
+
+        emit_store();
+
+        FreeRegister(rhs_reg);
+        FreeRegister(cur_val_reg);
+    }
+}
+
+void BytecodeEmitter::VisitCompoundPrivateAssign(CompoundPrivateAssignExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Name())));
+    bytecode_->EmitOpcode(Opcode::LdaPrivate);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+
+    if (node->Op() == BinaryOp::LogicalAnd) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfFalse, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        bytecode_->EmitOpcode(Opcode::StaPrivate);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::LogicalOr) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfTrue, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        bytecode_->EmitOpcode(Opcode::StaPrivate);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else if (node->Op() == BinaryOp::NullishCoalescing) {
+        Label short_circuit;
+        EmitJump(Opcode::JumpIfNotNullish, short_circuit);
+        node->Rhs()->Accept(this);
+        uint8_t val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(val_reg);
+        bytecode_->EmitOpcode(Opcode::StaPrivate);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(val_reg);
+        FreeRegister(val_reg);
+        Bind(short_circuit);
+    } else {
+        uint8_t cur_val_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(cur_val_reg);
+
+        node->Rhs()->Accept(this);
+        uint8_t rhs_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rhs_reg);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(cur_val_reg);
+
+        EmitBinaryOp(node->Op(), rhs_reg);
+
+        uint8_t res_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(res_reg);
+
+        bytecode_->EmitOpcode(Opcode::StaPrivate);
+        bytecode_->EmitU8(obj_reg);
+        bytecode_->EmitU16(name_idx);
+
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(res_reg);
+
+        FreeRegister(res_reg);
+        FreeRegister(rhs_reg);
+        FreeRegister(cur_val_reg);
+    }
+
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitUpdateProperty(UpdatePropertyExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(new JSString(node->Property())));
+    uint16_t lda_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaNamed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+    bytecode_->EmitU16(lda_slot);
+
+    uint8_t old_reg = 0;
+    if (!node->IsPrefix()) {
+        old_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(old_reg);
+    }
+
+    uint8_t lhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(lhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::LdaSmi);
+    bytecode_->EmitI32(1);
+    uint8_t rhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(rhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::Ldar);
+    bytecode_->EmitU8(lhs_reg);
+
+    uint16_t op_slot = next_feedback_slot_++;
+    if (node->Op() == UpdateOp::Increment) {
+        bytecode_->EmitOpcode(Opcode::Add);
+    } else {
+        bytecode_->EmitOpcode(Opcode::Sub);
+    }
+    bytecode_->EmitU8(rhs_reg);
+    bytecode_->EmitU16(op_slot);
+
+    FreeRegister(rhs_reg);
+    FreeRegister(lhs_reg);
+
+    uint16_t sta_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::StaNamed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU16(name_idx);
+    bytecode_->EmitU16(sta_slot);
+
+    if (!node->IsPrefix()) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(old_reg);
+        FreeRegister(old_reg);
+    }
+
+    FreeRegister(obj_reg);
+}
+
+void BytecodeEmitter::VisitUpdateIndex(UpdateIndexExpr* node) {
+    node->Object()->Accept(this);
+    uint8_t obj_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(obj_reg);
+
+    node->Index()->Accept(this);
+    uint8_t key_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(key_reg);
+
+    uint16_t lda_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::LdaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(key_reg);
+    bytecode_->EmitU16(lda_slot);
+
+    uint8_t old_reg = 0;
+    if (!node->IsPrefix()) {
+        old_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(old_reg);
+    }
+
+    uint8_t lhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(lhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::LdaSmi);
+    bytecode_->EmitI32(1);
+    uint8_t rhs_reg = AllocateRegister();
+    bytecode_->EmitOpcode(Opcode::Star);
+    bytecode_->EmitU8(rhs_reg);
+
+    bytecode_->EmitOpcode(Opcode::Ldar);
+    bytecode_->EmitU8(lhs_reg);
+
+    uint16_t op_slot = next_feedback_slot_++;
+    if (node->Op() == UpdateOp::Increment) {
+        bytecode_->EmitOpcode(Opcode::Add);
+    } else {
+        bytecode_->EmitOpcode(Opcode::Sub);
+    }
+    bytecode_->EmitU8(rhs_reg);
+    bytecode_->EmitU16(op_slot);
+
+    FreeRegister(rhs_reg);
+    FreeRegister(lhs_reg);
+
+    uint16_t sta_slot = next_feedback_slot_++;
+    bytecode_->EmitOpcode(Opcode::StaKeyed);
+    bytecode_->EmitU8(obj_reg);
+    bytecode_->EmitU8(key_reg);
+    bytecode_->EmitU16(sta_slot);
+
+    if (!node->IsPrefix()) {
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(old_reg);
+        FreeRegister(old_reg);
+    }
+
+    FreeRegister(key_reg);
+    FreeRegister(obj_reg);
 }
 
 } // namespace aether

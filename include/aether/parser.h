@@ -39,7 +39,16 @@ public:
     std::unique_ptr<Stmt> ParseStatement();
     std::unique_ptr<Expr> ParseExpression(Precedence precedence = Precedence::Assignment);
 
+    void SetModule(bool is_module = true) {
+        is_module_ = is_module;
+        if (is_module_) {
+            strict_mode_ = true;
+        }
+    }
+    bool IsModule() const { return is_module_; }
+
 private:
+    friend struct FunctionContextGuard;
     Token Advance();
     Token Peek();
     bool Check(TokenKind kind);
@@ -49,7 +58,7 @@ private:
     Precedence GetPrecedence(TokenKind kind);
 
     // Statement parsers
-    std::unique_ptr<Stmt> ParseVarDecl(bool is_const = false);
+    std::unique_ptr<Stmt> ParseVarDecl(bool is_const = false, VarDeclStmt::Kind kind = VarDeclStmt::Kind::Var);
     std::unique_ptr<Stmt> ParseFunctionDecl(bool is_async = false);
     std::unique_ptr<Stmt> ParseIf();
     std::unique_ptr<Stmt> ParseWhile();
@@ -63,6 +72,7 @@ private:
     std::unique_ptr<Stmt> ParseThrow();
     std::unique_ptr<Stmt> ParseTryCatch();
     std::unique_ptr<Stmt> ParseClassDecl();
+    std::unique_ptr<Stmt> ParseWith();
     std::unique_ptr<BlockStmt> ParseBlock();
     std::unique_ptr<Stmt> ParseExprStmt();
     std::unique_ptr<Stmt> ParseImportDecl();
@@ -72,9 +82,18 @@ private:
     // Expression parsers
     std::unique_ptr<Expr> ParsePrefix();
     std::unique_ptr<Expr> ParseInfix(std::unique_ptr<Expr> lhs, Token op_token);
+    std::unique_ptr<CallExpr> MakeTaggedTemplateCall(std::unique_ptr<Expr> tag, Token op_token);
+    void ConsumeSemicolon();
 
     Lexer& lexer_;
     Token current_token_;
+    bool in_derived_constructor_{false};
+    bool strict_mode_{false};
+    bool allow_in_{true};
+    bool in_generator_{false};
+    bool in_async_{false};
+    bool is_module_{false};
+    uint32_t function_depth_{0};
 };
 
 } // namespace aether

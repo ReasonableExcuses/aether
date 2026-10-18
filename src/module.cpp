@@ -28,6 +28,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
     source_code_ = std::string(source);
     Lexer lexer(source_code_);
     Parser parser(lexer);
+    parser.SetModule(true);
     ast_ = parser.ParseProgram();
 
     requested_modules_.clear();
@@ -51,6 +52,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
         void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
         void VisitUpdate(UpdateExpr*) override {}
         void VisitPropertyAccess(PropertyAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
+        void VisitPrivateAccess(PrivateAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
         void VisitPropertyAssign(PropertyAssignExpr* n) override {
             if (n->Object()) n->Object()->Accept(this);
             if (n->Value()) n->Value()->Accept(this);
@@ -82,7 +84,14 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Index()) n->Index()->Accept(this);
             if (n->Value()) n->Value()->Accept(this);
         }
+        void VisitCompoundAssign(CompoundAssignExpr* n) override {
+            if (n->Rhs()) n->Rhs()->Accept(this);
+        }
         void VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* n) override {
+            if (n->Object()) n->Object()->Accept(this);
+            if (n->Rhs()) n->Rhs()->Accept(this);
+        }
+        void VisitCompoundPrivateAssign(CompoundPrivateAssignExpr* n) override {
             if (n->Object()) n->Object()->Accept(this);
             if (n->Rhs()) n->Rhs()->Accept(this);
         }
@@ -152,6 +161,10 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
         void VisitExportDecl(ExportDeclStmt* n) override {
             if (n->Declaration()) n->Declaration()->Accept(this);
             if (n->DefaultExpr()) n->DefaultExpr()->Accept(this);
+        }
+        void VisitWith(WithStmt* n) override {
+            if (n->Object()) n->Object()->Accept(this);
+            if (n->Body()) n->Body()->Accept(this);
         }
         void VisitThrow(ThrowStmt* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
         void VisitTryCatch(TryCatchStmt* n) override {

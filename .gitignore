@@ -31,3 +31,17 @@ PASSOVER.md
 .DS_Store
 Thumbs.db
 .system_generated/
+
+# Official Test262 Suite & Temporary Runner Artifacts
+test/official-test262/
+.tmp_test262*.js
+test262_report.json
+scratch/
+
+# Node files
+node_modules/
+package.json
+package-lock.json
+vc140.pdb
+__pycache__/
+*.pyc

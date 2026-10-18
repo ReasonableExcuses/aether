@@ -3,8 +3,56 @@
 #include <iostream>
 #include <unordered_set>
 #include <unordered_map>
+#include <limits>
 
 namespace aether {
+
+namespace {
+
+// Tier 2 values are unboxed int32 values until the final return. Keep this
+// proof conservative: a failed proof must use the interpreter instead of
+// silently changing a JavaScript value's representation.
+bool IsInt32Value(Node* node, std::unordered_set<Node*>& visiting) {
+    // Cycles are formed by loop Phi nodes.  The non-cyclic edge is checked
+    // below; the backedge itself is the value being proven.
+    if (!node) return false;
+    if (visiting.contains(node)) return true;
+    visiting.insert(node);
+
+    bool result = false;
+    switch (node->Op()) {
+        case NodeOp::ConstantInt32:
+        case NodeOp::Parameter:
+            result = true;
+            break;
+        case NodeOp::Int32Add:
+        case NodeOp::Int32Sub:
+        case NodeOp::Int32Mul:
+        case NodeOp::Int32Div:
+        case NodeOp::Int32Mod:
+        case NodeOp::Int32And:
+        case NodeOp::Int32Or:
+        case NodeOp::Int32Xor:
+            result = node->Inputs().size() >= 2 &&
+                     IsInt32Value(node->Input(0), visiting) &&
+                     IsInt32Value(node->Input(1), visiting);
+            break;
+        case NodeOp::Phi:
+            result = node->Inputs().size() >= 2;
+            for (size_t i = 1; result && i < node->Inputs().size(); ++i) {
+                result = IsInt32Value(node->Input(i), visiting);
+            }
+            break;
+        default:
+            result = false;
+            break;
+    }
+
+    visiting.erase(node);
+    return result;
+}
+
+} // namespace
 
 bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
     if (!BaselineJIT::CanCompile(bytecode)) {
@@ -16,15 +64,12 @@ bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
     uint32_t backward_jumps = 0;
     uint32_t conditional_jumps = 0;
     uint32_t forward_unconditional_jumps = 0;
+    uint32_t return_count = 0;
 
     while (pc < code.size()) {
         Opcode op = static_cast<Opcode>(code[pc++]);
         switch (op) {
             case Opcode::LdaZero:
-            case Opcode::LdaTrue:
-            case Opcode::LdaFalse:
-            case Opcode::LdaUndefined:
-            case Opcode::LdaNull:
                 break;
 
             case Opcode::LdaSmi:
@@ -38,7 +83,7 @@ bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
                 pc += 2;
                 if (idx >= bytecode.Constants().size()) return false;
                 const auto& c = bytecode.Constants()[idx];
-                if (!c.IsSmi() && !c.IsBoolean()) {
+                if (!c.IsSmi()) {
                     return false;
                 }
                 break;
@@ -99,12 +144,19 @@ bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
             }
 
             case Opcode::Return:
+                ++return_count;
                 break;
 
             default:
                 // Unsupported bytecode for Tier 2 Sea-of-Nodes lowering
                 return false;
         }
+    }
+
+    // Early returns require a real control-flow merge/deoptimization map.
+    // Until that exists, compiling them would lose observable paths.
+    if (return_count != 1) {
+        return false;
     }
 
     // The Tier 2 code generator supports:
@@ -133,6 +185,21 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
     // 1. Build unified Sea-of-Nodes SSA Graph
     SeaOfNodesBuilder builder(bytecode, feedback);
     auto graph = builder.Build();
+    if (!graph || !graph->ReturnNode()) {
+        return nullptr;
+    }
+
+    // Tier 2 stores arithmetic values unboxed and tags only the final
+    // return. Reject a graph whose result is a boolean, null, undefined,
+    // comparison, or any other value with an unproven representation.
+    Node* return_node = graph->ReturnNode();
+    if (return_node->Inputs().size() < 3) {
+        return nullptr;
+    }
+    std::unordered_set<Node*> visiting;
+    if (!IsInt32Value(return_node->Input(return_node->Inputs().size() - 1), visiting)) {
+        return nullptr;
+    }
 
     // 2. Run Global Optimizations: GVN, Constant Folding, DCE, LICM
     SeaOfNodesOptimizer::Optimize(*graph);
@@ -149,6 +216,9 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
     if (stack_frame_size % 16 != 0) stack_frame_size += 8;
     masm.Prologue(stack_frame_size);
     masm.MovRegReg(X86Reg::RBX, X86Reg::RCX);
+    // Keep the argument count in a callee-saved register; RDX is used by
+    // arithmetic lowering and is not stable across emitted nodes.
+    masm.MovRegReg(X86Reg::R12, X86Reg::RDX);
 
     auto GetNodeOffset = [](uint32_t id) -> int32_t {
         return -(56 + static_cast<int32_t>((id + 1) * 8));
@@ -173,7 +243,15 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
 
             case NodeOp::Parameter: {
                 uint32_t idx = node->ParameterIndex();
+                JITLabel missing_parameter;
+                JITLabel parameter_ready;
+                masm.CmpRegImm32(X86Reg::R12, static_cast<int32_t>(idx + 1));
+                masm.Jcc(Condition::Less, missing_parameter);
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBX, static_cast<int32_t>(idx * 8));
+                masm.Jmp(parameter_ready);
+                masm.Bind(missing_parameter);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::Undefined().RawBits());
+                masm.Bind(parameter_ready);
                 // Validate incoming parameter is a Smi
                 masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
                 // Extract unboxed 32-bit payload
@@ -285,6 +363,14 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.CmpRegImm32(X86Reg::RCX, 0);
                 masm.Jcc(Condition::Equal, deopt_bailout_label);
+                // x86 idiv faults for INT32_MIN % -1. Deopt to the
+                // interpreter for this ECMAScript edge case.
+                masm.CmpRegImm32(X86Reg::RCX, -1);
+                JITLabel safe_mod;
+                masm.Jcc(Condition::NotEqual, safe_mod);
+                masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.Bind(safe_mod);
                 masm.Cdq();
                 masm.IdivReg32(X86Reg::RCX);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RDX);

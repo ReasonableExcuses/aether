@@ -228,28 +228,71 @@ static void AppendUtf8(std::string& out, uint32_t cp) {
     }
 }
 
-void Lexer::SkipWhitespaceAndComments() {
+bool Lexer::SkipWhitespaceAndComments() {
+    bool saw_newline = false;
     while (!IsAtEnd()) {
         char c = Peek();
+
+        // ECMAScript source text is UTF-8 in the host interface. Handle the
+        // non-ASCII WhiteSpace and LineTerminator code points before the
+        // single-byte switch below; treating their bytes as punctuation
+        // produces misleading parser errors (notably in Test262).
+        const auto byte = [](char value) {
+            return static_cast<unsigned char>(value);
+        };
+        if (byte(c) == 0xC2 && cursor_ + 1 < source_.size() &&
+            byte(source_[cursor_ + 1]) == 0xA0) { // U+00A0 NBSP
+            cursor_ += 2;
+            column_ += 2;
+            continue;
+        }
+        if (byte(c) == 0xE2 && cursor_ + 2 < source_.size() &&
+            byte(source_[cursor_ + 1]) == 0x80 &&
+            (byte(source_[cursor_ + 2]) == 0xA8 ||
+             byte(source_[cursor_ + 2]) == 0xA9)) { // U+2028/U+2029
+            cursor_ += 3;
+            line_++;
+            column_ = 1;
+            saw_newline = true;
+            continue;
+        }
+        if (byte(c) == 0xEF && cursor_ + 2 < source_.size() &&
+            byte(source_[cursor_ + 1]) == 0xBB &&
+            byte(source_[cursor_ + 2]) == 0xBF) { // U+FEFF BOM/WhiteSpace
+            cursor_ += 3;
+            column_ += 3;
+            continue;
+        }
+
         switch (c) {
             case ' ':
             case '\t':
-            case '\r':
             case '\v':
             case '\f':
                 Advance();
+                break;
+            case '\r':
+                cursor_++;
+                if (Peek() == '\n') {
+                    // \r\n will handle line_ on \n
+                } else {
+                    line_++;
+                    column_ = 1;
+                }
+                saw_newline = true;
                 break;
             case '\n':
                 cursor_++;
                 line_++;
                 column_ = 1;
+                saw_newline = true;
                 break;
             case '/':
                 if (PeekNext() == '/') {
                     // Single line comment
                     Advance();
                     Advance();
-                    while (!IsAtEnd() && Peek() != '\n') {
+                    while (!IsAtEnd() && Peek() != '\n' && Peek() != '\r') {
                         Advance();
                     }
                 } else if (PeekNext() == '*') {
@@ -261,6 +304,14 @@ void Lexer::SkipWhitespaceAndComments() {
                             cursor_++;
                             line_++;
                             column_ = 1;
+                            saw_newline = true;
+                        } else if (Peek() == '\r') {
+                            cursor_++;
+                            if (Peek() != '\n') {
+                                line_++;
+                                column_ = 1;
+                            }
+                            saw_newline = true;
                         } else if (Peek() == '*' && PeekNext() == '/') {
                             Advance();
                             Advance();
@@ -270,7 +321,7 @@ void Lexer::SkipWhitespaceAndComments() {
                         }
                     }
                 } else {
-                    return;
+                    return saw_newline;
                 }
                 break;
             case '#':
@@ -278,17 +329,18 @@ void Lexer::SkipWhitespaceAndComments() {
                 if (cursor_ == 0 && PeekNext() == '!') {
                     Advance();
                     Advance();
-                    while (!IsAtEnd() && Peek() != '\n') {
+                    while (!IsAtEnd() && Peek() != '\n' && Peek() != '\r') {
                         Advance();
                     }
                 } else {
-                    return;
+                    return saw_newline;
                 }
                 break;
             default:
-                return;
+                return saw_newline;
         }
     }
+    return saw_newline;
 }
 
 Token Lexer::PeekToken() {
@@ -311,7 +363,13 @@ Token Lexer::NextTokenImpl() {
         return tok;
     }
 
-    SkipWhitespaceAndComments();
+    bool saw_newline = SkipWhitespaceAndComments();
+    Token tok = ScanToken();
+    tok.has_leading_newline = saw_newline;
+    return tok;
+}
+
+Token Lexer::ScanToken() {
 
     SourceLocation loc{line_, column_};
 
@@ -327,7 +385,7 @@ Token Lexer::NextTokenImpl() {
     }
 
     // Identifiers and keywords
-    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$' || (c == '\\' && PeekNext() == 'u')) {
         return ScanIdentifierOrKeyword();
     }
 
@@ -371,7 +429,8 @@ Token Lexer::NextTokenImpl() {
                 if (Match('=')) return Token{TokenKind::QuestionQuestionEqual, "??=", 0, false, 0, false, loc};
                 return Token{TokenKind::QuestionQuestion, "??", 0, false, 0, false, loc};
             }
-            if (Match('.')) {
+            if (Peek() == '.' && (PeekNext() < '0' || PeekNext() > '9')) {
+                Advance();
                 return Token{TokenKind::QuestionDot, "?.", 0, false, 0, false, loc};
             }
             return Token{TokenKind::Question, "?", 0, false, 0, false, loc};
@@ -469,63 +528,88 @@ Token Lexer::NextTokenImpl() {
 
 Token Lexer::ScanIdentifierOrKeyword() {
     SourceLocation loc{line_, column_};
-    size_t start = cursor_;
+    std::string text;
+    bool has_escape = false;
     while (!IsAtEnd()) {
         char c = Peek();
         if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
-            Advance();
+            text.push_back(Advance());
+        } else if (c == '\\' && PeekNext() == 'u') {
+            has_escape = true;
+            Advance(); // '\'
+            Advance(); // 'u'
+            uint32_t cp = 0;
+            if (!IsAtEnd() && Peek() == '{') {
+                Advance(); // '{'
+                while (!IsAtEnd() && Peek() != '}') {
+                    char hc = Advance();
+                    if (std::isxdigit(static_cast<unsigned char>(hc))) {
+                        cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+                    }
+                }
+                if (!IsAtEnd() && Peek() == '}') Advance();
+            } else {
+                for (int i = 0; i < 4 && !IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek())); ++i) {
+                    char hc = Advance();
+                    cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+                }
+            }
+            AppendUtf8(text, cp);
         } else {
             break;
         }
     }
 
-    std::string_view text = source_.substr(start, cursor_ - start);
     TokenKind kind = TokenKind::Identifier;
 
-    if (text == "var")             kind = TokenKind::Var;
-    else if (text == "let")        kind = TokenKind::Let;
-    else if (text == "const")      kind = TokenKind::Const;
-    else if (text == "function")   kind = TokenKind::Function;
-    else if (text == "return")     kind = TokenKind::Return;
-    else if (text == "if")         kind = TokenKind::If;
-    else if (text == "else")       kind = TokenKind::Else;
-    else if (text == "while")      kind = TokenKind::While;
-    else if (text == "for")        kind = TokenKind::For;
-    else if (text == "break")      kind = TokenKind::Break;
-    else if (text == "continue")   kind = TokenKind::Continue;
-    else if (text == "new")        kind = TokenKind::New;
-    else if (text == "try")        kind = TokenKind::Try;
-    else if (text == "catch")      kind = TokenKind::Catch;
-    else if (text == "finally")    kind = TokenKind::Finally;
-    else if (text == "throw")      kind = TokenKind::Throw;
-    else if (text == "class")      kind = TokenKind::Class;
-    else if (text == "extends")    kind = TokenKind::Extends;
-    else if (text == "this")       kind = TokenKind::This;
-    else if (text == "typeof")     kind = TokenKind::TypeOf;
-    else if (text == "instanceof") kind = TokenKind::InstanceOf;
-    else if (text == "in")         kind = TokenKind::In;
-    else if (text == "delete")     kind = TokenKind::Delete;
-    else if (text == "switch")     kind = TokenKind::Switch;
-    else if (text == "case")       kind = TokenKind::Case;
-    else if (text == "do")         kind = TokenKind::Do;
-    else if (text == "void")       kind = TokenKind::Void;
-    else if (text == "debugger")   kind = TokenKind::Debugger;
-    else if (text == "with")       kind = TokenKind::With;
-    else if (text == "super")      kind = TokenKind::Super;
-    else if (text == "static")     kind = TokenKind::Static;
-    else if (text == "true")       kind = TokenKind::True;
-    else if (text == "false")      kind = TokenKind::False;
-    else if (text == "null")       kind = TokenKind::Null;
-    else if (text == "undefined")  kind = TokenKind::Undefined;
-    else if (text == "of")         kind = TokenKind::Of;
-    else if (text == "yield")      kind = TokenKind::Yield;
-    else if (text == "async")      kind = TokenKind::Async;
-    else if (text == "await")      kind = TokenKind::Await;
-    else if (text == "import")     kind = TokenKind::Import;
-    else if (text == "export")     kind = TokenKind::Export;
-    else if (text == "default")    kind = TokenKind::Default;
+    if (!has_escape) {
+        if (text == "var")             kind = TokenKind::Var;
+        else if (text == "let")        kind = TokenKind::Let;
+        else if (text == "const")      kind = TokenKind::Const;
+        else if (text == "function")   kind = TokenKind::Function;
+        else if (text == "return")     kind = TokenKind::Return;
+        else if (text == "if")         kind = TokenKind::If;
+        else if (text == "else")       kind = TokenKind::Else;
+        else if (text == "while")      kind = TokenKind::While;
+        else if (text == "for")        kind = TokenKind::For;
+        else if (text == "break")      kind = TokenKind::Break;
+        else if (text == "continue")   kind = TokenKind::Continue;
+        else if (text == "new")        kind = TokenKind::New;
+        else if (text == "try")        kind = TokenKind::Try;
+        else if (text == "catch")      kind = TokenKind::Catch;
+        else if (text == "finally")    kind = TokenKind::Finally;
+        else if (text == "throw")      kind = TokenKind::Throw;
+        else if (text == "class")      kind = TokenKind::Class;
+        else if (text == "extends")    kind = TokenKind::Extends;
+        else if (text == "this")       kind = TokenKind::This;
+        else if (text == "typeof")     kind = TokenKind::TypeOf;
+        else if (text == "instanceof") kind = TokenKind::InstanceOf;
+        else if (text == "in")         kind = TokenKind::In;
+        else if (text == "delete")     kind = TokenKind::Delete;
+        else if (text == "switch")     kind = TokenKind::Switch;
+        else if (text == "case")       kind = TokenKind::Case;
+        else if (text == "do")         kind = TokenKind::Do;
+        else if (text == "void")       kind = TokenKind::Void;
+        else if (text == "debugger")   kind = TokenKind::Debugger;
+        else if (text == "with")       kind = TokenKind::With;
+        else if (text == "super")      kind = TokenKind::Super;
+        else if (text == "static")     kind = TokenKind::Static;
+        else if (text == "true")       kind = TokenKind::True;
+        else if (text == "false")      kind = TokenKind::False;
+        else if (text == "null")       kind = TokenKind::Null;
+        else if (text == "undefined")  kind = TokenKind::Undefined;
+        else if (text == "of")         kind = TokenKind::Identifier;
+        else if (text == "yield")      kind = TokenKind::Yield;
+        else if (text == "async")      kind = TokenKind::Async;
+        else if (text == "await")      kind = TokenKind::Await;
+        else if (text == "import")     kind = TokenKind::Import;
+        else if (text == "export")     kind = TokenKind::Export;
+        else if (text == "default")    kind = TokenKind::Default;
+    }
 
-    return Token{kind, std::string(text), 0, false, 0, false, loc};
+    Token tok{kind, std::move(text), 0, false, 0, false, loc};
+    tok.has_escape = has_escape;
+    return tok;
 }
 
 Token Lexer::ScanNumber() {
@@ -612,7 +696,7 @@ Token Lexer::ScanNumber() {
             char ch = Advance();
             if (ch != '_') raw.push_back(ch);
         }
-        if (!IsAtEnd() && Peek() == '.' && (std::isdigit(static_cast<unsigned char>(PeekNext())) || PeekNext() == '_')) {
+        if (!IsAtEnd() && Peek() == '.') {
             is_fp = true;
             Advance(); // .
             raw.push_back('.');
@@ -668,7 +752,8 @@ Token Lexer::ScanString(char quote) {
                 case 'v': result.push_back('\v'); break;
                 case 'n': result.push_back('\n'); break;
                 case 't': result.push_back('\t'); break;
-                case 'r':
+                case 'r': result.push_back('\r'); break;
+                case '\r':
                     if (!IsAtEnd() && Peek() == '\n') Advance();
                     line_++;
                     column_ = 1;
@@ -730,17 +815,33 @@ Token Lexer::ScanTemplateLiteral() {
     Token tok{TokenKind::Backtick, "", 0.0, false, 0, false, loc};
 
     std::string current_quasi;
+    std::string current_raw_quasi;
+    bool current_has_invalid = false;
+
+    auto hex_val = [](char c) -> uint32_t {
+        if (c >= '0' && c <= '9') return static_cast<uint32_t>(c - '0');
+        if (c >= 'a' && c <= 'f') return static_cast<uint32_t>(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return static_cast<uint32_t>(c - 'A' + 10);
+        return 0;
+    };
+
     while (!IsAtEnd()) {
         char c = Peek();
         if (c == '`') {
             Advance(); // Consume closing backtick
             tok.template_quasis.push_back(std::move(current_quasi));
+            tok.template_raw_quasis.push_back(std::move(current_raw_quasi));
+            tok.template_has_invalid_escape.push_back(current_has_invalid);
             return tok;
         } else if (c == '$' && PeekNext() == '{') {
             Advance(); // Consume '$'
             Advance(); // Consume '{'
             tok.template_quasis.push_back(std::move(current_quasi));
+            tok.template_raw_quasis.push_back(std::move(current_raw_quasi));
+            tok.template_has_invalid_escape.push_back(current_has_invalid);
             current_quasi.clear();
+            current_raw_quasi.clear();
+            current_has_invalid = false;
 
             // Scan embedded expression until closing '}'
             int brace_depth = 1;
@@ -788,51 +889,151 @@ Token Lexer::ScanTemplateLiteral() {
             tok.template_exprs.push_back(std::move(expr_text));
         } else if (c == '\\') {
             Advance(); // Consume '\'
-            if (IsAtEnd()) break;
-            char esc = Advance();
-            switch (esc) {
-                case '0': current_quasi.push_back('\0'); break;
-                case 'b': current_quasi.push_back('\b'); break;
-                case 'f': current_quasi.push_back('\f'); break;
-                case 'v': current_quasi.push_back('\v'); break;
-                case 'n': current_quasi.push_back('\n'); break;
-                case 't': current_quasi.push_back('\t'); break;
-                case 'r': current_quasi.push_back('\r'); break;
-                case '\\': current_quasi.push_back('\\'); break;
-                case '`': current_quasi.push_back('`'); break;
-                case '$': current_quasi.push_back('$'); break;
-                case 'x': {
-                    uint32_t cp = 0;
-                    for (int i = 0; i < 2 && !IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek())); ++i) {
-                        char hc = Advance();
-                        cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+            if (IsAtEnd()) {
+                current_raw_quasi.push_back('\\');
+                current_has_invalid = true;
+                break;
+            }
+            char esc = Peek();
+            // 1. Line continuation check
+            if (esc == '\r') {
+                Advance(); // Consume '\r'
+                if (!IsAtEnd() && Peek() == '\n') Advance(); // Consume '\n'
+                line_++;
+                column_ = 1;
+                // TV is empty, TRV is \ followed by \n
+                current_raw_quasi.push_back('\\');
+                current_raw_quasi.push_back('\n');
+            } else if (esc == '\n') {
+                Advance(); // Consume '\n'
+                line_++;
+                column_ = 1;
+                current_raw_quasi.push_back('\\');
+                current_raw_quasi.push_back('\n');
+            } else if (static_cast<unsigned char>(esc) == 0xE2 && cursor_ + 2 < source_.size() &&
+                       static_cast<unsigned char>(source_[cursor_ + 1]) == 0x80 &&
+                       (static_cast<unsigned char>(source_[cursor_ + 2]) == 0xA8 || static_cast<unsigned char>(source_[cursor_ + 2]) == 0xA9)) {
+                // Line separator U+2028 or Paragraph separator U+2029
+                char b2 = source_[cursor_ + 1];
+                char b3 = source_[cursor_ + 2];
+                Advance(); Advance(); Advance();
+                line_++;
+                column_ = 1;
+                current_raw_quasi.push_back('\\');
+                current_raw_quasi.push_back(esc);
+                current_raw_quasi.push_back(b2);
+                current_raw_quasi.push_back(b3);
+            } else {
+                // Escape sequence:
+                current_raw_quasi.push_back('\\');
+                Advance(); // Consume esc
+                current_raw_quasi.push_back(esc);
+
+                switch (esc) {
+                    case '0': {
+                        if (!IsAtEnd() && std::isdigit(static_cast<unsigned char>(Peek()))) {
+                            current_has_invalid = true;
+                            while (!IsAtEnd() && std::isdigit(static_cast<unsigned char>(Peek()))) {
+                                current_raw_quasi.push_back(Advance());
+                            }
+                        } else {
+                            current_quasi.push_back('\0');
+                        }
+                        break;
                     }
-                    current_quasi.push_back(static_cast<char>(cp));
-                    break;
-                }
-                case 'u': {
-                    if (!IsAtEnd() && Peek() == '{') {
-                        Advance();
-                        uint32_t cp = 0;
-                        while (!IsAtEnd() && Peek() != '}') {
-                            char hc = Advance();
-                            if (std::isxdigit(static_cast<unsigned char>(hc))) {
-                                cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+                    case '1': case '2': case '3': case '4':
+                    case '5': case '6': case '7': case '8': case '9': {
+                        current_has_invalid = true;
+                        while (!IsAtEnd() && std::isdigit(static_cast<unsigned char>(Peek()))) {
+                            current_raw_quasi.push_back(Advance());
+                        }
+                        break;
+                    }
+                    case 'b': current_quasi.push_back('\b'); break;
+                    case 'f': current_quasi.push_back('\f'); break;
+                    case 'v': current_quasi.push_back('\v'); break;
+                    case 'n': current_quasi.push_back('\n'); break;
+                    case 't': current_quasi.push_back('\t'); break;
+                    case 'r': current_quasi.push_back('\r'); break;
+                    case '\\': current_quasi.push_back('\\'); break;
+                    case '\'': current_quasi.push_back('\''); break;
+                    case '"': current_quasi.push_back('"'); break;
+                    case '`': current_quasi.push_back('`'); break;
+                    case '$': current_quasi.push_back('$'); break;
+                    case 'x': {
+                        if (!IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek()))) {
+                            char h1 = Advance();
+                            current_raw_quasi.push_back(h1);
+                            if (!IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek()))) {
+                                char h2 = Advance();
+                                current_raw_quasi.push_back(h2);
+                                uint32_t val = (hex_val(h1) << 4) | hex_val(h2);
+                                current_quasi.push_back(static_cast<char>(val));
+                            } else {
+                                current_has_invalid = true;
+                            }
+                        } else {
+                            current_has_invalid = true;
+                        }
+                        break;
+                    }
+                    case 'u': {
+                        if (!IsAtEnd() && Peek() == '{') {
+                            Advance(); // '{'
+                            current_raw_quasi.push_back('{');
+                            uint32_t cp = 0;
+                            int count = 0;
+                            bool valid = true;
+                            while (!IsAtEnd() && Peek() != '}' && Peek() != '`' && !(Peek() == '$' && PeekNext() == '{')) {
+                                char ch = Advance();
+                                current_raw_quasi.push_back(ch);
+                                if (std::isxdigit(static_cast<unsigned char>(ch))) {
+                                    count++;
+                                    cp = (cp << 4) | hex_val(ch);
+                                    if (cp > 0x10FFFF) valid = false;
+                                } else {
+                                    valid = false;
+                                }
+                            }
+                            if (!IsAtEnd() && Peek() == '}') {
+                                Advance(); // '}'
+                                current_raw_quasi.push_back('}');
+                            } else {
+                                valid = false;
+                            }
+                            if (count == 0) valid = false;
+                            if (valid) {
+                                AppendUtf8(current_quasi, cp);
+                            } else {
+                                current_has_invalid = true;
+                            }
+                        } else {
+                            uint32_t cp = 0;
+                            bool valid = true;
+                            for (int i = 0; i < 4; ++i) {
+                                if (!IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek()))) {
+                                    char ch = Advance();
+                                    current_raw_quasi.push_back(ch);
+                                    cp = (cp << 4) | hex_val(ch);
+                                } else {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if (valid) {
+                                AppendUtf8(current_quasi, cp);
+                            } else {
+                                current_has_invalid = true;
                             }
                         }
-                        if (!IsAtEnd() && Peek() == '}') Advance();
-                        AppendUtf8(current_quasi, cp);
-                    } else {
-                        uint32_t cp = 0;
-                        for (int i = 0; i < 4 && !IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek())); ++i) {
-                            char hc = Advance();
-                            cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
-                        }
-                        AppendUtf8(current_quasi, cp);
+                        break;
                     }
-                    break;
+                    default: {
+                        // NonEscapeCharacter
+                        current_quasi.push_back(esc);
+                        break;
+                    }
                 }
-                default: current_quasi.push_back(esc); break;
             }
         } else {
             if (c == '\r') {
@@ -841,16 +1042,23 @@ Token Lexer::ScanTemplateLiteral() {
                 line_++;
                 column_ = 1;
                 current_quasi.push_back('\n');
+                current_raw_quasi.push_back('\n');
             } else if (c == '\n') {
                 line_++;
                 column_ = 1;
-                current_quasi.push_back(Advance());
+                Advance();
+                current_quasi.push_back('\n');
+                current_raw_quasi.push_back('\n');
             } else {
-                current_quasi.push_back(Advance());
+                Advance();
+                current_quasi.push_back(c);
+                current_raw_quasi.push_back(c);
             }
         }
     }
     tok.template_quasis.push_back(std::move(current_quasi));
+    tok.template_raw_quasis.push_back(std::move(current_raw_quasi));
+    tok.template_has_invalid_escape.push_back(current_has_invalid);
     return tok;
 }
 
