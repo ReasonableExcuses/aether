@@ -6,7 +6,7 @@
 
 Aether is an experimental ECMAScript and WebAssembly runtime implemented from scratch in modern C++ (ISO C++23). It is designed as an embeddable, modular virtual machine with a multi-tier JIT compilation pipeline, an Immix-based generational garbage collector, and native concurrency primitives.
 
-> **Status**: Aether is an active research and development project. While it implements a substantial subset of ECMAScript and the WebAssembly MVP specification, it is not yet intended for production deployments.
+> **Status**: Aether is an active research and development project. While it implements a substantial subset of ECMAScript and the WebAssembly MVP specification, it is not yet intended for production deployments. For detailed milestone tracking, architecture deep-dives, and verification status, see [progress.md](progress.md).
 
 ---
 
@@ -136,7 +136,8 @@ Aether includes a test suite covering each subsystem and regression scenarios:
 .
 ├── CMakeLists.txt                # Build configuration
 ├── LICENSE                       # Apache 2.0 license
-├── README.md                     # Project documentation
+├── README.md                     # Project overview and architecture summary
+├── progress.md                   # Detailed milestone tracking, verification & roadmap
 ├── include/aether/               # Public headers
 │   ├── advanced_intrinsics.h     # Weak collections, SharedArrayBuffer, Atomics
 │   ├── background_compiler.h     # Background Sea-of-Nodes worker pool
