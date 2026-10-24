@@ -2,17 +2,40 @@
 #include "aether/runtime.h"
 #include "aether/typed_array.h"
 #include "aether/bytecode.h"
+#include "aether/bounded_regex.h"
 #include <cctype>
-#include <regex>
 #include <cmath>
 
 namespace aether {
+
+namespace {
+thread_local size_t property_lookup_depth = 0;
+struct PropertyLookupScope {
+    PropertyLookupScope() { ++property_lookup_depth; }
+    ~PropertyLookupScope() { --property_lookup_depth; }
+};
+} // namespace
 
 static bool IsAllDigits(std::string_view s) {
     if (s.empty()) return false;
     for (char c : s) {
         if (!std::isdigit(static_cast<unsigned char>(c))) return false;
     }
+    return true;
+}
+
+static bool TryParseArrayIndex(std::string_view s, size_t& index) noexcept {
+    if (s.empty()) return false;
+    size_t value = 0;
+    for (char c : s) {
+        if (c < '0' || c > '9') return false;
+        const size_t digit = static_cast<size_t>(c - '0');
+        if (value > (std::numeric_limits<size_t>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    index = value;
     return true;
 }
 
@@ -36,6 +59,8 @@ static bool SameValueZero(TaggedValue a, TaggedValue b) {
 }
 
 TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
+    if (property_lookup_depth > kMaxPrototypeChainDepth) return TaggedValue::Undefined();
+    PropertyLookupScope lookup_scope;
     if (deleted_properties_.count(std::string(key))) {
         if (prototype_ != nullptr) {
             return prototype_->GetNamedProperty(key);
@@ -46,9 +71,12 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
         if (key == "length") {
             return TaggedValue::FromSmi(static_cast<int32_t>(static_cast<const JSArray*>(this)->Length()));
         }
-        if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
-            return static_cast<const JSArray*>(this)->GetElement(idx);
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
+            const auto* arr = static_cast<const JSArray*>(this);
+            if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
+                return arr->Elements()[idx];
+            }
         }
     } else if (IsMap()) {
         if (key == "size") {
@@ -95,9 +123,9 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
         if (IsFunction()) {
             if (key == "name") {
                 if (GetType() == HeapObjectType::JSFunction) {
-                    return TaggedValue::FromHeapObject(new JSString(static_cast<const JSFunction*>(this)->Name()));
+                    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(static_cast<const JSFunction*>(this)->Name()));
                 } else if (GetType() == HeapObjectType::JSNativeFunction) {
-                    return TaggedValue::FromHeapObject(new JSString(static_cast<const JSNativeFunction*>(this)->Name()));
+                    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(static_cast<const JSNativeFunction*>(this)->Name()));
                 }
             }
             if (key == "length") {
@@ -105,6 +133,9 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
                     auto* fn = static_cast<const JSFunction*>(this);
                     uint32_t len = fn->GetBytecode() ? fn->GetBytecode()->Length() : 0;
                     return TaggedValue::FromSmi(static_cast<int32_t>(len));
+                } else if (GetType() == HeapObjectType::JSNativeFunction) {
+                    auto* fn = static_cast<const JSNativeFunction*>(this);
+                    return TaggedValue::FromSmi(static_cast<int32_t>(fn->Length()));
                 }
             }
         }
@@ -130,7 +161,8 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
 
         // Walk shape prototype chain
         TaggedValue proto = shape->Prototype();
-        while (proto.IsHeapObject()) {
+        size_t depth = 0;
+        while (proto.IsHeapObject() && depth++ < kMaxPrototypeChainDepth) {
             HeapObject* p_obj = proto.AsHeapObject();
             if (p_obj->IsJSObject()) {
                 JSObject* js_proto = static_cast<JSObject*>(p_obj);
@@ -160,16 +192,20 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
 }
 
 bool JSObject::HasNamedProperty(std::string_view key) const {
+    if (property_lookup_depth > kMaxPrototypeChainDepth) return false;
+    PropertyLookupScope lookup_scope;
     if (deleted_properties_.count(std::string(key))) {
         if (prototype_ != nullptr && prototype_->HasNamedProperty(key)) return true;
         return false;
     }
     if (IsArray()) {
         if (key == "length") return true;
-        if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
             const auto* arr = static_cast<const JSArray*>(this);
-            return idx < arr->Length() && !arr->Elements()[idx].IsEmpty();
+            if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
+                return true;
+            }
         }
     } else if (IsMap()) {
         if (key == "size") return true;
@@ -205,7 +241,8 @@ bool JSObject::HasNamedProperty(std::string_view key) const {
         }
 
         TaggedValue proto = shape->Prototype();
-        while (proto.IsHeapObject()) {
+        size_t depth = 0;
+        while (proto.IsHeapObject() && depth++ < kMaxPrototypeChainDepth) {
             HeapObject* p_obj = proto.AsHeapObject();
             if (p_obj->IsJSObject()) {
                 JSObject* js_proto = static_cast<JSObject*>(p_obj);
@@ -230,12 +267,16 @@ bool JSObject::HasNamedProperty(std::string_view key) const {
 bool JSObject::DeleteNamedProperty(std::string_view key) {
     if (IsArray()) {
         if (key == "length") return false;
-        if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
             auto* arr = static_cast<JSArray*>(this);
             if (idx < arr->Length()) {
-                arr->SetElement(idx, TaggedValue::Empty());
-                return true;
+                PropertyAttributes attrs = GetOwnPropertyAttributes(key);
+                if (attrs & PropertyAttributes::Configurable) {
+                    arr->SetElement(idx, TaggedValue::Empty());
+                    return true;
+                }
+                return false;
             }
         }
     }
@@ -243,8 +284,8 @@ bool JSObject::DeleteNamedProperty(std::string_view key) {
         if (key == "length" || key == "name") {
             PropertyAttributes attrs = GetOwnPropertyAttributes(key);
             if (attrs & PropertyAttributes::Configurable) {
-                deleted_properties_.insert(std::string(key));
-                own_attributes_.erase(std::string(key));
+                MarkDeletedProperty(key);
+                if (auto it = own_attributes_.find(key); it != own_attributes_.end()) own_attributes_.erase(it);
                 return true;
             }
             return false;
@@ -257,9 +298,9 @@ bool JSObject::DeleteNamedProperty(std::string_view key) {
             attrs = own_it->second;
         }
         if (attrs & PropertyAttributes::Configurable) {
+            MarkDeletedProperty(key);
             accessors_.erase(it);
-            own_attributes_.erase(std::string(key));
-            deleted_properties_.insert(std::string(key));
+            if (own_it != own_attributes_.end()) own_attributes_.erase(own_it);
             return true;
         }
         return false;
@@ -272,9 +313,9 @@ bool JSObject::DeleteNamedProperty(std::string_view key) {
             if (!val.IsEmpty()) {
                 PropertyAttributes attrs = GetOwnPropertyAttributes(key);
                 if (attrs & PropertyAttributes::Configurable) {
-                    own_attributes_.erase(std::string(key));
+                    MarkDeletedProperty(key);
+                    if (auto it = own_attributes_.find(key); it != own_attributes_.end()) own_attributes_.erase(it);
                     SetFastSlot(desc->slot_index, desc->is_in_object, TaggedValue::Empty());
-                    deleted_properties_.insert(std::string(key));
                     return true;
                 }
                 return false;
@@ -297,8 +338,8 @@ bool JSObject::HasOwnProperty(std::string_view key) const {
     }
     if (IsArray()) {
         if (key == "length") return true;
-        if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
             const auto* arr = static_cast<const JSArray*>(this);
             return idx < arr->Length() && !arr->Elements()[idx].IsEmpty();
         }
@@ -320,10 +361,10 @@ PropertyAttributes JSObject::GetOwnPropertyAttributes(std::string_view key) cons
     } else if (const AccessorDescriptor* accessor = GetAccessor(key)) {
         attrs = accessor->attributes;
     } else if (IsArray()) {
+        size_t idx = 0;
         if (key == "length") {
             attrs = PropertyAttributes::Writable;
-        } else if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+        } else if (TryParseArrayIndex(key, idx)) {
             if (idx < static_cast<const JSArray*>(this)->Length()) {
                 attrs = PropertyAttributes::Default;
             }
@@ -380,9 +421,26 @@ PropertyAttributes JSObject::GetOwnPropertyAttributes(std::string_view key) cons
 }
 
 void JSObject::SetOwnPropertyAttributes(std::string_view key, PropertyAttributes attributes) {
-    own_attributes_[std::string(key)] = attributes;
-    auto accessor = accessors_.find(std::string(key));
+    CheckPropertyGrowth(key);
+    if (!own_attributes_.contains(key) && own_attributes_.size() >= kMaxObjectProperties) {
+        throw std::length_error("object property limit exceeded");
+    }
+    own_attributes_.insert_or_assign(detail::MakePropertyKey(key, key_allocator_), attributes);
+    auto accessor = accessors_.find(key);
     if (accessor != accessors_.end()) accessor->second.attributes = attributes;
+}
+
+void JSObject::CheckPropertyGrowth(std::string_view key) const {
+    if (key.size() > kMaxStringLength) throw std::length_error("property key is too long");
+    const Shape* shape = GetShape();
+    if (accessors_.contains(key) || own_attributes_.contains(key) ||
+        (shape && shape->LookupProperty(key))) return;
+    // own_attributes_ includes both data and accessor names. Shapes retain
+    // deleted slots, so separately enforce the slot count at transition time.
+    if (own_attributes_.size() >= kMaxObjectProperties ||
+        accessors_.size() >= kMaxObjectProperties) {
+        throw std::length_error("object property limit exceeded");
+    }
 }
 
 void JSObject::Freeze() noexcept {
@@ -406,7 +464,8 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
         if (name.rfind("__private__", 0) == 0) return;
         if (deleted_properties_.count(name)) return;
         if (seen.insert(name).second) {
-            if (IsAllDigits(name)) {
+            size_t parsed_index = 0;
+            if (TryParseArrayIndex(name, parsed_index)) {
                 indices.push_back(name);
             } else if (name.rfind("@@", 0) == 0) {
                 symbol_keys.push_back(name);
@@ -437,7 +496,7 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
 
     // Collect accessor names
     for (const auto& [name, acc] : accessors_) {
-        add_key(name);
+        add_key(std::string(name));
     }
 
     // Collect shape property names ordered by slot_index (creation order)
@@ -460,7 +519,12 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
 
     // Sort integer indices ascending numerically
     std::sort(indices.begin(), indices.end(), [](const std::string& a, const std::string& b) {
-        return std::stoull(a) < std::stoull(b);
+        size_t ai = 0;
+        size_t bi = 0;
+        const bool a_ok = TryParseArrayIndex(a, ai);
+        const bool b_ok = TryParseArrayIndex(b, bi);
+        if (a_ok && b_ok) return ai < bi;
+        return a < b;
     });
 
     std::vector<std::string> result;
@@ -471,7 +535,7 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
     return result;
 }
 void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id) {
-    deleted_properties_.erase(std::string(key));
+    CheckPropertyGrowth(key);
     Shape* current_shape = GetShape();
     if (current_shape == nullptr) {
         if (Realm::Current()) {
@@ -480,14 +544,13 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
             static Shape s_fallback_root_shape(0, nullptr, "", TaggedValue::Null());
             current_shape = &s_fallback_root_shape;
         }
-        SetShape(current_shape);
     }
     assert(current_shape != nullptr && "Object must have a valid shape");
 
     if (is_frozen_) {
         if (Interpreter::Current() && Interpreter::Current()->IsStrictMode()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Cannot assign to read only property")));
+                AllocateRuntime<JSError>("TypeError", "Cannot assign to read only property")));
         }
         return;
     }
@@ -499,7 +562,7 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
         } else if (is_private || (Interpreter::Current() && Interpreter::Current()->IsStrictMode())) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Cannot set property without a setter")));
+                    AllocateRuntime<JSError>("TypeError", "Cannot set property without a setter")));
             }
         }
         return;
@@ -507,13 +570,17 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
 
     if (IsFunction()) {
         if (key == "length" || key == "name") {
-            auto override_it = own_attributes_.find(std::string(key));
-            if (override_it == own_attributes_.end() || !(override_it->second & PropertyAttributes::Writable)) {
-                if (Interpreter::Current() && Interpreter::Current()->IsStrictMode()) {
-                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "Cannot assign to read-only property '" + std::string(key) + "'")));
+            if (Interpreter::Current() != nullptr) {
+                auto override_it = own_attributes_.find(std::string(key));
+                if (override_it == own_attributes_.end() || !(override_it->second & PropertyAttributes::Writable)) {
+                    if (Interpreter::Current()->IsStrictMode()) {
+                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot assign to read-only property '" + std::string(key) + "'")));
+                    }
+                    return;
                 }
-                return;
+            } else if (key == "length" && GetType() == HeapObjectType::JSNativeFunction && value.IsSmi()) {
+                static_cast<JSNativeFunction*>(this)->SetLength(static_cast<uint32_t>(value.AsSmi()));
             }
         }
     }
@@ -525,14 +592,22 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
 
     if (IsArray()) {
         if (key == "length") {
-            if (value.IsSmi()) {
-                static_cast<JSArray*>(this)->SetLength(static_cast<size_t>(value.AsSmi()));
+            const double length = value.ToDouble();
+            if (!std::isfinite(length) || length < 0 ||
+                length > static_cast<double>(kMaxArrayLength) || std::trunc(length) != length) {
+                throw std::length_error("invalid array length");
             }
+            static_cast<JSArray*>(this)->SetLength(static_cast<size_t>(length));
+            ClearDeletedProperty(key);
             return;
         }
         if (IsAllDigits(key)) {
-            size_t idx = static_cast<size_t>(std::stoull(std::string(key)));
+            size_t idx = 0;
+            if (!TryParseArrayIndex(key, idx)) {
+                throw std::length_error("array index overflow");
+            }
             static_cast<JSArray*>(this)->SetElement(idx, value);
+            ClearDeletedProperty(key);
             return;
         }
     }
@@ -544,19 +619,24 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
             if (!(GetOwnPropertyAttributes(key) & PropertyAttributes::Writable)) {
                 if (Interpreter::Current() && (is_private || Interpreter::Current()->IsStrictMode())) {
                     Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "Cannot assign to read only property")));
+                        AllocateRuntime<JSError>("TypeError", "Cannot assign to read only property")));
                 }
                 return;
             }
             // Fast path: Shape already contains property; overwrite existing slot
             SetFastSlot(desc->slot_index, desc->is_in_object, value);
+            ClearDeletedProperty(key);
             return;
         }
     }
 
     // A setter or non-writable property on the prototype chain handles assignment
     TaggedValue proto_val = prototype_ ? TaggedValue::FromHeapObject(prototype_) : (current_shape ? current_shape->Prototype() : TaggedValue::Null());
+    size_t prototype_depth = 0;
     while (proto_val.IsHeapObject()) {
+        if (++prototype_depth > kMaxPrototypeChainDepth) {
+            throw std::length_error("prototype chain depth exceeded");
+        }
         HeapObject* p_obj = proto_val.AsHeapObject();
         if (p_obj->IsJSObject()) {
             JSObject* p = static_cast<JSObject*>(p_obj);
@@ -566,27 +646,30 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
                 } else if (is_private || (Interpreter::Current() && Interpreter::Current()->IsStrictMode())) {
                     if (Interpreter::Current()) {
                         Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                            new JSError("TypeError", "Cannot set property without a setter")));
+                            AllocateRuntime<JSError>("TypeError", "Cannot set property without a setter")));
                     }
                 }
                 return;
             }
-            if (is_private && p->HasNamedProperty(key)) {
+            if (is_private && p->HasOwnProperty(key)) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "Cannot assign to private method")));
+                        AllocateRuntime<JSError>("TypeError", "Cannot assign to private method")));
                 }
                 return;
             }
-            PropertyAttributes attrs = p->GetOwnPropertyAttributes(key);
-            if (p->HasNamedProperty(key) && !(attrs & PropertyAttributes::Writable)) {
-                if (is_private || (Interpreter::Current() && Interpreter::Current()->IsStrictMode())) {
-                    if (Interpreter::Current()) {
-                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                            new JSError("TypeError", "Cannot assign to read only property")));
+            if (p->HasOwnProperty(key)) {
+                PropertyAttributes attrs = p->GetOwnPropertyAttributes(key);
+                if (!(attrs & PropertyAttributes::Writable)) {
+                    if (is_private || (Interpreter::Current() && Interpreter::Current()->IsStrictMode())) {
+                        if (Interpreter::Current()) {
+                            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                                AllocateRuntime<JSError>("TypeError", "Cannot assign to read only property")));
+                        }
                     }
+                    return;
                 }
-                return;
+                break;
             }
             proto_val = p->GetPrototype() ? TaggedValue::FromHeapObject(p->GetPrototype()) : (p->GetShape() ? p->GetShape()->Prototype() : TaggedValue::Null());
         } else {
@@ -599,34 +682,45 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
         if (is_sealed_ || !is_extensible_) {
             if (Interpreter::Current() && Interpreter::Current()->IsStrictMode()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Cannot add property to a non-extensible object")));
+                    AllocateRuntime<JSError>("TypeError", "Cannot add property to a non-extensible object")));
             }
             return;
         }
-        if (own_attributes_.find(std::string(key)) == own_attributes_.end()) {
-            own_attributes_[std::string(key)] = PropertyAttributes::Default;
-        }
+        PrepareFastSlot(desc->slot_index, desc->is_in_object);
+        if (!own_attributes_.contains(key)) SetOwnPropertyAttributes(key, PropertyAttributes::Default);
         SetFastSlot(desc->slot_index, desc->is_in_object, value);
+        ClearDeletedProperty(key);
         return;
     }
     if (is_sealed_ || !is_extensible_) {
         if (Interpreter::Current() && Interpreter::Current()->IsStrictMode()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Cannot add property to a non-extensible object")));
+                AllocateRuntime<JSError>("TypeError", "Cannot add property to a non-extensible object")));
         }
         return;
     }
 
-    // Slow path: Property does not exist; transition shape
-    Shape* next_shape = current_shape->FindOrCreateTransition(key, next_shape_id++, current_shape->Prototype());
-    SetShape(next_shape);
-
-    const PropertyDescriptor* new_desc = next_shape->LookupProperty(key);
-    assert(new_desc != nullptr);
-    if (own_attributes_.find(std::string(key)) == own_attributes_.end()) {
-        own_attributes_[std::string(key)] = PropertyAttributes::Default;
+    // The transition allocates the next slot at PropertyCount().  Validate
+    // and reserve it before publishing the child shape so a failed growth
+    // cannot leave a shape whose slot metadata points past storage.
+    if (AETHER_UNLIKELY(current_shape->PropertyCount() >= kMaxObjectProperties)) {
+        throw std::length_error("object property limit exceeded");
     }
-    SetFastSlot(new_desc->slot_index, new_desc->is_in_object, value);
+    const uint32_t next_slot = current_shape->PropertyCount();
+    PrepareFastSlot(next_slot, next_slot < Shape::kDefaultInObjectProperties);
+    auto [attr, inserted] = own_attributes_.try_emplace(detail::MakePropertyKey(key, key_allocator_), PropertyAttributes::Default);
+    Shape* next_shape;
+    try {
+        next_shape = current_shape->FindOrCreateTransition(key, next_shape_id, current_shape->Prototype());
+    } catch (...) {
+        if (inserted) own_attributes_.erase(attr);
+        throw;
+    }
+    // All allocating operations have succeeded; publish storage before shape.
+    SetFastSlot(next_slot, next_slot < Shape::kDefaultInObjectProperties, value);
+    SetShape(next_shape);
+    ++next_shape_id;
+    ClearDeletedProperty(key);
 }
 
 // JSMap Implementation
@@ -640,6 +734,7 @@ void JSMap::Set(TaggedValue key, TaggedValue val) {
             return;
         }
     }
+    detail::ReserveStorage(entries_, entries_storage_, entries_.size() + 1);
     entries_.emplace_back(key, val);
     if (AETHER_UNLIKELY(IsOld())) {
         if (key.IsHeapObject()) RecordWriteBarrier(this, key);
@@ -682,6 +777,7 @@ void JSSet::Add(TaggedValue val) {
             return;
         }
     }
+    detail::ReserveStorage(values_, values_storage_, values_.size() + 1);
     values_.push_back(val);
     if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
         RecordWriteBarrier(this, val);
@@ -723,7 +819,7 @@ void JSPromise::Fulfill(TaggedValue val, MicrotaskQueue& queue) {
             } else {
                 if (downstream) downstream->Fulfill(val, queue);
             }
-        });
+        }, {on_fulfilled, val, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
     }
     reactions_.clear();
 }
@@ -743,7 +839,7 @@ void JSPromise::Reject(TaggedValue reason, MicrotaskQueue& queue) {
             } else {
                 if (downstream) downstream->Reject(reason, queue);
             }
-        });
+        }, {on_rejected, reason, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
     }
     reactions_.clear();
 }
@@ -758,7 +854,7 @@ void JSPromise::AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, J
             } else {
                 if (downstream) downstream->Fulfill(val, queue);
             }
-        });
+        }, {on_fulfilled, val, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
     } else if (state_ == PromiseState::Rejected) {
         TaggedValue reason = result_;
         queue.Enqueue([on_rejected, reason, downstream, &queue]() {
@@ -768,25 +864,16 @@ void JSPromise::AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, J
             } else {
                 if (downstream) downstream->Reject(reason, queue);
             }
-        });
+        }, {on_rejected, reason, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
     } else {
+        detail::ReserveStorage(reactions_, reactions_storage_, reactions_.size() + 1);
         reactions_.push_back({on_fulfilled, on_rejected, downstream});
     }
 }
 
 // JSRegExp Implementation
 bool JSRegExp::Test(std::string_view str) const {
-    try {
-        std::regex::flag_type flags = std::regex::ECMAScript;
-        if (flags_.find('i') != std::string::npos) {
-            flags |= std::regex::icase;
-        }
-        std::regex re(pattern_, flags);
-        std::string s(str);
-        return std::regex_search(s, re);
-    } catch (...) {
-        return false;
-    }
+    return RegexSearch(Pattern(), Flags(), str).has_value();
 }
 
 void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visitor) {
@@ -819,11 +906,16 @@ void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visito
             }
         }
     }
+    for (auto& f : instance_fields_) {
+        if (f.initial_value.IsHeapObject()) {
+            visitor(f.initial_value);
+        }
+    }
 }
 
 JSFunction::JSFunction(std::string_view name, std::shared_ptr<const BytecodeArray> bytecode, LexicalEnvironment* env, Shape* shape)
     : JSObject(HeapObjectType::JSFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
-      name_(name),
+      name_(detail::ChargedString(name, name_storage_)),
       bytecode_shared_(std::move(bytecode)),
       bytecode_(bytecode_shared_.get()),
       environment_(env) {
@@ -834,7 +926,7 @@ JSFunction::JSFunction(std::string_view name, std::shared_ptr<const BytecodeArra
 
 JSFunction::JSFunction(std::string_view name, const BytecodeArray* bytecode, LexicalEnvironment* env, Shape* shape)
     : JSObject(HeapObjectType::JSFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
-      name_(name),
+      name_(detail::ChargedString(name, name_storage_)),
       bytecode_(bytecode),
       environment_(env) {
     if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
@@ -845,7 +937,7 @@ JSFunction::JSFunction(std::string_view name, const BytecodeArray* bytecode, Lex
 JSObject* JSFunction::GetOrCreateConstructorPrototype() {
     if (ctor_prototype_.IsEmpty()) {
         Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
-        auto* proto = new JSObject(root_shape);
+        auto* proto = AllocateRuntime<JSObject>(root_shape);
         if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
             proto->SetPrototype(Realm::Current()->GetObjectPrototype());
         }
@@ -862,11 +954,11 @@ JSObject* JSFunction::GetOrCreateConstructorPrototype() {
 
 JSError::JSError(std::string_view name, std::string_view message, Shape* shape)
     : JSObject(HeapObjectType::JSError, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
-      name_(name),
-      message_(message) {
+      name_(detail::ChargedString(name, name_storage_)),
+      message_(detail::ChargedString(message, message_storage_)) {
     uint32_t sid = 8000;
-    SetNamedProperty("name", TaggedValue::FromHeapObject(new JSString(name_)), sid);
-    SetNamedProperty("message", TaggedValue::FromHeapObject(new JSString(message_)), sid);
+    SetNamedProperty("name", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(name_)), sid);
+    SetNamedProperty("message", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(message_)), sid);
     if (Realm::Current()) {
         TaggedValue ctor_val = Realm::Current()->GetGlobalProperty(name_);
         if (!ctor_val.IsEmpty() && ctor_val.IsHeapObject()) {
@@ -879,6 +971,78 @@ JSError::JSError(std::string_view name, std::string_view message, Shape* shape)
             }
         }
     }
+}
+
+JSBigInt* JSBigInt::Create(int64_t value) {
+    return Create(JSBigInt(value));
+}
+
+JSBigInt* JSBigInt::Create(bool negative, const std::vector<uint32_t>& limbs) {
+    return Create(JSBigInt(negative, limbs));
+}
+
+JSBigInt* JSBigInt::Create(bool negative, std::vector<uint32_t>&& limbs) {
+    return Create(JSBigInt(negative, std::move(limbs)));
+}
+
+JSBigInt* JSBigInt::Create(JSBigInt&& value) {
+    return AllocateRuntime<JSBigInt>(std::move(value));
+}
+
+JSBigInt* JSBigInt::Create(bool negative, std::vector<uint32_t>&& limbs, MemoryCharge&& charge) {
+    JSBigInt value(0);
+    value.is_negative_ = negative;
+    value.limbs_storage_ = std::move(charge);
+    value.limbs_ = std::move(limbs);
+    value.Normalize();
+    return Create(std::move(value));
+}
+
+JSArrayBuffer* JSArrayBuffer::Slice(int64_t begin, int64_t end, Shape* shape) const {
+    if (is_detached_) throw std::length_error("ArrayBuffer is detached");
+    const int64_t len = static_cast<int64_t>(byte_length_);
+    const size_t start = static_cast<size_t>(NormalizeIndex(begin, len));
+    const size_t finish = static_cast<size_t>(NormalizeIndex(end, len));
+    const size_t count = finish > start ? finish - start : 0;
+    const bool shared = is_shared_;
+    std::optional<HandleScope> scope;
+    Handle<JSArrayBuffer> source;
+    if (auto* heap = IsolateHeap::Current()) {
+        scope.emplace(*heap);
+        source = scope->CreateHandle(const_cast<JSArrayBuffer*>(this));
+    }
+    auto* copy = shared ? AllocateRuntime<JSArrayBuffer>(count, count, true, shape)
+                        : AllocateRuntime<JSArrayBuffer>(count, shape);
+    const auto* original = scope ? source.Get() : this;
+    if (count != 0) std::memcpy(copy->Data(), original->Data() + start, count);
+    return copy;
+}
+
+JSTypedArray* JSTypedArray::Subarray(int64_t begin, int64_t end, Shape* shape) const {
+    if (!buffer_ || buffer_->IsDetached()) throw std::length_error("TypedArray buffer is detached");
+    const int64_t len = static_cast<int64_t>(length_);
+    const size_t start = static_cast<size_t>(NormalizeIndex(begin, len));
+    const size_t finish = static_cast<size_t>(NormalizeIndex(end, len));
+    const size_t count = finish > start ? finish - start : 0;
+    const size_t delta = CheckedStorageBytes(start, BytesPerElement());
+    if (delta > std::numeric_limits<size_t>::max() - byte_offset_) {
+        throw std::length_error("TypedArray subarray offset overflow");
+    }
+    JSTypedArray pending(kind_, buffer_, byte_offset_ + delta, count, shape);
+    JSArrayBuffer* buffer = buffer_;
+    std::optional<HandleScope> scope;
+    Handle<JSArrayBuffer> source;
+    if (auto* heap = IsolateHeap::Current()) {
+        scope.emplace(*heap);
+        source = scope->CreateHandle(buffer);
+    }
+    // A managed allocation may move the rooted backing object. Publish the
+    // refreshed pointer after allocation rather than passing a stale raw arg.
+    pending.buffer_ = nullptr;
+    auto* result = AllocateRuntime<JSTypedArray>(std::move(pending));
+    result->buffer_ = scope ? source.Get() : buffer;
+    if (result->IsOld()) RecordWriteBarrier(result, TaggedValue::FromHeapObject(result->buffer_));
+    return result;
 }
 
 } // namespace aether

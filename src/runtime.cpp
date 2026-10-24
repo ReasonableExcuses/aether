@@ -8,7 +8,7 @@
 #include "aether/intl.h"
 #include "aether/wasm.h"
 #include "aether/advanced_intrinsics.h"
-#include <regex>
+#include "aether/bounded_regex.h"
 #include <random>
 #include <cmath>
 #include <iostream>
@@ -20,6 +20,64 @@ namespace aether {
 
 static thread_local MicrotaskQueue* s_current_microtasks_{nullptr};
 static thread_local Agent* s_current_agent_{nullptr};
+
+static void SetRegexException(const RegexError& error) {
+    const bool resource = error.ErrorKind() == RegexErrorKind::StepBudgetExceeded ||
+                          error.ErrorKind() == RegexErrorKind::ResourceLimitExceeded;
+    if (resource) {
+        RaiseResourceError(error.what());
+        return;
+    }
+    if (Interpreter::Current()) {
+        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+            AllocateRuntime<JSError>("SyntaxError", error.what())));
+    }
+}
+
+static void SetRangeException(std::string_view message) {
+    if (Interpreter::Current()) {
+        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+            AllocateRuntime<JSError>("RangeError", message)));
+    }
+}
+
+static void AppendRegexReplacement(std::string& out, std::string_view replacement,
+                                   std::string_view input, const RegexMatch& match) {
+    for (size_t i = 0; i < replacement.size(); ++i) {
+        if (replacement[i] != '$' || i + 1 >= replacement.size()) {
+            out.push_back(replacement[i]);
+            continue;
+        }
+        const char next = replacement[i + 1];
+        if (next == '$') {
+            out.push_back('$');
+            ++i;
+        } else if (next == '&') {
+            const auto range = match.Full();
+            out.append(input.substr(range.begin, range.end - range.begin));
+            ++i;
+        } else if (next >= '0' && next <= '9') {
+            size_t group = static_cast<size_t>(next - '0');
+            size_t consumed = 1;
+            if (i + 2 < replacement.size() && replacement[i + 2] >= '0' && replacement[i + 2] <= '9') {
+                const size_t candidate = group * 10 + static_cast<size_t>(replacement[i + 2] - '0');
+                if (candidate < match.captures.size()) {
+                    group = candidate;
+                    consumed = 2;
+                }
+            }
+            if (group < match.captures.size() && match.captures[group].has_value()) {
+                const auto range = *match.captures[group];
+                out.append(input.substr(range.begin, range.end - range.begin));
+                i += consumed;
+            } else {
+                out.push_back('$');
+            }
+        } else {
+            out.push_back('$');
+        }
+    }
+}
 
 Agent* Agent::Current() noexcept { return s_current_agent_; }
 void Agent::SetCurrent(Agent* agent) noexcept { s_current_agent_ = agent; }
@@ -101,14 +159,14 @@ TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::ve
 TaggedValue ProxyGet(JSProxy* proxy, std::string_view key, TaggedValue receiver) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'get' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'get' on a proxy that has been revoked")));
         }
         return TaggedValue::Undefined();
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return TaggedValue::Undefined();
     }
@@ -119,11 +177,11 @@ TaggedValue ProxyGet(JSProxy* proxy, std::string_view key, TaggedValue receiver)
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'get' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'get' on proxy: trap is not callable")));
         }
         return TaggedValue::Undefined();
     }
-    TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+    TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
     TaggedValue rec_val = receiver.IsEmpty() ? TaggedValue::FromHeapObject(proxy) : receiver;
     return CallFunction(trap, handler_val, { proxy->GetTarget(), key_val, rec_val });
 }
@@ -131,14 +189,14 @@ TaggedValue ProxyGet(JSProxy* proxy, std::string_view key, TaggedValue receiver)
 bool ProxySet(JSProxy* proxy, std::string_view key, TaggedValue value, TaggedValue receiver) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'set' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'set' on a proxy that has been revoked")));
         }
         return false;
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return false;
     }
@@ -149,11 +207,11 @@ bool ProxySet(JSProxy* proxy, std::string_view key, TaggedValue value, TaggedVal
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'set' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'set' on proxy: trap is not callable")));
         }
         return false;
     }
-    TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+    TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
     TaggedValue rec_val = receiver.IsEmpty() ? TaggedValue::FromHeapObject(proxy) : receiver;
     TaggedValue res = CallFunction(trap, handler_val, { proxy->GetTarget(), key_val, value, rec_val });
     return res.ToBoolean();
@@ -162,14 +220,14 @@ bool ProxySet(JSProxy* proxy, std::string_view key, TaggedValue value, TaggedVal
 bool ProxyHas(JSProxy* proxy, std::string_view key) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'has' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'has' on a proxy that has been revoked")));
         }
         return false;
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return false;
     }
@@ -180,11 +238,11 @@ bool ProxyHas(JSProxy* proxy, std::string_view key) {
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'has' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'has' on proxy: trap is not callable")));
         }
         return false;
     }
-    TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+    TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
     TaggedValue res = CallFunction(trap, handler_val, { proxy->GetTarget(), key_val });
     return res.ToBoolean();
 }
@@ -192,14 +250,14 @@ bool ProxyHas(JSProxy* proxy, std::string_view key) {
 bool ProxyDeleteProperty(JSProxy* proxy, std::string_view key) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'deleteProperty' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'deleteProperty' on a proxy that has been revoked")));
         }
         return false;
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return false;
     }
@@ -210,11 +268,11 @@ bool ProxyDeleteProperty(JSProxy* proxy, std::string_view key) {
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'deleteProperty' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'deleteProperty' on proxy: trap is not callable")));
         }
         return false;
     }
-    TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+    TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
     TaggedValue res = CallFunction(trap, handler_val, { proxy->GetTarget(), key_val });
     return res.ToBoolean();
 }
@@ -222,21 +280,21 @@ bool ProxyDeleteProperty(JSProxy* proxy, std::string_view key) {
 TaggedValue ProxyApply(JSProxy* proxy, TaggedValue this_val, const std::vector<TaggedValue>& args) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'apply' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'apply' on a proxy that has been revoked")));
         }
         return TaggedValue::Undefined();
     }
     TaggedValue target_val = proxy->GetTarget();
     if (!target_val.IsHeapObject() || !target_val.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy target is not a function")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy target is not a function")));
         }
         return TaggedValue::Undefined();
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return TaggedValue::Undefined();
     }
@@ -247,7 +305,7 @@ TaggedValue ProxyApply(JSProxy* proxy, TaggedValue this_val, const std::vector<T
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'apply' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'apply' on proxy: trap is not callable")));
         }
         return TaggedValue::Undefined();
     }
@@ -263,21 +321,21 @@ TaggedValue ProxyApply(JSProxy* proxy, TaggedValue this_val, const std::vector<T
 TaggedValue ProxyConstruct(JSProxy* proxy, const std::vector<TaggedValue>& args, TaggedValue new_target) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'construct' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'construct' on a proxy that has been revoked")));
         }
         return TaggedValue::Undefined();
     }
     TaggedValue target_val = proxy->GetTarget();
     if (!target_val.IsHeapObject() || !target_val.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy target is not a constructor")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy target is not a constructor")));
         }
         return TaggedValue::Undefined();
     }
     TaggedValue handler_val = proxy->GetHandler();
     if (!handler_val.IsHeapObject() || !handler_val.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy handler is not an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy handler is not an object")));
         }
         return TaggedValue::Undefined();
     }
@@ -288,7 +346,7 @@ TaggedValue ProxyConstruct(JSProxy* proxy, const std::vector<TaggedValue>& args,
     }
     if (!trap.IsHeapObject() || !trap.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'construct' on proxy: trap is not callable")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'construct' on proxy: trap is not callable")));
         }
         return TaggedValue::Undefined();
     }
@@ -302,7 +360,7 @@ TaggedValue ProxyConstruct(JSProxy* proxy, const std::vector<TaggedValue>& args,
     TaggedValue res = CallFunction(trap, handler_val, { target_val, TaggedValue::FromHeapObject(arg_arr), nt });
     if (!res.IsHeapObject() || !res.AsHeapObject()->IsJSObject()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Proxy [[Construct]] must return an object")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Proxy [[Construct]] must return an object")));
         }
         return TaggedValue::Undefined();
     }
@@ -312,7 +370,7 @@ TaggedValue ProxyConstruct(JSProxy* proxy, const std::vector<TaggedValue>& args,
 TaggedValue ProxyGetPrototypeOf(JSProxy* proxy) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'getPrototypeOf' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'getPrototypeOf' on a proxy that has been revoked")));
         }
         return TaggedValue::Null();
     }
@@ -330,7 +388,7 @@ TaggedValue ProxyGetPrototypeOf(JSProxy* proxy) {
 bool ProxySetPrototypeOf(JSProxy* proxy, TaggedValue proto) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'setPrototypeOf' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'setPrototypeOf' on a proxy that has been revoked")));
         }
         return false;
     }
@@ -349,7 +407,7 @@ bool ProxySetPrototypeOf(JSProxy* proxy, TaggedValue proto) {
 TaggedValue ProxyOwnKeys(JSProxy* proxy) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'ownKeys' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'ownKeys' on a proxy that has been revoked")));
         }
         return TaggedValue::Undefined();
     }
@@ -367,7 +425,7 @@ TaggedValue ProxyOwnKeys(JSProxy* proxy) {
 TaggedValue ProxyGetOwnPropertyDescriptor(JSProxy* proxy, std::string_view key) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked")));
         }
         return TaggedValue::Undefined();
     }
@@ -376,7 +434,7 @@ TaggedValue ProxyGetOwnPropertyDescriptor(JSProxy* proxy, std::string_view key) 
         auto* handler = static_cast<JSObject*>(handler_val.AsHeapObject());
         TaggedValue trap = handler->GetNamedProperty("getOwnPropertyDescriptor");
         if (trap.IsHeapObject() && trap.AsHeapObject()->IsFunction()) {
-            TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+            TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
             return CallFunction(trap, handler_val, { proxy->GetTarget(), key_val });
         }
     }
@@ -401,7 +459,7 @@ TaggedValue ProxyGetOwnPropertyDescriptor(JSProxy* proxy, std::string_view key) 
 bool ProxyDefineProperty(JSProxy* proxy, std::string_view key, TaggedValue desc) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'defineProperty' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'defineProperty' on a proxy that has been revoked")));
         }
         return false;
     }
@@ -410,7 +468,7 @@ bool ProxyDefineProperty(JSProxy* proxy, std::string_view key, TaggedValue desc)
         auto* handler = static_cast<JSObject*>(handler_val.AsHeapObject());
         TaggedValue trap = handler->GetNamedProperty("defineProperty");
         if (trap.IsHeapObject() && trap.AsHeapObject()->IsFunction()) {
-            TaggedValue key_val = TaggedValue::FromHeapObject(new JSString(std::string(key)));
+            TaggedValue key_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(key)));
             TaggedValue res = CallFunction(trap, handler_val, { proxy->GetTarget(), key_val, desc });
             return res.ToBoolean();
         }
@@ -425,7 +483,7 @@ bool ProxyDefineProperty(JSProxy* proxy, std::string_view key, TaggedValue desc)
 bool ProxyIsExtensible(JSProxy* proxy) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'isExtensible' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'isExtensible' on a proxy that has been revoked")));
         }
         return false;
     }
@@ -444,7 +502,7 @@ bool ProxyIsExtensible(JSProxy* proxy) {
 bool ProxyPreventExtensions(JSProxy* proxy) {
     if (proxy->IsRevoked()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot perform 'preventExtensions' on a proxy that has been revoked")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot perform 'preventExtensions' on a proxy that has been revoked")));
         }
         return false;
     }
@@ -574,8 +632,7 @@ bool SetPrototypeOf(TaggedValue obj, TaggedValue proto) {
     if (ho->IsProxy()) return ProxySetPrototypeOf(static_cast<JSProxy*>(ho), proto);
     if (ho->IsJSObject()) {
         JSObject* p = (proto.IsHeapObject() && proto.AsHeapObject()->IsJSObject()) ? static_cast<JSObject*>(proto.AsHeapObject()) : nullptr;
-        static_cast<JSObject*>(ho)->SetPrototype(p);
-        return true;
+        return static_cast<JSObject*>(ho)->SetPrototype(p);
     }
     return false;
 }
@@ -592,7 +649,7 @@ TaggedValue GetOwnKeys(TaggedValue obj) {
     if (ho->IsJSObject()) {
         auto names = static_cast<JSObject*>(ho)->GetOwnPropertyNames();
         for (const auto& name : names) {
-            arr->Push(TaggedValue::FromHeapObject(new JSString(name)));
+            arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(name)));
         }
     }
     return TaggedValue::FromHeapObject(arr);
@@ -612,7 +669,7 @@ TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& ar
         auto* fn = static_cast<JSFunction*>(ho);
         if (fn->IsArrow() || fn->IsAsync() || fn->IsGenerator()) {
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function is not a constructor")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Function is not a constructor")));
             }
             return TaggedValue::Undefined();
         }
@@ -626,12 +683,14 @@ TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& ar
         }
         TaggedValue inst_val = TaggedValue::FromHeapObject(instance);
         uint32_t field_sid = 11000;
-        for (const auto& [name, initial] : fn->InstanceFields()) {
-            std::string property = name.size() > 0 && name[0] == '#'
-                ? "__private__" + name.substr(1) : name;
-            instance->SetNamedProperty(property, initial, field_sid);
+        for (const auto& f : fn->InstanceFields()) {
+            std::string property = f.name.size() > 0 && f.name[0] == '#'
+                ? "__private__" + f.name.substr(1) : f.name;
+            instance->SetNamedProperty(property, f.initial_value, field_sid);
+            if (f.is_method) {
+                instance->SetOwnPropertyAttributes(property, PropertyAttributes::None);
+            }
         }
-        TaggedValue target = new_target.IsEmpty() ? ctor : new_target;
         TaggedValue ret = CallFunction(ctor, inst_val, args, target);
         if (ret.IsHeapObject() && ret.AsHeapObject()->IsJSObject()) {
             return ret;
@@ -677,7 +736,7 @@ TaggedValue OrdinaryHasInstance(TaggedValue C, TaggedValue O) {
     if (!P.IsHeapObject() || !P.AsHeapObject()->IsECMAObject()) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Function has non-object prototype in instanceof check")));
+                AllocateRuntime<JSError>("TypeError", "Function has non-object prototype in instanceof check")));
         }
         return TaggedValue::Undefined();
     }
@@ -696,7 +755,7 @@ TaggedValue InstanceofOperator(TaggedValue V, TaggedValue target) {
     if (!target.IsHeapObject() || !target.AsHeapObject()->IsECMAObject()) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Right-hand side of 'instanceof' is not an object")));
+                AllocateRuntime<JSError>("TypeError", "Right-hand side of 'instanceof' is not an object")));
         }
         return TaggedValue::Undefined();
     }
@@ -716,7 +775,7 @@ TaggedValue InstanceofOperator(TaggedValue V, TaggedValue target) {
         if (!callable) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Symbol.hasInstance is not a function")));
+                    AllocateRuntime<JSError>("TypeError", "Symbol.hasInstance is not a function")));
             }
             return TaggedValue::Undefined();
         }
@@ -733,7 +792,7 @@ TaggedValue InstanceofOperator(TaggedValue V, TaggedValue target) {
     if (!target_callable) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Right-hand side of 'instanceof' is not callable")));
+                AllocateRuntime<JSError>("TypeError", "Right-hand side of 'instanceof' is not callable")));
         }
         return TaggedValue::Undefined();
     }
@@ -1133,7 +1192,7 @@ static TaggedValue Array_indexOf(TaggedValue this_val, const std::vector<TaggedV
     TaggedValue search = args.empty() ? TaggedValue::Undefined() : args[0];
     size_t from = (args.size() > 1 && args[1].IsSmi()) ? static_cast<size_t>(std::max<int32_t>(0, args[1].AsSmi())) : 0;
     for (size_t i = from; i < arr->Length(); ++i) {
-        if (StrictEqualValues(arr->GetElement(i), search)) {
+        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty() && StrictEqualValues(arr->GetElement(i), search)) {
             return TaggedValue::FromSmi(static_cast<int32_t>(i));
         }
     }
@@ -1192,8 +1251,10 @@ static TaggedValue Array_map(TaggedValue this_val, const std::vector<TaggedValue
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
     for (size_t i = 0; i < arr->Length(); ++i) {
-        TaggedValue res = CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
-        new_arr->SetElement(i, res);
+        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
+            TaggedValue res = CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+            new_arr->SetElement(i, res);
+        }
     }
     return TaggedValue::FromHeapObject(new_arr);
 }
@@ -1207,10 +1268,12 @@ static TaggedValue Array_filter(TaggedValue this_val, const std::vector<TaggedVa
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
     for (size_t i = 0; i < arr->Length(); ++i) {
-        TaggedValue el = arr->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
-        if (res.ToBoolean()) {
-            new_arr->Push(el);
+        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
+            TaggedValue el = arr->GetElement(i);
+            TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+            if (res.ToBoolean()) {
+                new_arr->Push(el);
+            }
         }
     }
     return TaggedValue::FromHeapObject(new_arr);
@@ -1221,7 +1284,9 @@ static TaggedValue Array_forEach(TaggedValue this_val, const std::vector<TaggedV
     auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
     TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
     for (size_t i = 0; i < arr->Length(); ++i) {
-        CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
+            CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        }
     }
     return TaggedValue::Undefined();
 }
@@ -1230,17 +1295,29 @@ static TaggedValue Array_reduce(TaggedValue this_val, const std::vector<TaggedVa
     if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
     auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
     TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
-    size_t start_idx = 0;
+    size_t k = 0;
     TaggedValue acc;
     if (args.size() > 1) {
         acc = args[1];
     } else {
-        if (arr->Length() == 0) return TaggedValue::Undefined();
-        acc = arr->GetElement(0);
-        start_idx = 1;
+        bool found = false;
+        while (k < arr->Length()) {
+            if (k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                acc = arr->GetElement(k);
+                found = true;
+                k++;
+                break;
+            }
+            k++;
+        }
+        if (!found) {
+            return TaggedValue::Undefined();
+        }
     }
-    for (size_t i = start_idx; i < arr->Length(); ++i) {
-        acc = CallFunction(cb, this_val, {acc, arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    for (; k < arr->Length(); ++k) {
+        if (k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+            acc = CallFunction(cb, this_val, {acc, arr->GetElement(k), TaggedValue::FromSmi(static_cast<int32_t>(k)), this_val});
+        }
     }
     return acc;
 }
@@ -1449,13 +1526,34 @@ static TaggedValue String_split(TaggedValue this_val, const std::vector<TaggedVa
 
     if (args[0].IsHeapObject() && args[0].AsHeapObject()->IsRegExp()) {
         auto* re = static_cast<JSRegExp*>(args[0].AsHeapObject());
-        std::regex::flag_type flags = std::regex::ECMAScript;
-        if (re->Flags().find('i') != std::string::npos) flags |= std::regex::icase;
-        std::regex std_re(re->Pattern(), flags);
-        std::sregex_token_iterator iter(s_str.begin(), s_str.end(), std_re, -1);
-        std::sregex_token_iterator end;
-        for (; iter != end; ++iter) {
-            arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::string(*iter))));
+        try {
+            RegexBudget budget;
+            BoundedRegex regex = BoundedRegex::Compile(re->Pattern(), re->Flags(), budget);
+            size_t cursor = 0;
+            size_t search = 0;
+            while (search <= s_str.size()) {
+                auto match = regex.Search(s_str, search, budget);
+                if (!match) break;
+                const auto full = match->Full();
+                arr->Push(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSString>(s_str.substr(cursor, full.begin - cursor))));
+                for (size_t i = 1; i < match->captures.size(); ++i) {
+                    if (match->captures[i].has_value()) {
+                        const auto capture = *match->captures[i];
+                        arr->Push(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSString>(s_str.substr(capture.begin, capture.end - capture.begin))));
+                    }
+                }
+                cursor = full.end;
+                auto next = NextRegexSearchOffset(*match, s_str.size());
+                if (!next) break;
+                search = *next;
+            }
+            arr->Push(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSString>(s_str.substr(cursor))));
+        } catch (const RegexError& error) {
+            SetRegexException(error);
+            return TaggedValue::Undefined();
         }
         return TaggedValue::FromHeapObject(arr);
     }
@@ -1493,17 +1591,34 @@ static TaggedValue String_replace(TaggedValue this_val, const std::vector<Tagged
 
     if (args[0].IsHeapObject() && args[0].AsHeapObject()->IsRegExp()) {
         auto* re = static_cast<JSRegExp*>(args[0].AsHeapObject());
-        std::regex::flag_type flags = std::regex::ECMAScript;
-        if (re->Flags().find('i') != std::string::npos) flags |= std::regex::icase;
-        std::regex std_re(re->Pattern(), flags);
         bool is_global = re->Flags().find('g') != std::string::npos;
-        std::string res;
-        if (is_global) {
-            res = std::regex_replace(str, std_re, replacement);
-        } else {
-            res = std::regex_replace(str, std_re, replacement, std::regex_constants::format_first_only);
+        try {
+            RegexBudget budget;
+            BoundedRegex regex = BoundedRegex::Compile(re->Pattern(), re->Flags(), budget);
+            std::string res;
+            size_t cursor = 0;
+            size_t search = 0;
+            bool replaced = false;
+            while (search <= str.size()) {
+                auto match = regex.Search(str, search, budget);
+                if (!match) break;
+                const auto full = match->Full();
+                res.append(str.substr(cursor, full.begin - cursor));
+                AppendRegexReplacement(res, replacement, str, *match);
+                cursor = full.end;
+                replaced = true;
+                if (!is_global) break;
+                auto next = NextRegexSearchOffset(*match, str.size());
+                if (!next) break;
+                search = *next;
+            }
+            if (!replaced) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str));
+            res.append(str.substr(cursor));
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
+        } catch (const RegexError& error) {
+            SetRegexException(error);
+            return TaggedValue::Undefined();
         }
-        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
     }
 
     std::string pattern = args[0].ToString();
@@ -1517,16 +1632,19 @@ static TaggedValue String_replace(TaggedValue this_val, const std::vector<Tagged
 static TaggedValue String_repeat(TaggedValue this_val, const std::vector<TaggedValue>& args) {
     std::string str = this_val.ToString();
     if (args.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
-    int64_t count = args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble());
-    if (count < 0) {
-        if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("RangeError", "Invalid count value")));
-        }
+    const double count_value = args[0].IsSmi() ? static_cast<double>(args[0].AsSmi()) : args[0].ToDouble();
+    if (!std::isfinite(count_value) || count_value < 0.0 || std::floor(count_value) != count_value) {
+        SetRangeException("Invalid count value");
         return TaggedValue::Undefined();
     }
+    if (!str.empty() && count_value > static_cast<double>(kMaxStringLength / str.size())) {
+        SetRangeException("String length exceeds maximum allowed length");
+        return TaggedValue::Undefined();
+    }
+    const size_t count = static_cast<size_t>(count_value);
     std::string res;
     res.reserve(str.length() * count);
-    for (int64_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i) {
         res += str;
     }
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
@@ -1535,7 +1653,7 @@ static TaggedValue String_repeat(TaggedValue this_val, const std::vector<TaggedV
 static TaggedValue Function_call(TaggedValue this_val, const std::vector<TaggedValue>& args) {
     if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function.prototype.call called on non-function")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Function.prototype.call called on non-function")));
         }
         return TaggedValue::Undefined();
     }
@@ -1550,7 +1668,7 @@ static TaggedValue Function_call(TaggedValue this_val, const std::vector<TaggedV
 static TaggedValue Function_apply(TaggedValue this_val, const std::vector<TaggedValue>& args) {
     if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function.prototype.apply called on non-function")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Function.prototype.apply called on non-function")));
         }
         return TaggedValue::Undefined();
     }
@@ -1568,7 +1686,7 @@ static TaggedValue Function_apply(TaggedValue this_val, const std::vector<Tagged
 static TaggedValue Function_bind(TaggedValue this_val, const std::vector<TaggedValue>& args) {
     if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFunction()) {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Function.prototype.bind called on non-function")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Function.prototype.bind called on non-function")));
         }
         return TaggedValue::Undefined();
     }
@@ -1651,7 +1769,7 @@ static TaggedValue Object_propertyIsEnumerable(TaggedValue this_val, const std::
 
 static TaggedValue Object_values(const std::vector<TaggedValue>& args) {
     if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
         return TaggedValue::Undefined();
     }
     Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
@@ -1673,7 +1791,7 @@ static TaggedValue Object_values(const std::vector<TaggedValue>& args) {
 
 static TaggedValue Object_entries(const std::vector<TaggedValue>& args) {
     if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
         return TaggedValue::Undefined();
     }
     Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
@@ -1701,7 +1819,7 @@ static TaggedValue Object_entries(const std::vector<TaggedValue>& args) {
 
 static TaggedValue Object_fromEntries(const std::vector<TaggedValue>& args) {
     if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Object.fromEntries requires an iterable argument")));
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.fromEntries requires an iterable argument")));
         return TaggedValue::Undefined();
     }
     Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
@@ -1774,7 +1892,7 @@ static TaggedValue Object_isSealed(const std::vector<TaggedValue>& args) {
 
 static TaggedValue Object_hasOwn(const std::vector<TaggedValue>& args) {
     if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
         return TaggedValue::Undefined();
     }
     std::vector<TaggedValue> has_args;
@@ -2413,14 +2531,14 @@ static TaggedValue Promise_any(const std::vector<TaggedValue>& args) {
     }
 
     if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
-        p->Reject(TaggedValue::FromHeapObject(new JSError("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+        p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
     auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
     size_t count = input_arr->Length();
     if (count == 0) {
-        p->Reject(TaggedValue::FromHeapObject(new JSError("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+        p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
@@ -2443,7 +2561,7 @@ static TaggedValue Promise_any(const std::vector<TaggedValue>& args) {
                 errors->SetElement(i, r_args.empty() ? TaggedValue::Undefined() : r_args[0]);
                 (*remaining)--;
                 if (*remaining == 0) {
-                    auto* err = new JSError("AggregateError", "All promises were rejected");
+                    auto* err = AllocateRuntime<JSError>("AggregateError", "All promises were rejected");
                     uint32_t sid = 9200;
                     err->SetNamedProperty("errors", TaggedValue::FromHeapObject(errors), sid);
                     p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
@@ -2535,6 +2653,13 @@ static TaggedValue Promise_finally(TaggedValue this_val, const std::vector<Tagge
 static TaggedValue RegExp_ctor(const std::vector<TaggedValue>& args) {
     std::string pattern = args.size() > 0 ? args[0].ToString() : "";
     std::string flags = args.size() > 1 ? args[1].ToString() : "";
+    try {
+        RegexBudget budget;
+        (void)BoundedRegex::Compile(pattern, flags, budget);
+    } catch (const RegexError& error) {
+        SetRegexException(error);
+        return TaggedValue::Undefined();
+    }
     auto* re = AllocateRuntime<JSRegExp>(pattern, flags, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetRegExpPrototype()) {
         re->SetPrototype(Realm::Current()->GetRegExpPrototype());
@@ -2554,24 +2679,32 @@ static TaggedValue RegExp_exec(TaggedValue this_val, const std::vector<TaggedVal
     auto* re = static_cast<JSRegExp*>(this_val.AsHeapObject());
     std::string str = args.empty() ? "" : args[0].ToString();
 
-    std::regex::flag_type flags = std::regex::ECMAScript;
-    if (re->Flags().find('i') != std::string::npos) flags |= std::regex::icase;
-    std::regex std_re(re->Pattern(), flags);
-    std::smatch m;
-    if (std::regex_search(str, m, std_re)) {
+    try {
+        RegexBudget budget;
+        BoundedRegex regex = BoundedRegex::Compile(re->Pattern(), re->Flags(), budget);
+        auto match = regex.Search(str, 0, budget);
+        if (!match) return TaggedValue::Null();
         auto* arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
         if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
             arr->SetPrototype(Realm::Current()->GetArrayPrototype());
         }
-        for (size_t i = 0; i < m.size(); ++i) {
-            arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(m[i].str())));
+        for (const auto& capture : match->captures) {
+            if (capture.has_value()) {
+                const auto range = *capture;
+                arr->Push(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSString>(str.substr(range.begin, range.end - range.begin))));
+            } else {
+                arr->Push(TaggedValue::Undefined());
+            }
         }
         uint32_t sid = 9300;
-        arr->SetNamedProperty("index", TaggedValue::FromSmi(static_cast<int32_t>(m.position())), sid);
+        arr->SetNamedProperty("index", TaggedValue::FromSmi(static_cast<int32_t>(match->Start())), sid);
         arr->SetNamedProperty("input", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str)), sid);
         return TaggedValue::FromHeapObject(arr);
+    } catch (const RegexError& error) {
+        SetRegexException(error);
+        return TaggedValue::Undefined();
     }
-    return TaggedValue::Null();
 }
 
 // Event Loop, Timer & Microtask Callbacks
@@ -2645,7 +2778,7 @@ static TaggedValue Global_queueMicrotask(const std::vector<TaggedValue>& args) {
         TaggedValue cb = args[0];
         CurrentMicrotaskQueue().Enqueue([cb]() {
             CallFunction(cb, TaggedValue::Undefined(), {});
-        });
+        }, {cb});
     }
     return TaggedValue::Undefined();
 }
@@ -2990,7 +3123,7 @@ static bool CheckDataViewBounds(JSDataView* dv, size_t offset, size_t size) {
     if (!dv || !dv->CheckBounds(offset, size)) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(
-                TaggedValue::FromHeapObject(new JSError("RangeError", "Offset is outside the bounds of the DataView")));
+                TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "Offset is outside the bounds of the DataView")));
         }
         return false;
     }
@@ -3233,6 +3366,7 @@ static TaggedValue Array_values(TaggedValue this_val, const std::vector<TaggedVa
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (obj) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(obj));
     uint32_t sid = 5100;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3262,6 +3396,7 @@ static TaggedValue Array_keys(TaggedValue this_val, const std::vector<TaggedValu
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (obj) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(obj));
     uint32_t sid = 5101;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3351,6 +3486,7 @@ static TaggedValue Map_entries(TaggedValue this_val, const std::vector<TaggedVal
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (map) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(map));
     uint32_t sid = 5104;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3372,6 +3508,7 @@ static TaggedValue Map_keys(TaggedValue this_val, const std::vector<TaggedValue>
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (map) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(map));
     uint32_t sid = 5105;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3393,6 +3530,7 @@ static TaggedValue Map_values(TaggedValue this_val, const std::vector<TaggedValu
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (map) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(map));
     uint32_t sid = 5106;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3414,6 +3552,7 @@ static TaggedValue Set_values(TaggedValue this_val, const std::vector<TaggedValu
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (set) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(set));
     uint32_t sid = 5107;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3442,6 +3581,7 @@ static TaggedValue Set_entries(TaggedValue this_val, const std::vector<TaggedVal
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (set) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(set));
     uint32_t sid = 5108;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3463,6 +3603,7 @@ static TaggedValue TypedArray_values(TaggedValue this_val, const std::vector<Tag
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (ta) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(ta));
     uint32_t sid = 5109;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3484,6 +3625,7 @@ static TaggedValue TypedArray_keys(TaggedValue this_val, const std::vector<Tagge
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (ta) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(ta));
     uint32_t sid = 5110;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3511,6 +3653,7 @@ static TaggedValue TypedArray_entries(TaggedValue this_val, const std::vector<Ta
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
+    if (ta) next_fn->AddCapturedRoot(TaggedValue::FromHeapObject(ta));
     uint32_t sid = 5111;
     iter_obj->SetNamedProperty("next", TaggedValue::FromHeapObject(next_fn), sid);
     auto* self_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [iter_obj](const std::vector<TaggedValue>&) -> TaggedValue {
@@ -3705,7 +3848,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     async_generator_prototype_->SetNamedProperty("next", TaggedValue::FromHeapObject(make_native("next", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
             auto* p = make_promise();
-            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.next called on incompatible receiver")), CurrentMicrotaskQueue());
+            p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method AsyncGenerator.prototype.next called on incompatible receiver")), CurrentMicrotaskQueue());
             return TaggedValue::FromHeapObject(p);
         }
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
@@ -3721,7 +3864,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     async_generator_prototype_->SetNamedProperty("return", TaggedValue::FromHeapObject(make_native("return", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
             auto* p = make_promise();
-            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.return called on incompatible receiver")), CurrentMicrotaskQueue());
+            p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method AsyncGenerator.prototype.return called on incompatible receiver")), CurrentMicrotaskQueue());
             return TaggedValue::FromHeapObject(p);
         }
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
@@ -3737,7 +3880,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     async_generator_prototype_->SetNamedProperty("throw", TaggedValue::FromHeapObject(make_native("throw", [make_promise](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsGeneratorObject()) {
             auto* p = make_promise();
-            p->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Method AsyncGenerator.prototype.throw called on incompatible receiver")), CurrentMicrotaskQueue());
+            p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method AsyncGenerator.prototype.throw called on incompatible receiver")), CurrentMicrotaskQueue());
             return TaggedValue::FromHeapObject(p);
         }
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
@@ -4017,6 +4160,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     object_prototype_->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
         return this_val;
     })), next_shape_id_);
+    object_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype_), next_shape_id_);
     object_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
     object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(make_native("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
@@ -4032,27 +4176,31 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
     object_ctor->SetNamedProperty("getPrototypeOf", TaggedValue::FromHeapObject(make_native("getPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Null();
         }
         return GetPrototypeOf(args[0]);
     })), next_shape_id_);
     object_ctor->SetNamedProperty("setPrototypeOf", TaggedValue::FromHeapObject(make_native("setPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
         TaggedValue proto = args.size() > 1 ? args[1] : TaggedValue::Null();
         if (!proto.IsNull() && (!proto.IsHeapObject() || !proto.AsHeapObject()->IsECMAObject())) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Object prototype may only be an Object or null")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object prototype may only be an Object or null")));
             return TaggedValue::Undefined();
         }
-        SetPrototypeOf(args[0], proto);
+        if (!SetPrototypeOf(args[0], proto)) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(
+                TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot set object prototype")));
+            return TaggedValue::Undefined();
+        }
         return args[0];
     })), next_shape_id_);
     object_ctor->SetNamedProperty("keys", TaggedValue::FromHeapObject(make_native("keys", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
         TaggedValue all_keys = GetOwnKeys(args[0]);
@@ -4088,7 +4236,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
     object_ctor->SetNamedProperty("getOwnPropertyNames", TaggedValue::FromHeapObject(make_native("getOwnPropertyNames", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
         TaggedValue all_keys = GetOwnKeys(args[0]);
@@ -4109,7 +4257,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
     object_ctor->SetNamedProperty("defineProperty", TaggedValue::FromHeapObject(make_native("defineProperty", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Object.defineProperty called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.defineProperty called on non-object")));
             return TaggedValue::Undefined();
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4135,7 +4283,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             writable = HasProperty(desc, "writable") && GetProperty(desc, "writable").ToBoolean();
         }
         if (has_accessor && has_data) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Invalid property descriptor")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Invalid property descriptor")));
             return TaggedValue::Undefined();
         }
         if (has_accessor && args[0].AsHeapObject()->IsJSObject()) {
@@ -4160,11 +4308,11 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
     object_ctor->SetNamedProperty("defineProperties", TaggedValue::FromHeapObject(make_native("defineProperties", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Object.defineProperties called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.defineProperties called on non-object")));
             return TaggedValue::Undefined();
         }
         if (args.size() < 2 || args[1].IsNull() || args[1].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
         TaggedValue target = args[0];
@@ -4192,7 +4340,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
                     bool configurable = HasProperty(desc, "configurable") && GetProperty(desc, "configurable").ToBoolean();
                     bool writable = HasProperty(desc, "writable") && GetProperty(desc, "writable").ToBoolean();
                     if (has_accessor && has_data) {
-                        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Invalid property descriptor")));
+                        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Invalid property descriptor")));
                         return TaggedValue::Undefined();
                     }
                     if (has_accessor && target.AsHeapObject()->IsJSObject()) {
@@ -4250,7 +4398,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
     object_ctor->SetNamedProperty("assign", TaggedValue::FromHeapObject(make_native("assign", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot convert undefined or null to object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
         TaggedValue target = args[0];
@@ -4321,7 +4469,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     function_prototype_->SetOwnPropertyAttributes("@@hasInstance", PropertyAttributes::None);
     auto* throw_type_error = make_native("%ThrowTypeError%", [](const std::vector<TaggedValue>&) -> TaggedValue {
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "'caller' and 'arguments' are restricted function properties in strict mode and for arrow functions")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "'caller' and 'arguments' are restricted function properties in strict mode and for arrow functions")));
         }
         return TaggedValue::Undefined();
     });
@@ -4354,7 +4502,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         if (args.size() < 2 || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject() ||
             !args[1].IsHeapObject() || !args[1].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot create proxy with a non-object as target or handler")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot create proxy with a non-object as target or handler")));
             }
             return TaggedValue::Undefined();
         }
@@ -4367,7 +4515,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         if (args.size() < 2 || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject() ||
             !args[1].IsHeapObject() || !args[1].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Cannot create proxy with a non-object as target or handler")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot create proxy with a non-object as target or handler")));
             }
             return TaggedValue::Undefined();
         }
@@ -4389,7 +4537,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     auto* reflect_obj = make_old_obj();
     reflect_obj->SetNamedProperty("get", TaggedValue::FromHeapObject(make_native("get", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.get called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.get called on non-object")));
             return TaggedValue::Undefined();
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4399,7 +4547,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("set", TaggedValue::FromHeapObject(make_native("set", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.set called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.set called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4410,7 +4558,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("has", TaggedValue::FromHeapObject(make_native("has", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.has called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.has called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4419,7 +4567,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("deleteProperty", TaggedValue::FromHeapObject(make_native("deleteProperty", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.deleteProperty called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.deleteProperty called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4428,7 +4576,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("apply", TaggedValue::FromHeapObject(make_native("apply", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsProxy())) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.apply target is not a function")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.apply target is not a function")));
             return TaggedValue::Undefined();
         }
         TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
@@ -4443,7 +4591,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("construct", TaggedValue::FromHeapObject(make_native("construct", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsProxy())) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.construct target is not a constructor")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.construct target is not a constructor")));
             return TaggedValue::Undefined();
         }
         std::vector<TaggedValue> ctor_args;
@@ -4458,7 +4606,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("getPrototypeOf", TaggedValue::FromHeapObject(make_native("getPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.getPrototypeOf called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.getPrototypeOf called on non-object")));
             return TaggedValue::Null();
         }
         return GetPrototypeOf(args[0]);
@@ -4466,7 +4614,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("setPrototypeOf", TaggedValue::FromHeapObject(make_native("setPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.setPrototypeOf called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.setPrototypeOf called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         TaggedValue proto = args.size() > 1 ? args[1] : TaggedValue::Null();
@@ -4475,7 +4623,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("ownKeys", TaggedValue::FromHeapObject(make_native("ownKeys", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.ownKeys called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.ownKeys called on non-object")));
             return TaggedValue::Undefined();
         }
         return GetOwnKeys(args[0]);
@@ -4483,7 +4631,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("isExtensible", TaggedValue::FromHeapObject(make_native("isExtensible", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.isExtensible called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.isExtensible called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         if (args[0].AsHeapObject()->IsProxy()) return TaggedValue::FromBoolean(ProxyIsExtensible(static_cast<JSProxy*>(args[0].AsHeapObject())));
@@ -4492,7 +4640,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("preventExtensions", TaggedValue::FromHeapObject(make_native("preventExtensions", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.preventExtensions called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.preventExtensions called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         if (args[0].AsHeapObject()->IsProxy()) return TaggedValue::FromBoolean(ProxyPreventExtensions(static_cast<JSProxy*>(args[0].AsHeapObject())));
@@ -4501,7 +4649,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("getOwnPropertyDescriptor", TaggedValue::FromHeapObject(make_native("getOwnPropertyDescriptor", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.getOwnPropertyDescriptor called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.getOwnPropertyDescriptor called on non-object")));
             return TaggedValue::Undefined();
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4525,7 +4673,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     reflect_obj->SetNamedProperty("defineProperty", TaggedValue::FromHeapObject(make_native("defineProperty", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Reflect.defineProperty called on non-object")));
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.defineProperty called on non-object")));
             return TaggedValue::FromBoolean(false);
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
@@ -4578,7 +4726,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
                 return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(desc));
             }
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Symbol.prototype.description called on non-symbol")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Symbol.prototype.description called on non-symbol")));
             }
             return TaggedValue::Undefined();
         })),
@@ -4592,7 +4740,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Symbol(" + desc + ")"));
         }
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Symbol.prototype.toString called on non-symbol")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Symbol.prototype.toString called on non-symbol")));
         }
         return TaggedValue::Undefined();
     })), next_shape_id_);
@@ -4602,7 +4750,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return this_val;
         }
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Symbol.prototype.valueOf called on non-symbol")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Symbol.prototype.valueOf called on non-symbol")));
         }
         return TaggedValue::Undefined();
     })), next_shape_id_);
@@ -4612,7 +4760,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return this_val;
         }
         if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Symbol.prototype[@@toPrimitive] called on non-symbol")));
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Symbol.prototype[@@toPrimitive] called on non-symbol")));
         }
         return TaggedValue::Undefined();
     })), next_shape_id_);

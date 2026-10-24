@@ -6,6 +6,8 @@
 #include "aether/ast.h"
 #include <memory>
 #include <string>
+#include <vector>
+#include <unordered_set>
 
 namespace aether {
 
@@ -35,6 +37,8 @@ class Parser {
 public:
     explicit Parser(Lexer& lexer);
 
+    // Parsing inhibits collection while AST literals are unpublished. Emit the
+    // returned AST before the next explicit GC, or hold an enclosing NoGCScope.
     std::unique_ptr<Program> ParseProgram();
     std::unique_ptr<Stmt> ParseStatement();
     std::unique_ptr<Expr> ParseExpression(Precedence precedence = Precedence::Assignment);
@@ -72,6 +76,15 @@ private:
     std::unique_ptr<Stmt> ParseThrow();
     std::unique_ptr<Stmt> ParseTryCatch();
     std::unique_ptr<Stmt> ParseClassDecl();
+    struct ParsedClassBody {
+        struct Field {
+            std::string name;
+            std::unique_ptr<Expr> initializer;
+        };
+        std::vector<std::unique_ptr<FunctionDeclStmt>> methods;
+        std::vector<Field> fields;
+    };
+    ParsedClassBody ParseClassElements(std::string_view super_name);
     std::unique_ptr<Stmt> ParseWith();
     std::unique_ptr<BlockStmt> ParseBlock();
     std::unique_ptr<Stmt> ParseExprStmt();
@@ -80,7 +93,7 @@ private:
     bool MatchContextualKeyword(std::string_view kw);
 
     // Expression parsers
-    std::unique_ptr<Expr> ParsePrefix();
+    std::unique_ptr<Expr> ParsePrefix(Precedence precedence = Precedence::Assignment);
     std::unique_ptr<Expr> ParseInfix(std::unique_ptr<Expr> lhs, Token op_token);
     std::unique_ptr<CallExpr> MakeTaggedTemplateCall(std::unique_ptr<Expr> tag, Token op_token);
     void ConsumeSemicolon();
@@ -94,6 +107,7 @@ private:
     bool in_async_{false};
     bool is_module_{false};
     uint32_t function_depth_{0};
+    std::vector<std::unordered_set<std::string>> declared_private_names_stack_;
 };
 
 } // namespace aether

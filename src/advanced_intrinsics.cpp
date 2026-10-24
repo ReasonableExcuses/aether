@@ -6,6 +6,7 @@
 #include <thread>
 #include <limits>
 #include <string>
+#include <optional>
 
 namespace aether {
 
@@ -40,41 +41,107 @@ static inline double ValueToNumber(TaggedValue v) {
 // Managed Async Wait Thread Pool
 // ============================================================================
 
+namespace {
+// Only used while publishing a wait: the queue takes over the backing-store
+// root before native code can reach a safepoint. The promise does not retain it
+// after settlement/cancellation.
+class AsyncWaitPromise final : public JSPromise {
+public:
+    AsyncWaitPromise(TaggedValue buffer, Shape* shape) : JSPromise(shape), buffer_(buffer) {}
+    AsyncWaitPromise(AsyncWaitPromise&&) noexcept = default;
+    size_t ObjectSize() const override { return sizeof(AsyncWaitPromise); }
+    HeapObject* RelocateTo(void* dst) override { return new (dst) AsyncWaitPromise(std::move(*this)); }
+    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+        JSPromise::IteratePointers(visitor);
+        visitor(buffer_);
+    }
+    TaggedValue BufferRoot() const { return buffer_; }
+    void ReleaseBuffer() { buffer_ = TaggedValue::Undefined(); }
+private:
+    TaggedValue buffer_;
+};
+
+struct AsyncWaitState : AsyncWaitManager::WaitTask {
+    std::optional<MicrotaskQueue::PendingTask> completion;
+    int32_t* address{nullptr};
+    std::atomic<bool> finished{false};
+    std::string result;
+    bool resource_failed{false};
+};
+
+void JoinCancelledWait(const std::shared_ptr<AsyncWaitManager::WaitTask>& base) {
+    auto task = std::static_pointer_cast<AsyncWaitState>(base);
+    // Cancellation may win just before Wait32 registers its waiter. Repeat the
+    // wake until the worker exits, rather than relying on one racy global Clear.
+    // Normal waits keep one continuous futex registration (no polling gaps).
+    while (!task->finished.load(std::memory_order_acquire)) {
+        FutexManager::Instance().Notify(task->address, UINT32_MAX);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (task->worker.joinable()) task->worker.join();
+    task->completion->Cancel();
+}
+}
+
 AsyncWaitManager& AsyncWaitManager::Instance() {
     static AsyncWaitManager s_mgr;
     return s_mgr;
 }
 
 void AsyncWaitManager::SpawnWait(int32_t* ptr, int32_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    if (realm) {
-        realm->RegisterRootValue(std::make_unique<TaggedValue>(TaggedValue::FromHeapObject(promise)));
-    }
-
-    auto task = std::make_shared<WaitTask>();
+    (void)realm;
+    NoGCScope guard;
+    if (std::isnan(timeout)) timeout = std::numeric_limits<double>::infinity();
+    if (timeout < 0.0) timeout = 0.0;
+    auto& queue = agent ? agent->GetMicrotasks() : CurrentMicrotaskQueue();
+    auto task = std::make_shared<AsyncWaitState>();
     task->agent = agent;
-
-    task->worker = std::thread([ptr, expected, timeout, promise, task]() {
-        std::string wait_res = FutexManager::Instance().Wait32(ptr, expected, timeout);
-        if (task->cancelled.load(std::memory_order_acquire)) {
+    task->address = ptr;
+    std::vector<TaggedValue> roots{TaggedValue::FromHeapObject(promise)};
+    auto* wait_promise = dynamic_cast<AsyncWaitPromise*>(promise);
+    if (wait_promise) roots.push_back(wait_promise->BufferRoot());
+    task->completion.emplace(queue.Prepare([this, promise, task, &queue]() {
+        // Join and retire native state even if fulfillment fails its budget.
+        if (task->worker.joinable()) task->worker.join();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            std::erase(tasks_, task);
+        }
+        if (task->cancelled.load(std::memory_order_acquire)) return;
+        if (task->resource_failed) {
+            RaiseResourceError("Async wait allocation failed");
+            if (auto* interpreter = Interpreter::Current()) {
+                TaggedValue reason = interpreter->PendingException();
+                interpreter->ClearPendingException();
+                promise->Reject(reason, queue);
+            }
             return;
         }
-        if (task->agent) {
-            task->agent->GetMicrotasks().Enqueue([promise, wait_res, task]() {
-                if (task->cancelled.load(std::memory_order_acquire)) return;
-                MicrotaskQueue dummy;
-                promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(wait_res)), dummy);
-            });
-        } else {
-            CurrentMicrotaskQueue().Enqueue([promise, wait_res, task]() {
-                if (task->cancelled.load(std::memory_order_acquire)) return;
-                MicrotaskQueue dummy;
-                promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(wait_res)), dummy);
-            });
-        }
-    });
+        promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(task->result)), queue);
+    }, std::move(roots)));
+    if (wait_promise) wait_promise->ReleaseBuffer();
 
-    tasks_.push_back(task);
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        // Publish manager ownership before creating a joinable thread.
+        tasks_.push_back(task);
+        task->worker = std::thread([ptr, expected, timeout, task]() {
+            try {
+                // Workers touch only the pre-rooted backing store and host state.
+                if (!task->cancelled.load(std::memory_order_acquire)) {
+                    task->result = FutexManager::Instance().Wait32(ptr, expected, timeout);
+                }
+            } catch (...) {
+                task->resource_failed = true;
+            }
+            task->completion->Publish();
+            task->finished.store(true, std::memory_order_release);
+        });
+    } catch (...) {
+        std::erase(tasks_, task);
+        task->completion->Cancel();
+        throw;
+    }
 }
 
 void AsyncWaitManager::CancelAndJoinForAgent(Agent* agent) {
@@ -92,11 +159,8 @@ void AsyncWaitManager::CancelAndJoinForAgent(Agent* agent) {
         }
     }
     if (!agent_tasks.empty()) {
-        FutexManager::Instance().Clear();
         for (auto& t : agent_tasks) {
-            if (t->worker.joinable()) {
-                t->worker.join();
-            }
+            JoinCancelledWait(t);
         }
     }
 }
@@ -112,11 +176,8 @@ void AsyncWaitManager::Shutdown() {
         tasks_.clear();
     }
     if (!all_tasks.empty()) {
-        FutexManager::Instance().Clear();
         for (auto& t : all_tasks) {
-            if (t->worker.joinable()) {
-                t->worker.join();
-            }
+            JoinCancelledWait(t);
         }
     }
 }
@@ -253,7 +314,25 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
 // Initialization Entrypoint: InitializeAdvancedIntrinsics
 // ============================================================================
 
+// Bound before converting: converting NaN, infinity or an out-of-range double
+// to size_t/int64_t is undefined behavior. The engine cap is exactly representable.
+static size_t SharedBufferLength(double value) {
+    if (!std::isfinite(value) || value < 0.0 || value > static_cast<double>(kMaxArrayBufferSize)) {
+        throw std::length_error("Invalid SharedArrayBuffer byte length");
+    }
+    return static_cast<size_t>(value);
+}
+
+static int64_t SharedBufferSliceIndex(TaggedValue value, size_t length) {
+    double number = ValueToNumber(value);
+    if (std::isnan(number)) return 0;
+    const double bound = static_cast<double>(length);
+    return static_cast<int64_t>(std::clamp(number, -bound, bound));
+}
+
 void InitializeAdvancedIntrinsics(Realm& realm) {
+    IsolateScope isolate(realm.GetHeap());
+    NoGCScope guard(realm.GetHeap());
     Shape* root = realm.GetRootShape();
     uint32_t& next_sid = realm.NextShapeId();
     JSObject* global = realm.GetGlobalObject();
@@ -282,7 +361,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakMap()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakMap.prototype.set called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakMap.prototype.set called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -291,7 +370,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!k.IsHeapObject() || !k.AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Invalid value used as weak map key")));
+                    AllocateRuntime<JSError>("TypeError", "Invalid value used as weak map key")));
             }
             return TaggedValue::Undefined();
         }
@@ -304,7 +383,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakMap()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakMap.prototype.get called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakMap.prototype.get called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -320,7 +399,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakMap()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakMap.prototype.has called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakMap.prototype.has called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -336,7 +415,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakMap()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakMap.prototype.delete called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakMap.prototype.delete called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -372,6 +451,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(wm);
     });
 
+    weak_map_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_map_proto));
     weak_map_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_map_proto), next_sid);
     weak_map_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_map_ctor), next_sid);
     global->SetNamedProperty("WeakMap", TaggedValue::FromHeapObject(weak_map_ctor), next_sid);
@@ -386,7 +466,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakSet()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakSet.prototype.add called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakSet.prototype.add called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -395,7 +475,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!v.IsHeapObject() || !v.AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Invalid value used in weak set")));
+                    AllocateRuntime<JSError>("TypeError", "Invalid value used in weak set")));
             }
             return TaggedValue::Undefined();
         }
@@ -407,7 +487,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakSet()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakSet.prototype.has called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakSet.prototype.has called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -423,7 +503,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakSet()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakSet.prototype.delete called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakSet.prototype.delete called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -452,6 +532,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(ws);
     });
 
+    weak_set_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_set_proto));
     weak_set_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_set_proto), next_sid);
     weak_set_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_set_ctor), next_sid);
     global->SetNamedProperty("WeakSet", TaggedValue::FromHeapObject(weak_set_ctor), next_sid);
@@ -462,29 +543,31 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
     auto* sab_proto = AllocateRuntime<JSObject>(root);
     set_string_tag(sab_proto, "SharedArrayBuffer");
 
-    sab_proto->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_method("slice", [sab_proto](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* sab_slice = make_method("slice", [sab_proto](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArrayBuffer()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method SharedArrayBuffer.prototype.slice called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method SharedArrayBuffer.prototype.slice called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
         auto* sab = static_cast<JSArrayBuffer*>(this_val.AsHeapObject());
         int64_t begin = 0;
         int64_t end = static_cast<int64_t>(sab->ByteLength());
-        if (!args.empty() && args[0].IsNumber()) begin = static_cast<int64_t>(args[0].AsNumber());
-        if (args.size() > 1 && args[1].IsNumber()) end = static_cast<int64_t>(args[1].AsNumber());
+        if (!args.empty()) begin = SharedBufferSliceIndex(args[0], sab->ByteLength());
+        if (args.size() > 1 && !args[1].IsUndefined()) end = SharedBufferSliceIndex(args[1], sab->ByteLength());
         auto* copy = sab->Slice(begin, end, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
         copy->SetPrototype(sab_proto);
         return TaggedValue::FromHeapObject(copy);
-    })), next_sid);
+    });
+    sab_slice->AddCapturedRoot(TaggedValue::FromHeapObject(sab_proto));
+    sab_proto->SetNamedProperty("slice", TaggedValue::FromHeapObject(sab_slice), next_sid);
 
     sab_proto->SetNamedProperty("grow", TaggedValue::FromHeapObject(make_method("grow", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArrayBuffer()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method SharedArrayBuffer.prototype.grow called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method SharedArrayBuffer.prototype.grow called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -492,19 +575,13 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!sab->IsGrowable()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "SharedArrayBuffer is not growable")));
+                    AllocateRuntime<JSError>("TypeError", "SharedArrayBuffer is not growable")));
             }
             return TaggedValue::Undefined();
         }
         double new_len_d = args.empty() ? 0.0 : ValueToNumber(args[0]);
-        if (new_len_d < 0.0 || new_len_d < static_cast<double>(sab->ByteLength()) || new_len_d > static_cast<double>(sab->MaxByteLength())) {
-            if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("RangeError", "Invalid new byte length for SharedArrayBuffer")));
-            }
-            return TaggedValue::Undefined();
-        }
-        sab->Grow(static_cast<size_t>(new_len_d));
+        size_t new_length = SharedBufferLength(new_len_d);
+        if (!sab->Grow(new_length)) return RaiseResourceError("Invalid new byte length for SharedArrayBuffer");
         return TaggedValue::Undefined();
     })), next_sid);
 
@@ -512,31 +589,19 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         double byte_length_d = 0.0;
         if (!args.empty()) {
             byte_length_d = ValueToNumber(args[0]);
-            if (std::isnan(byte_length_d) || byte_length_d < 0.0) {
-                if (Interpreter::Current()) {
-                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("RangeError", "Invalid SharedArrayBuffer byte length")));
-                }
-                return TaggedValue::Undefined();
-            }
         }
-        size_t byte_length = static_cast<size_t>(byte_length_d);
+        size_t byte_length = SharedBufferLength(byte_length_d);
         size_t max_byte_length = byte_length;
 
         // Check options: { maxByteLength: N }
         if (args.size() > 1 && args[1].IsHeapObject() && args[1].AsHeapObject()->IsJSObject()) {
             auto* opts_obj = static_cast<JSObject*>(args[1].AsHeapObject());
             TaggedValue max_bl_val = opts_obj->GetNamedProperty("maxByteLength");
-            if (max_bl_val.IsNumber()) {
-                double mbl = max_bl_val.AsNumber();
-                if (mbl < byte_length_d) {
-                    if (Interpreter::Current()) {
-                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                            new JSError("RangeError", "maxByteLength must be greater than or equal to byteLength")));
-                    }
-                    return TaggedValue::Undefined();
+            if (!max_bl_val.IsUndefined()) {
+                max_byte_length = SharedBufferLength(ValueToNumber(max_bl_val));
+                if (max_byte_length < byte_length) {
+                    return RaiseResourceError("maxByteLength must be greater than or equal to byteLength");
                 }
-                max_byte_length = static_cast<size_t>(mbl);
             }
         }
 
@@ -545,6 +610,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(sab);
     });
 
+    sab_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(sab_proto));
     sab_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(sab_proto), next_sid);
     sab_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(sab_ctor), next_sid);
     global->SetNamedProperty("SharedArrayBuffer", TaggedValue::FromHeapObject(sab_ctor), next_sid);
@@ -627,14 +693,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() < 4) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.compareExchange: requires 4 arguments")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.compareExchange: requires 4 arguments")));
             }
             return TaggedValue::Undefined();
         }
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.compareExchange: argument 0 must be a TypedArray")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.compareExchange: argument 0 must be a TypedArray")));
             }
             return TaggedValue::Undefined();
         }
@@ -650,7 +716,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("RangeError", "Atomics.compareExchange: index out of bounds")));
+                    AllocateRuntime<JSError>("RangeError", "Atomics.compareExchange: index out of bounds")));
             }
             return TaggedValue::Undefined();
         }
@@ -703,7 +769,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
 
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                new JSError("TypeError", "Atomics.compareExchange: unsupported element type")));
+                AllocateRuntime<JSError>("TypeError", "Atomics.compareExchange: unsupported element type")));
         }
         return TaggedValue::Undefined();
     })), next_sid);
@@ -713,14 +779,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() < 3) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.wait: requires at least 3 arguments")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: requires at least 3 arguments")));
             }
             return TaggedValue::Undefined();
         }
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.wait: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: argument 0 must be an Int32Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -728,14 +794,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (ta->Kind() != TypedArrayKind::Int32) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.wait: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: typedArray must be an Int32Array")));
             }
             return TaggedValue::Undefined();
         }
         if (!ta->Buffer() || !ta->Buffer()->IsShared()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.wait: typedArray buffer must be a SharedArrayBuffer")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: typedArray buffer must be a SharedArrayBuffer")));
             }
             return TaggedValue::Undefined();
         }
@@ -744,7 +810,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("RangeError", "Atomics.wait: index out of bounds")));
+                    AllocateRuntime<JSError>("RangeError", "Atomics.wait: index out of bounds")));
             }
             return TaggedValue::Undefined();
         }
@@ -754,6 +820,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() > 3 && !args[3].IsUndefined()) {
             timeout = args[3].AsNumber();
             if (std::isnan(timeout)) timeout = std::numeric_limits<double>::infinity();
+            if (timeout < 0.0) timeout = 0.0;
         }
 
         int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + static_cast<size_t>(idx) * sizeof(int32_t));
@@ -766,14 +833,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() < 2) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.notify: requires at least 2 arguments")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: requires at least 2 arguments")));
             }
             return TaggedValue::Undefined();
         }
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.notify: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: argument 0 must be an Int32Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -781,14 +848,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (ta->Kind() != TypedArrayKind::Int32) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.notify: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: typedArray must be an Int32Array")));
             }
             return TaggedValue::Undefined();
         }
         if (!ta->Buffer() || !ta->Buffer()->IsShared()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.notify: typedArray buffer must be a SharedArrayBuffer")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: typedArray buffer must be a SharedArrayBuffer")));
             }
             return TaggedValue::Undefined();
         }
@@ -797,7 +864,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("RangeError", "Atomics.notify: index out of bounds")));
+                    AllocateRuntime<JSError>("RangeError", "Atomics.notify: index out of bounds")));
             }
             return TaggedValue::Undefined();
         }
@@ -818,14 +885,14 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() < 3) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.waitAsync: requires at least 3 arguments")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: requires at least 3 arguments")));
             }
             return TaggedValue::Undefined();
         }
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Atomics.waitAsync: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: argument 0 must be an Int32Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -849,7 +916,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("RangeError", "Atomics.waitAsync: index out of bounds")));
+                    AllocateRuntime<JSError>("RangeError", "Atomics.waitAsync: index out of bounds")));
             }
             return TaggedValue::Undefined();
         }
@@ -859,6 +926,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() > 3 && !args[3].IsUndefined()) {
             timeout = args[3].AsNumber();
             if (std::isnan(timeout)) timeout = std::numeric_limits<double>::infinity();
+            if (timeout < 0.0) timeout = 0.0;
         }
 
         int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + static_cast<size_t>(idx) * sizeof(int32_t));
@@ -879,7 +947,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             return TaggedValue::FromHeapObject(res_obj);
         }
 
-        auto* promise = AllocateRuntime<JSPromise>(root);
+        auto* promise = AllocateRuntime<AsyncWaitPromise>(TaggedValue::FromHeapObject(ta->Buffer()), root);
         if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
             promise->SetPrototype(Realm::Current()->GetPromisePrototype());
         }
@@ -903,7 +971,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsWeakRef()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method WeakRef.prototype.deref called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method WeakRef.prototype.deref called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -915,7 +983,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "WeakRef: target must be an object")));
+                    AllocateRuntime<JSError>("TypeError", "WeakRef: target must be an object")));
             }
             return TaggedValue::Undefined();
         }
@@ -924,6 +992,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(wr);
     });
 
+    weak_ref_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_ref_proto));
     weak_ref_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_ref_proto), next_sid);
     weak_ref_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_ref_ctor), next_sid);
     global->SetNamedProperty("WeakRef", TaggedValue::FromHeapObject(weak_ref_ctor), next_sid);
@@ -938,7 +1007,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFinalizationRegistry()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method FinalizationRegistry.prototype.register called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method FinalizationRegistry.prototype.register called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -946,7 +1015,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "FinalizationRegistry.prototype.register: target must be an object")));
+                    AllocateRuntime<JSError>("TypeError", "FinalizationRegistry.prototype.register: target must be an object")));
             }
             return TaggedValue::Undefined();
         }
@@ -957,7 +1026,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             if (!args[2].IsHeapObject() || !args[2].AsHeapObject()->IsECMAObject()) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "FinalizationRegistry.prototype.register: unregisterToken must be an object")));
+                        AllocateRuntime<JSError>("TypeError", "FinalizationRegistry.prototype.register: unregisterToken must be an object")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -972,7 +1041,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsFinalizationRegistry()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Method FinalizationRegistry.prototype.unregister called on incompatible receiver")));
+                    AllocateRuntime<JSError>("TypeError", "Method FinalizationRegistry.prototype.unregister called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         }
@@ -980,7 +1049,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "FinalizationRegistry.prototype.unregister: unregisterToken must be an object")));
+                    AllocateRuntime<JSError>("TypeError", "FinalizationRegistry.prototype.unregister: unregisterToken must be an object")));
             }
             return TaggedValue::Undefined();
         }
@@ -1006,7 +1075,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "FinalizationRegistry: cleanupCallback must be a function")));
+                    AllocateRuntime<JSError>("TypeError", "FinalizationRegistry: cleanupCallback must be a function")));
             }
             return TaggedValue::Undefined();
         }
@@ -1015,6 +1084,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(fr);
     });
 
+    fr_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(fr_proto));
     fr_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(fr_proto), next_sid);
     fr_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(fr_ctor), next_sid);
     global->SetNamedProperty("FinalizationRegistry", TaggedValue::FromHeapObject(fr_ctor), next_sid);

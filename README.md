@@ -15,6 +15,7 @@ A high-performance, low-latency ECMAScript virtual machine and multi-tier JIT co
   <img src="https://img.shields.io/badge/Specification-ECMA--262%20(ES2023%2B)%20%7C%20ECMA--402-F7DF1E?style=flat-square&logo=javascript&logoColor=black" alt="ECMA-262" />
   <img src="https://img.shields.io/badge/Memory_Model-4GB%20Zero--Offset%20Compressed-4682B4?style=flat-square" alt="Memory Model" />
   <img src="https://img.shields.io/badge/Verification-100%25%20Verified%20Clean-2E8B57?style=flat-square" alt="Verification" />
+  <img src="https://img.shields.io/badge/Enterprise_Hardening-Verified%20Clean-00C853?style=flat-square" alt="Enterprise Hardening" />
   <img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="License" />
 </p>
 
@@ -504,6 +505,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │       ├── ast.h                 # AST node definitions
 │       ├── background_compiler.h # Multi-threaded background JIT compilation worker pool
 │       ├── baseline_jit.h        # Tier 1 Baseline Template JIT compiler
+│       ├── bounded_regex.h       # Bounded regular expression engine & ReDoS protection
 │       ├── bytecode.h            # Bytecode ISA and BytecodeArray container
 │       ├── bytecode_emitter.h    # AST to bytecode compilation pass
 │       ├── common.h              # Compiler macros, alignment, and attributes
@@ -515,6 +517,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │       ├── interpreter.h         # Tier 0 Interpreter and TypeFeedbackVector
 │       ├── intl.h                # ECMA-402 Internationalization namespace
 │       ├── lexer.h               # Tokenizer scanner
+│       ├── memory_budget.h       # Per-isolate memory budget, atomic accounting & charge tracking
 │       ├── module.h              # CommonJS Module Loader & Process Environment
 │       ├── optimizing_jit.h      # Tier 2 Sea-of-Nodes Optimizing JIT
 │       ├── parser.h              # Pratt precedence parser
@@ -530,6 +533,7 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── assembler.cpp             # Machine code emission implementation
 │   ├── background_compiler.cpp   # Background worker threads and JIT task queue
 │   ├── baseline_jit.cpp          # Baseline JIT compiler implementation
+│   ├── bounded_regex.cpp         # Bounded regex execution engine and step/backtracking limits
 │   ├── bytecode.cpp             # Bytecode disassembler and emitter
 │   ├── bytecode_emitter.cpp     # AST lowering passes
 │   ├── concurrent_marker.cpp    # Immix concurrent marking and atomic line tagging
@@ -575,6 +579,11 @@ AetherVM's C++ frontend parser (`test262.h` / `test262.cpp`):
 │   ├── test_milestone19_wasm.cpp      # WebAssembly MVP execution & interop tests
 │   ├── test_milestone20_parallel.cpp  # Concurrent Immix GC & Background JIT tests
 │   ├── test_milestone21_advanced_intrinsics.cpp # Advanced Intrinsics & Concurrency tests
+│   ├── test_hardening_async.cpp       # Hardening: Native roots, microtasks, event loop lifecycle
+│   ├── test_hardening_execution.cpp   # Hardening: Recurring GC, closures, stack depth guards
+│   ├── test_hardening_gc.cpp          # Hardening: Survivor handles, constructor GC inhibition, probes
+│   ├── test_hardening_limits.cpp      # Hardening: String/array/slot bounds & prototype cycle prevention
+│   ├── test_hardening_regex.cpp       # Hardening: Bounded regex execution & ReDoS mitigation
 │   ├── test_issue_regressions.cpp     # Memory safety, concurrency & validation regressions
 │   └── test_test262_harness.cpp       # Test262 YAML parser & test suite driver
 └── tools/
@@ -636,6 +645,13 @@ cmake --build build -j$(nproc)
 
 # Run native Test262 conformance test suite
 .\build\Release\test_test262_harness.exe
+
+# Run Enterprise Hardening test suites
+.\build\Release\test_hardening_async.exe
+.\build\Release\test_hardening_execution.exe
+.\build\Release\test_hardening_gc.exe
+.\build\Release\test_hardening_limits.exe
+.\build\Release\test_hardening_regex.exe
 
 # Run Test262 Python CLI runner across test directories
 python tools\run_test262.py
@@ -702,6 +718,29 @@ AetherVM incorporates comprehensive guarantees addressing low-level concurrency,
 
 14. **WebAssembly Linear Memory Prototype Chaining**:
     - `WasmMemoryInstance::GetOrCreateJSBuffer` anchors linear memory buffers to `ArrayBuffer.prototype`, ensuring `mem.buffer instanceof ArrayBuffer` and full integration with standard ArrayBuffer reflection.
+
+15. **Managed Runtime Allocation & Fallback Heap**:
+    - Replaced raw unmanaged `new` allocations across the runtime, interpreter, parser, and module loader with `AllocateRuntime` / `Allocate` / `HandleScope`.
+    - Introduced `RuntimeFallbackHeap` to ensure objects created during engine bootstrap or without an explicit isolate heap context are properly managed and not leaked.
+
+16. **Per-Isolate Memory Budget & Resource Accounting**:
+    - `MemoryBudgetState` enforces fine-grained, thread-safe memory limits on isolate heaps.
+    - RAII `MemoryCharge` tracks auxiliary allocations (strings, arrays, regex states) and throws length/out-of-memory errors before backing buffers exceed isolate budgets.
+
+17. **GC Safepoint Protocol & Constructor Inhibition**:
+    - `NoGCScope` locks down garbage collection during object construction, native re-entrancy, and critical sections.
+    - Backward branch and allocation safepoint checks ensure GC pause cycles occur only at consistent, thread-safe execution boundaries.
+
+18. **Nursery Space Poisoning (UAF Exploit Prevention)**:
+    - Post-scavenge semi-space flips immediately poison evacuated from-space with `0xDD`.
+    - Ensures stale pointers to collected young-generation objects trigger immediate determinism rather than reading corrupted payload data.
+
+19. **Bounded Collections & Prototype Cycle Defense**:
+    - Rigid checks on `kMaxArrayLength`, `CheckedStringLength` (`kMaxStringLength`), property slots, and `ArrayBuffer` allocations protect against memory exhaustion attacks.
+    - Cycle detection in `SetPrototype()` prevents circular prototype loops and unbounded property lookups.
+
+20. **Bounded Regex Execution Engine (ReDoS Defense)**:
+    - Custom bounded regular expression engine with backtracking step counters and recursion depth limits protects the virtual machine from catastrophic backtracking Denial-of-Service attacks.
 
 ### Running the Standalone Aether CLI
 

@@ -14,11 +14,44 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
+#include <stdexcept>
+#include <thread>
 
 namespace aether {
 
 using NativeCallback = TaggedValue (*)(const std::vector<TaggedValue>& args);
 using NativeMethodCallback = TaggedValue (*)(TaggedValue this_val, const std::vector<TaggedValue>& args);
+
+// Sets the current interpreter's pending RangeError and returns Undefined.
+// Must be allocation-failure-safe (use a preallocated/rooted emergency error);
+// never recursively try to allocate an error when the heap budget is exhausted.
+TaggedValue RaiseResourceError(std::string_view message) noexcept;
+
+// Owner-thread, non-stack roots for host records. The heap must outlive this
+// object. Slots never move; Clear/destruction unregisters every slot.
+class NativeRootSet {
+public:
+    explicit NativeRootSet(Heap& heap) : heap_(heap) { heap_.AssertOwnerThread(); }
+    ~NativeRootSet() { Clear(); }
+    NativeRootSet(const NativeRootSet&) = delete;
+    NativeRootSet& operator=(const NativeRootSet&) = delete;
+
+    void Add(TaggedValue value) {
+        heap_.AssertOwnerThread();
+        if (!value.IsHeapObject()) return;
+        slots_.push_back(value);
+        try { heap_.RegisterExtraRoot(&slots_.back()); }
+        catch (...) { slots_.pop_back(); throw; }
+    }
+    void Clear() noexcept {
+        for (auto& slot : slots_) heap_.UnregisterExtraRoot(&slot);
+        slots_.clear();
+    }
+private:
+    Heap& heap_;
+    std::deque<TaggedValue> slots_;
+};
 
 /**
  * @brief Managed Host Native Function callable from ECMAScript.
@@ -28,22 +61,38 @@ public:
     using CallbackType = std::function<TaggedValue(const std::vector<TaggedValue>&)>;
     using MethodCallbackType = std::function<TaggedValue(TaggedValue, const std::vector<TaggedValue>&)>;
 
-    JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape = nullptr);
-    JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape = nullptr);
+    JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape = nullptr, uint32_t length = 0);
+    JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape = nullptr, uint32_t length = 0);
 
     JSNativeFunction(JSNativeFunction&& other) noexcept = default;
 
     const std::string& Name() const noexcept { return name_; }
+    uint32_t Length() const noexcept { return length_; }
+    void SetLength(uint32_t len) noexcept { length_ = len; }
     const CallbackType& Callback() const noexcept { return callback_; }
     const MethodCallbackType& MethodCallback() const noexcept { return method_callback_; }
     bool IsMethodCallback() const noexcept { return static_cast<bool>(method_callback_); }
 
+    // std::function captures are opaque to GC. All managed captures must also
+    // appear here. Raw captures require the runtime's stable/nonmoving storage.
+    void SetCapturedRoots(std::vector<TaggedValue> roots) {
+        captured_roots_ = std::move(roots);
+        for (auto value : captured_roots_) RecordWriteBarrier(this, value);
+    }
+    void AddCapturedRoot(TaggedValue root) {
+        captured_roots_.push_back(root);
+        RecordWriteBarrier(this, root);
+    }
+
     TaggedValue Invoke(TaggedValue this_val, const std::vector<TaggedValue>& args) const {
-        if (method_callback_) {
-            return method_callback_(this_val, args);
-        }
-        if (callback_) {
-            return callback_(args);
+        NoGCScope native_scope(Heap::Current() ? *Heap::Current() : Heap::RuntimeFallbackHeap());
+        try {
+            if (method_callback_) return method_callback_(this_val, args);
+            if (callback_) return callback_(args);
+        } catch (const std::length_error& error) {
+            return RaiseResourceError(error.what());
+        } catch (const std::bad_alloc&) {
+            return RaiseResourceError("Native allocation failed");
         }
         return TaggedValue::Undefined();
     }
@@ -51,6 +100,7 @@ public:
     size_t ObjectSize() const override { return sizeof(JSNativeFunction); }
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         JSObject::IteratePointers(visitor);
+        for (auto& root : captured_roots_) visitor(root);
     }
 
     HeapObject* RelocateTo(void* dst) override {
@@ -59,8 +109,10 @@ public:
 
 private:
     std::string name_;
+    uint32_t length_{0};
     CallbackType callback_{nullptr};
     MethodCallbackType method_callback_{nullptr};
+    std::vector<TaggedValue> captured_roots_;
 };
 
 TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::vector<TaggedValue>& args, TaggedValue new_target = TaggedValue::Undefined());
@@ -72,39 +124,50 @@ JSObject* CreateIterResult(TaggedValue value, bool done);
  * @brief ECMA-262 Microtask Queue processing asynchronous Promise reactions.
  */
 class MicrotaskQueue {
+    struct Entry;
+    struct State;
+    class RootAnchor;
 public:
     MicrotaskQueue() = default;
+    ~MicrotaskQueue();
+    MicrotaskQueue(const MicrotaskQueue&) = delete;
+    MicrotaskQueue& operator=(const MicrotaskQueue&) = delete;
 
-    void Enqueue(std::function<void()> task) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        queue_.push_back(std::move(task));
-    }
+    // Initialize on the heap owner before handing the queue to workers. Main
+    // thread Enqueue/Prepare also initialize lazily. The heap outlives the queue.
+    void InitializeRoots(Heap& heap);
+    // Worker-safe publication; values must already be live until publication.
+    // Workers never allocate managed objects or change the heap root registry.
+    void Enqueue(std::function<void()> task, std::vector<TaggedValue> roots = {});
 
-    void PerformMicrotaskCheckpoint() {
-        while (true) {
-            std::function<void()> task;
-            {
-                std::lock_guard<std::mutex> lock(mtx_);
-                if (queue_.empty()) break;
-                task = std::move(queue_.front());
-                queue_.pop_front();
-            }
-            task();
-        }
-    }
-
-    size_t Size() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return queue_.size();
-    }
-    bool Empty() const noexcept {
-        std::lock_guard<std::mutex> lock(mtx_);
-        return queue_.empty();
-    }
+    class PendingTask {
+    public:
+        void Publish() const noexcept;
+        // Cancel only after the producer has stopped using its rooted values.
+        void Cancel() const noexcept;
+    private:
+        friend class MicrotaskQueue;
+        PendingTask(const std::shared_ptr<Entry>& entry, const std::shared_ptr<State>& state)
+            : entry_(entry), state_(state) {}
+        std::weak_ptr<Entry> entry_;
+        std::weak_ptr<State> state_;
+    };
+    // Prepare on the owner thread BEFORE starting work. Roots remain live even
+    // before Publish, which is allocation-free and safe from a worker thread.
+    PendingTask Prepare(std::function<void()> task, std::vector<TaggedValue> roots = {});
+    void PerformMicrotaskCheckpoint();
+    void Clear(); // owner thread, after stopping/joining associated producers
+    size_t Size() const noexcept; // ready tasks only
+    bool Empty() const noexcept { return Size() == 0; }
+    bool HasPendingWork() const noexcept; // includes unpublished worker tasks
 
 private:
-    mutable std::mutex mtx_;
-    std::deque<std::function<void()>> queue_;
+    void EnsureRoots();
+    std::shared_ptr<Entry> AddTask(std::function<void()> task, std::vector<TaggedValue> roots, bool ready);
+    const std::thread::id owner_thread_{std::this_thread::get_id()};
+    std::shared_ptr<State> state_;
+    Heap* heap_{nullptr};
+    TaggedValue anchor_{TaggedValue::Undefined()};
 };
 
 MicrotaskQueue& CurrentMicrotaskQueue();
@@ -122,6 +185,7 @@ public:
     static void SetCurrent(Realm* realm) noexcept { s_current_realm_ = realm; }
 
     JSObject* GetGlobalObject() noexcept { return global_object_; }
+    Heap& GetHeap() noexcept { return *heap_; }
     TaggedValue GetGlobalProperty(std::string_view name);
     void SetGlobalProperty(std::string_view name, TaggedValue value);
 
@@ -206,9 +270,10 @@ private:
     std::unordered_map<std::string, JSSymbol*> symbol_registry_;
 };
 
-inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape)
+inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType callback, Shape* shape, uint32_t length)
     : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
       name_(name),
+      length_(length),
       callback_(std::move(callback)),
       method_callback_(nullptr) {
     if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
@@ -216,9 +281,10 @@ inline JSNativeFunction::JSNativeFunction(std::string_view name, CallbackType ca
     }
 }
 
-inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape)
+inline JSNativeFunction::JSNativeFunction(std::string_view name, MethodCallbackType method_callback, Shape* shape, uint32_t length)
     : JSObject(HeapObjectType::JSNativeFunction, shape ? shape : (Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)),
       name_(name),
+      length_(length),
       callback_(nullptr),
       method_callback_(std::move(method_callback)) {
     if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {

@@ -106,21 +106,49 @@ static ThreadSafeWasmRegistry<WasmMemoryInstance> s_memory_registry;
 static ThreadSafeWasmRegistry<WasmTableInstance> s_table_registry;
 static ThreadSafeWasmRegistry<WasmGlobalInstance> s_global_registry;
 
+namespace {
+
+static size_t CheckedWasmMemorySize(WasmLimits limits) {
+    constexpr size_t max_pages = kMaxArrayBufferSize / WasmMemoryInstance::kPageSize;
+    if (limits.initial > max_pages ||
+        (limits.has_max && (limits.maximum > max_pages || limits.initial > limits.maximum))) {
+        throw std::length_error("WebAssembly.Memory exceeds the maximum byte length");
+    }
+    return static_cast<size_t>(limits.initial) * WasmMemoryInstance::kPageSize;
+}
+
+// Validate before converting to uint32_t, so huge/nonfinite JS numbers cannot
+// wrap to small page counts and bypass the implementation limit.
+static uint32_t CheckedWasmPages(TaggedValue value) {
+    double pages = value.AsNumber();
+    if (!std::isfinite(pages) || pages < 0 ||
+        pages > kMaxArrayBufferSize / WasmMemoryInstance::kPageSize) {
+        throw std::length_error("WebAssembly.Memory page count is out of range");
+    }
+    return static_cast<uint32_t>(pages);
+}
+
+} // namespace
+
 // Helper to extract binary buffer from ArrayBuffer or TypedArray
 static bool ExtractBufferSource(TaggedValue val, const uint8_t*& out_data, size_t& out_size) {
     if (!val.IsHeapObject()) return false;
     HeapObject* ho = val.AsHeapObject();
     if (ho->GetType() == HeapObjectType::JSArrayBuffer) {
         auto* ab = static_cast<JSArrayBuffer*>(ho);
-        if (ab->IsDetached()) return false;
+        if (ab->IsDetached() || ab->ByteLength() > kMaxArrayBufferSize) return false;
         out_data = ab->Data();
         out_size = ab->ByteLength();
         return true;
     }
     if (ho->GetType() == HeapObjectType::JSTypedArray) {
         auto* ta = static_cast<JSTypedArray*>(ho);
-        if (!ta->Buffer() || ta->Buffer()->IsDetached()) return false;
-        out_data = ta->Buffer()->Data() + ta->ByteOffset();
+        if (!ta->Buffer() || ta->Buffer()->IsDetached() ||
+            ta->Buffer()->ByteLength() > kMaxArrayBufferSize ||
+            ta->ByteOffset() > ta->Buffer()->ByteLength() ||
+            ta->ByteLength() > ta->Buffer()->ByteLength() - ta->ByteOffset()) return false;
+        out_data = ta->Buffer()->Data();
+        if (ta->ByteOffset()) out_data += ta->ByteOffset();
         out_size = ta->ByteLength();
         return true;
     }
@@ -1009,15 +1037,24 @@ bool WasmModule::Validate(const uint8_t* data, size_t length) {
 
 WasmMemoryInstance::WasmMemoryInstance(WasmLimits limits)
     : limits_(limits),
-      data_(limits.initial * kPageSize, 0) {}
+      data_(CheckedWasmMemorySize(limits), 0) {}
 
 int32_t WasmMemoryInstance::Grow(uint32_t delta_pages) {
     uint32_t current_pages = SizePages();
     uint64_t target_pages = static_cast<uint64_t>(current_pages) + delta_pages;
-    if (target_pages > kMaxPages) return -1;
+    if (target_pages > kMaxPages || target_pages > kMaxArrayBufferSize / kPageSize) return -1;
     if (limits_.has_max && target_pages > limits_.maximum) return -1;
 
-    // Detach all existing JS buffers wrapping this memory BEFORE reallocating
+    // Failed growth must leave existing wrappers intact. No JS/GC runs between
+    // the successful resize and detaching the old data pointers below.
+    try {
+        data_.resize(static_cast<size_t>(target_pages) * kPageSize, 0);
+    } catch (const std::bad_alloc&) {
+        return -1;
+    } catch (const std::length_error&) {
+        return -1;
+    }
+
     if (js_buffer_) {
         js_buffer_->Detach();
         js_buffer_ = nullptr;
@@ -1029,12 +1066,14 @@ int32_t WasmMemoryInstance::Grow(uint32_t delta_pages) {
     }
     all_buffers_.clear();
 
-    data_.resize(target_pages * kPageSize, 0);
 
     return static_cast<int32_t>(current_pages);
 }
 
 JSArrayBuffer* WasmMemoryInstance::GetOrCreateJSBuffer(Realm& realm) {
+    if (data_.size() > kMaxArrayBufferSize) {
+        throw std::length_error("WebAssembly.Memory buffer exceeds the maximum byte length");
+    }
     if (!js_buffer_ || js_buffer_->IsDetached()) {
         // Create an ArrayBuffer sharing the memory data pointer
         js_buffer_ = AllocateRuntime<JSArrayBuffer>(data_.data(), data_.size(), false, realm.GetRootShape());
@@ -1487,6 +1526,22 @@ std::shared_ptr<WasmInstance> WasmInstance::Instantiate(
                     if (res.empty()) return TaggedValue::Undefined();
                     return res[0].ToJS(realm);
                 }, root);
+                // WasmInstance stores imported JS functions in opaque
+                // std::function state. Keep each import alive for an escaped
+                // export; Invoke's NoGCScope does not cover this lifetime.
+                for (const auto& imp : module->Imports()) {
+                    if (imp.kind == WasmExternalKind::Function) {
+                        TaggedValue mod_val = import_object;
+                        TaggedValue field_val = TaggedValue::Undefined();
+                        if (mod_val.IsHeapObject() && mod_val.AsHeapObject()->IsJSObject()) {
+                            mod_val = static_cast<JSObject*>(mod_val.AsHeapObject())->GetNamedProperty(imp.module_name);
+                        }
+                        if (mod_val.IsHeapObject() && mod_val.AsHeapObject()->IsJSObject()) {
+                            field_val = static_cast<JSObject*>(mod_val.AsHeapObject())->GetNamedProperty(imp.field_name);
+                        }
+                        host_fn->AddCapturedRoot(field_val);
+                    }
+                }
                 exported_val = TaggedValue::FromHeapObject(host_fn);
                 break;
             }
@@ -1497,23 +1552,28 @@ std::shared_ptr<WasmInstance> WasmInstance::Instantiate(
                     s_memory_registry[mem_obj] = mem_inst;
 
                     // buffer getter
-                    mem_obj->SetNamedProperty("buffer", TaggedValue::FromHeapObject(mem_inst->GetOrCreateJSBuffer(realm)), next_sid);
+                    auto* buffer = mem_inst->GetOrCreateJSBuffer(realm);
+                    mem_obj->SetNamedProperty("buffer", TaggedValue::FromHeapObject(buffer), next_sid);
+                    buffer->SetNamedProperty("__wasm_memory_owner__", TaggedValue::FromHeapObject(mem_obj), next_sid);
                     // grow method
-                    mem_obj->SetNamedProperty("grow", TaggedValue::FromHeapObject(
-                        AllocateRuntime<JSNativeFunction>("grow", [mem_inst, &realm, mem_obj, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
-                            uint32_t delta = args.empty() ? 0 : static_cast<uint32_t>(args[0].AsNumber());
+                    auto* grow_fn = AllocateRuntime<JSNativeFunction>("grow", [mem_inst, &realm, mem_obj, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
+                            uint32_t delta = args.empty() ? 0 : CheckedWasmPages(args[0]);
                             int32_t prev = mem_inst->Grow(delta);
                             if (prev < 0) {
                                 if (Interpreter::Current()) {
                                     Interpreter::Current()->SetPendingException(
-                                        TaggedValue::FromHeapObject(new JSError("RangeError", "WebAssembly.Memory.grow failed")));
+                                        TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "WebAssembly.Memory.grow failed")));
                                 }
                                 return TaggedValue::Undefined();
                             }
                             // Refresh buffer property
-                            mem_obj->SetNamedProperty("buffer", TaggedValue::FromHeapObject(mem_inst->GetOrCreateJSBuffer(realm)), next_sid);
+                            auto* buffer = mem_inst->GetOrCreateJSBuffer(realm);
+                            mem_obj->SetNamedProperty("buffer", TaggedValue::FromHeapObject(buffer), next_sid);
+                            buffer->SetNamedProperty("__wasm_memory_owner__", TaggedValue::FromHeapObject(mem_obj), next_sid);
                             return TaggedValue::FromSmi(prev);
-                        }, root)), next_sid);
+                        }, root);
+                    grow_fn->AddCapturedRoot(TaggedValue::FromHeapObject(mem_obj));
+                    mem_obj->SetNamedProperty("grow", TaggedValue::FromHeapObject(grow_fn), next_sid);
                     exported_val = TaggedValue::FromHeapObject(mem_obj);
                 }
                 break;
@@ -1579,7 +1639,7 @@ std::vector<WasmVal> WasmInstance::Execute(uint32_t func_index, const std::vecto
     if (def_idx >= module_->Functions().size()) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(
-                TaggedValue::FromHeapObject(new JSError("WebAssembly.RuntimeError", "Function index out of bounds: " + std::to_string(func_index))));
+                TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.RuntimeError", "Function index out of bounds: " + std::to_string(func_index))));
         }
         return {};
     }
@@ -1616,7 +1676,7 @@ std::vector<WasmVal> WasmInstance::Execute(uint32_t func_index, const std::vecto
     auto Trap = [this](std::string_view msg) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(
-                TaggedValue::FromHeapObject(new JSError("WebAssembly.RuntimeError", msg)));
+                TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.RuntimeError", msg)));
         }
     };
 
@@ -2351,7 +2411,7 @@ void InitializeWebAssembly(Realm& realm) {
         auto* proto = AllocateRuntime<JSObject>(root);
         auto* ctor = AllocateRuntime<JSNativeFunction>(err_name, [err_name, root](const std::vector<TaggedValue>& args) -> TaggedValue {
             std::string msg = args.empty() ? "" : args[0].ToString();
-            return TaggedValue::FromHeapObject(new JSError(err_name, msg, root));
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSError>(err_name, msg, root));
         }, root);
         ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_sid);
         proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor), next_sid);
@@ -2387,7 +2447,7 @@ void InitializeWebAssembly(Realm& realm) {
         if (args.empty()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("TypeError", "WebAssembly.Module expects buffer source argument")));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "WebAssembly.Module expects buffer source argument")));
             }
             return TaggedValue::Undefined();
         }
@@ -2396,7 +2456,7 @@ void InitializeWebAssembly(Realm& realm) {
         if (!ExtractBufferSource(args[0], data, size)) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("TypeError", "Argument 0 must be an ArrayBuffer or TypedArray")));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Argument 0 must be an ArrayBuffer or TypedArray")));
             }
             return TaggedValue::Undefined();
         }
@@ -2406,7 +2466,7 @@ void InitializeWebAssembly(Realm& realm) {
         if (!mod) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("WebAssembly.CompileError", err)));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.CompileError", err)));
             }
             return TaggedValue::Undefined();
         }
@@ -2425,7 +2485,7 @@ void InitializeWebAssembly(Realm& realm) {
             if (args.empty() || !args[0].IsHeapObject() || !s_module_registry.contains(static_cast<JSObject*>(args[0].AsHeapObject()))) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(
-                        TaggedValue::FromHeapObject(new JSError("TypeError", "Expected WebAssembly.Module")));
+                        TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Expected WebAssembly.Module")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2445,7 +2505,7 @@ void InitializeWebAssembly(Realm& realm) {
             if (args.empty() || !args[0].IsHeapObject() || !s_module_registry.contains(static_cast<JSObject*>(args[0].AsHeapObject()))) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(
-                        TaggedValue::FromHeapObject(new JSError("TypeError", "Expected WebAssembly.Module")));
+                        TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Expected WebAssembly.Module")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2489,7 +2549,7 @@ void InitializeWebAssembly(Realm& realm) {
         if (args.empty() || !args[0].IsHeapObject() || !s_module_registry.contains(static_cast<JSObject*>(args[0].AsHeapObject()))) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("TypeError", "WebAssembly.Instance expects WebAssembly.Module as argument 0")));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "WebAssembly.Instance expects WebAssembly.Module as argument 0")));
             }
             return TaggedValue::Undefined();
         }
@@ -2501,7 +2561,7 @@ void InitializeWebAssembly(Realm& realm) {
         if (!inst) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("WebAssembly.LinkError", err)));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.LinkError", err)));
             }
             return TaggedValue::Undefined();
         }
@@ -2547,7 +2607,7 @@ void InitializeWebAssembly(Realm& realm) {
                 if (prev < 0) {
                     if (Interpreter::Current()) {
                         Interpreter::Current()->SetPendingException(
-                            TaggedValue::FromHeapObject(new JSError("RangeError", "WebAssembly.Memory.grow failed")));
+                            TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "WebAssembly.Memory.grow failed")));
                     }
                     return TaggedValue::Undefined();
                 }
@@ -2657,20 +2717,20 @@ void InitializeWebAssembly(Realm& realm) {
         make_native("compile", [&realm, root, module_proto, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
             auto* promise = AllocateRuntime<JSPromise>(root);
             if (args.empty()) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Missing buffer source")), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Missing buffer source")), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
             const uint8_t* data = nullptr;
             size_t size = 0;
             if (!ExtractBufferSource(args[0], data, size)) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Argument 0 must be an ArrayBuffer or TypedArray")), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Argument 0 must be an ArrayBuffer or TypedArray")), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 
             std::string err;
             auto mod = WasmModule::Decode(data, size, &err);
             if (!mod) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("WebAssembly.CompileError", err)), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.CompileError", err)), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 
@@ -2688,7 +2748,7 @@ void InitializeWebAssembly(Realm& realm) {
         make_native("instantiate", [&realm, root, module_proto, instance_proto, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
             auto* promise = AllocateRuntime<JSPromise>(root);
             if (args.empty()) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Missing argument 0")), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Missing argument 0")), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 
@@ -2700,7 +2760,7 @@ void InitializeWebAssembly(Realm& realm) {
                 std::string err;
                 auto inst = WasmInstance::Instantiate(mod, import_obj, realm, &err);
                 if (!inst) {
-                    promise->Reject(TaggedValue::FromHeapObject(new JSError("WebAssembly.LinkError", err)), CurrentMicrotaskQueue());
+                    promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.LinkError", err)), CurrentMicrotaskQueue());
                     return TaggedValue::FromHeapObject(promise);
                 }
                 auto* inst_obj = AllocateRuntime<JSObject>(root);
@@ -2715,14 +2775,14 @@ void InitializeWebAssembly(Realm& realm) {
             const uint8_t* data = nullptr;
             size_t size = 0;
             if (!ExtractBufferSource(args[0], data, size)) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("TypeError", "Argument 0 must be WebAssembly.Module or buffer source")), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Argument 0 must be WebAssembly.Module or buffer source")), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 
             std::string err;
             auto mod = WasmModule::Decode(data, size, &err);
             if (!mod) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("WebAssembly.CompileError", err)), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.CompileError", err)), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 
@@ -2732,7 +2792,7 @@ void InitializeWebAssembly(Realm& realm) {
 
             auto inst = WasmInstance::Instantiate(mod, import_obj, realm, &err);
             if (!inst) {
-                promise->Reject(TaggedValue::FromHeapObject(new JSError("WebAssembly.LinkError", err)), CurrentMicrotaskQueue());
+                promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("WebAssembly.LinkError", err)), CurrentMicrotaskQueue());
                 return TaggedValue::FromHeapObject(promise);
             }
 

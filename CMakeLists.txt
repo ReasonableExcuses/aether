@@ -36,6 +36,7 @@ set(AETHER_SOURCES
     src/concurrent_marker.cpp
     src/test262.cpp
     src/advanced_intrinsics.cpp
+    src/bounded_regex.cpp
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
@@ -115,3 +116,17 @@ target_link_libraries(test_milestone21_advanced_intrinsics PRIVATE aether_core)
 add_executable(test_issue_regressions tests/test_issue_regressions.cpp)
 target_link_libraries(test_issue_regressions PRIVATE aether_core)
 
+add_executable(test_hardening_gc tests/test_hardening_gc.cpp)
+target_link_libraries(test_hardening_gc PRIVATE aether_core)
+
+add_executable(test_hardening_limits tests/test_hardening_limits.cpp)
+target_link_libraries(test_hardening_limits PRIVATE aether_core)
+
+add_executable(test_hardening_regex tests/test_hardening_regex.cpp)
+target_link_libraries(test_hardening_regex PRIVATE aether_core)
+
+add_executable(test_hardening_execution tests/test_hardening_execution.cpp)
+target_link_libraries(test_hardening_execution PRIVATE aether_core)
+
+add_executable(test_hardening_async tests/test_hardening_async.cpp)
+target_link_libraries(test_hardening_async PRIVATE aether_core)

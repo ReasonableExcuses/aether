@@ -4,10 +4,6 @@
 #include "aether/common.h"
 #include "aether/value.h"
 #include "aether/heap_object.h"
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
 #include <vector>
 #include <atomic>
 
@@ -23,10 +19,11 @@ enum class ConcurrentMarkerState {
 };
 
 /**
- * @brief Concurrent background Immix GC marking thread.
- *
- * Runs concurrent mark passes parallel to mutator execution, drastically reducing
- * Stop-The-World (STW) pauses during major garbage collection cycles.
+ * Compatibility facade for synchronous, owning-thread STW marking.
+ * Background traversal is intentionally gated off: atomic mark bits do not
+ * make mutable vectors, maps or object fields safe to read concurrently.
+ * Start and FinalizeMarking trace synchronously; mutations between them are
+ * seen by a fresh trace. No worker ever reads the object graph.
  */
 class ConcurrentMarker {
 public:
@@ -38,19 +35,20 @@ public:
     static bool IsEnabled() noexcept;
     static void SetEnabled(bool enabled) noexcept;
 
-    // Start background concurrent marking thread with given initial root set
+    static constexpr bool SupportsConcurrentTraversal() noexcept { return false; }
+
+    // Snapshot root slots (kept relocatable/rooted until Stop) and mark STW.
     void Start(const std::vector<HeapObject*>& roots);
 
-    // Stop and join background worker
+    // Release explicit root slots. Does not sweep.
     void Stop();
 
-    // Write barrier hook called by mutator on pointer mutations during concurrent marking
-    void NotifyWrite(HeapObject* source, TaggedValue value);
+    void NotifyWrite(HeapObject* source, TaggedValue value) noexcept;
 
-    // Drain remaining write barrier buffers and finalize marking during brief STW pause
+    // Fresh STW trace, retaining explicit root slots until Stop.
     void FinalizeMarking();
 
-    // Wait for the background worker to drain the initial worklist
+    // Synchronous compatibility checkpoint.
     void WaitForCompletion();
 
     bool IsActive() const noexcept {
@@ -65,25 +63,13 @@ public:
     size_t WorklistSize() const noexcept;
 
 private:
-    void WorkerLoop();
-    void TraceObject(HeapObject* obj);
+    void Trace();
 
     IsolateHeap& heap_;
     std::atomic<ConcurrentMarkerState> state_{ConcurrentMarkerState::Idle};
-    std::thread worker_;
-
-    mutable std::mutex worklist_mutex_;
-    std::condition_variable cv_work_;
-    std::condition_variable cv_idle_;
-    std::deque<HeapObject*> worklist_;
-
-    mutable std::mutex barrier_mutex_;
-    std::vector<HeapObject*> write_barrier_buffer_;
-    std::vector<HeapObject*> dirty_sources_;
-
-    std::atomic<bool> stop_requested_{false};
+    std::vector<TaggedValue> roots_;
+    size_t registered_roots_{0};
     std::atomic<size_t> marked_count_{0};
-    std::atomic<bool> worker_active_{false};
 };
 
 } // namespace aether

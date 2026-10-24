@@ -189,6 +189,16 @@ private:
     std::string name_;
 };
 
+class PrivateIdentifierExpr : public Expr {
+public:
+    explicit PrivateIdentifierExpr(std::string_view name)
+        : name_(name) {}
+    const std::string& Name() const noexcept { return name_; }
+    void Accept(ASTVisitor* visitor) override;
+private:
+    std::string name_;
+};
+
 class PropertyAssignExpr : public Expr {
 public:
     PropertyAssignExpr(std::unique_ptr<Expr> obj, std::string_view prop, std::unique_ptr<Expr> val)
@@ -478,16 +488,18 @@ private:
 
 class OptionalCallExpr : public Expr {
 public:
-    OptionalCallExpr(std::unique_ptr<Expr> callee, std::vector<std::unique_ptr<Expr>> args)
-        : callee_(std::move(callee)), args_(std::move(args)) {}
+    OptionalCallExpr(std::unique_ptr<Expr> callee, std::vector<std::unique_ptr<Expr>> args, bool is_optional = true)
+        : callee_(std::move(callee)), args_(std::move(args)), is_optional_(is_optional) {}
 
     Expr* Callee() const noexcept { return callee_.get(); }
     const std::vector<std::unique_ptr<Expr>>& Args() const noexcept { return args_; }
+    bool IsOptional() const noexcept { return is_optional_; }
     void Accept(ASTVisitor* visitor) override;
 
 private:
     std::unique_ptr<Expr> callee_;
     std::vector<std::unique_ptr<Expr>> args_;
+    bool is_optional_{true};
 };
 
 class SpreadExpr : public Expr {
@@ -849,6 +861,33 @@ private:
     std::vector<Field> fields_;
 };
 
+class ClassExpr : public Expr {
+public:
+    struct Field {
+        std::string name;
+        std::unique_ptr<Expr> initializer;
+    };
+
+    ClassExpr(std::string_view name, std::string_view super_name, std::vector<std::unique_ptr<FunctionDeclStmt>> methods)
+        : name_(name), super_name_(super_name), methods_(std::move(methods)) {}
+
+    const std::string& Name() const noexcept { return name_; }
+    const std::string& SuperName() const noexcept { return super_name_; }
+    const std::vector<std::unique_ptr<FunctionDeclStmt>>& Methods() const noexcept { return methods_; }
+    void AddMethod(std::unique_ptr<FunctionDeclStmt> method) { methods_.push_back(std::move(method)); }
+    const std::vector<Field>& Fields() const noexcept { return fields_; }
+    void AddField(std::string_view name, std::unique_ptr<Expr> initializer) {
+        fields_.push_back(Field{std::string(name), std::move(initializer)});
+    }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string name_;
+    std::string super_name_;
+    std::vector<std::unique_ptr<FunctionDeclStmt>> methods_;
+    std::vector<Field> fields_;
+};
+
 struct ImportSpecifier {
     std::string imported_name;
     std::string local_name;
@@ -988,6 +1027,8 @@ public:
     virtual void VisitAwait(AwaitExpr* node) = 0;
     virtual void VisitImportMeta(ImportMetaExpr* node) = 0;
     virtual void VisitDynamicImport(DynamicImportExpr* node) = 0;
+    virtual void VisitPrivateIdentifier(PrivateIdentifierExpr* node) { (void)node; }
+    virtual void VisitClassExpr(ClassExpr* node) { (void)node; }
 
     virtual void VisitExprStmt(ExprStmt* node) = 0;
     virtual void VisitVarDecl(VarDeclStmt* node) = 0;
@@ -1063,6 +1104,8 @@ inline void ThrowStmt::Accept(ASTVisitor* v) { v->VisitThrow(this); }
 inline void TryCatchStmt::Accept(ASTVisitor* v) { v->VisitTryCatch(this); }
 inline void ReturnStmt::Accept(ASTVisitor* v) { v->VisitReturn(this); }
 inline void WithStmt::Accept(ASTVisitor* v) { v->VisitWith(this); }
+inline void PrivateIdentifierExpr::Accept(ASTVisitor* v) { v->VisitPrivateIdentifier(this); }
+inline void ClassExpr::Accept(ASTVisitor* v) { v->VisitClassExpr(this); }
 inline void Program::Accept(ASTVisitor* v) { v->VisitProgram(this); }
 
 } // namespace aether

@@ -4,6 +4,8 @@
 #include "aether/common.h"
 #include "aether/value.h"
 #include "aether/heap_object.h"
+#include "aether/memory_budget.h"
+#include <map>
 #include <vector>
 #include <bitset>
 #include <memory>
@@ -77,6 +79,8 @@ class NurserySpace {
 public:
     explicit NurserySpace(size_t semi_space_size = kDefaultNurserySemiSpaceSize);
     ~NurserySpace();
+    NurserySpace(const NurserySpace&) = delete;
+    NurserySpace& operator=(const NurserySpace&) = delete;
 
     void* Allocate(size_t bytes) noexcept;
 
@@ -85,12 +89,19 @@ public:
         return addr >= from_space_start_ && addr < from_space_limit_;
     }
 
+    // Flip after the collector has destroyed dead from-space objects.  The
+    // live bump is passed explicitly so survivors are not discarded.
+    void Flip(uintptr_t live_bump) noexcept;
     void Flip() noexcept;
 
     uintptr_t FromSpaceStart() const noexcept { return from_space_start_; }
     uintptr_t FromSpaceLimit() const noexcept { return from_space_limit_; }
     uintptr_t ToSpaceStart() const noexcept { return to_space_start_; }
     uintptr_t ToSpaceLimit() const noexcept { return to_space_limit_; }
+    bool ContainsToSpace(const void* ptr) const noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        return addr >= to_space_start_ && addr < to_space_limit_;
+    }
 
     size_t BytesAllocated() const noexcept { return bump_ptr_ - from_space_start_; }
     size_t Capacity() const noexcept { return semi_space_size_; }
@@ -152,19 +163,35 @@ public:
 
     void* Allocate(size_t bytes);
     void Sweep();
+    // Allocate returns raw storage. Placement-new users must register only
+    // after successful construction to enable destruction at sweep/shutdown.
+    void RegisterObject(HeapObject* obj, bool charged = false);
+    void DiscardAllocation(void* ptr) noexcept;
+    void DestroyAll() noexcept;
+    void SetBudget(std::shared_ptr<MemoryBudgetState> budget) { budget_ = std::move(budget); }
+    std::vector<HeapObject*> Objects() const;
+    size_t AllocationSize(const void* obj) const noexcept;
+    void ClearMarks() noexcept;
 
     bool Contains(const void* ptr) const noexcept;
-    void MarkObject(HeapObject* obj);
+    void MarkObject(HeapObject* obj, size_t allocation_size = 0);
 
     size_t BlockCount() const noexcept { return blocks_.size(); }
     std::mutex& GetMarkMutex() const noexcept { return mark_mutex_; }
 
 private:
-    void AllocateBlock();
+    bool AllocateBlock();
 
     uint8_t* reservation_start_{nullptr};
     size_t max_size_{0};
-    bool using_reservation_{false};
+    struct Allocation {
+        size_t bytes;
+        bool large;
+        bool constructed{false};
+        bool charged{false};
+    };
+    std::map<void*, Allocation> allocations_;
+    std::shared_ptr<MemoryBudgetState> budget_;
     std::vector<ImmixBlock*> blocks_;
     size_t active_block_index_{0};
     mutable std::mutex mark_mutex_;

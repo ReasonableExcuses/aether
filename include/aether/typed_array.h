@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <string_view>
 #include <vector>
+#include <limits>
+#include <stdexcept>
 
 namespace aether {
 
@@ -20,11 +22,13 @@ class JSArrayBuffer : public JSObject {
 public:
     explicit JSArrayBuffer(size_t byte_length, Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSArrayBuffer, shape),
-          byte_length_(byte_length),
+          storage_(CheckedBufferLength(byte_length), true),
+          data_(nullptr),
+          byte_length_(CheckedBufferLength(byte_length)),
           is_detached_(false),
           owns_data_(true),
           is_shared_(false),
-          max_byte_length_(byte_length),
+          max_byte_length_(CheckedBufferLength(byte_length)),
           is_growable_(false) {
         if (byte_length_ > 0) {
             data_ = new uint8_t[byte_length_]();
@@ -35,11 +39,13 @@ public:
 
     JSArrayBuffer(size_t byte_length, size_t max_byte_length, bool is_shared, Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSArrayBuffer, shape),
-          byte_length_(byte_length),
+          storage_(CheckedBufferAllocationSize(byte_length, max_byte_length), true),
+          data_(nullptr),
+          byte_length_(CheckedBufferLength(byte_length)),
           is_detached_(false),
           owns_data_(true),
           is_shared_(is_shared),
-          max_byte_length_(std::max(byte_length, max_byte_length)),
+          max_byte_length_(CheckedMaximumLength(byte_length, max_byte_length)),
           is_growable_(max_byte_length > 0 && max_byte_length >= byte_length) {
         size_t alloc_size = is_growable_ ? max_byte_length_ : byte_length_;
         if (alloc_size > 0) {
@@ -51,16 +57,18 @@ public:
 
     JSArrayBuffer(uint8_t* external_data, size_t byte_length, bool owns = false, Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSArrayBuffer, shape),
+          storage_(CheckedExternalBuffer(external_data, byte_length), true),
           data_(external_data),
-          byte_length_(byte_length),
+          byte_length_(CheckedBufferLength(byte_length)),
           is_detached_(false),
           owns_data_(owns),
           is_shared_(false),
-          max_byte_length_(byte_length),
+          max_byte_length_(CheckedBufferLength(byte_length)),
           is_growable_(false) {}
 
     JSArrayBuffer(JSArrayBuffer&& other) noexcept
         : JSObject(std::move(other)),
+          storage_(std::move(other.storage_)),
           data_(other.data_),
           byte_length_(other.byte_length_),
           is_detached_(other.is_detached_),
@@ -99,7 +107,7 @@ public:
     bool IsShared() const noexcept { return is_shared_; }
     void SetShared(bool shared) noexcept { is_shared_ = shared; }
     bool IsGrowable() const noexcept { return is_growable_; }
-    size_t MaxByteLength() const noexcept { return is_growable_ ? max_byte_length_ : byte_length_; }
+    size_t MaxByteLength() const noexcept { return is_detached_ ? 0 : (is_growable_ ? max_byte_length_ : byte_length_); }
 
     bool Grow(size_t new_byte_length) noexcept {
         if (!is_growable_ || is_detached_) return false;
@@ -111,9 +119,10 @@ public:
         return true;
     }
 
-    void Detach() noexcept {
+    void Detach() {
         if (is_shared_) return; // SharedArrayBuffer cannot be detached per ECMAScript specification
         if (!is_detached_) {
+            storage_.Resize(0);
             is_detached_ = true;
             if (owns_data_ && data_ != nullptr) {
                 delete[] data_;
@@ -123,27 +132,47 @@ public:
         }
     }
 
-    JSArrayBuffer* Slice(int64_t begin, int64_t end, Shape* shape = nullptr) const {
-        if (is_detached_) return new JSArrayBuffer(0, shape);
-
-        int64_t len = static_cast<int64_t>(byte_length_);
-        int64_t relative_begin = begin < 0 ? std::max<int64_t>(len + begin, 0) : std::min<int64_t>(begin, len);
-        int64_t relative_end = end < 0 ? std::max<int64_t>(len + end, 0) : std::min<int64_t>(end, len);
-        int64_t new_len = std::max<int64_t>(relative_end - relative_begin, 0);
-
-        JSArrayBuffer* copy = nullptr;
-        if (is_shared_) {
-            copy = new JSArrayBuffer(static_cast<size_t>(new_len), static_cast<size_t>(new_len), true, shape);
-        } else {
-            copy = new JSArrayBuffer(static_cast<size_t>(new_len), shape);
-        }
-        if (new_len > 0 && data_ != nullptr) {
-            std::memcpy(copy->Data(), data_ + relative_begin, static_cast<size_t>(new_len));
-        }
-        return copy;
-    }
+    JSArrayBuffer* Slice(int64_t begin, int64_t end, Shape* shape = nullptr) const;
 
 private:
+    static size_t CheckedBufferLength(size_t byte_length) {
+        if (byte_length > kMaxArrayBufferSize) {
+            throw std::length_error("ArrayBuffer exceeds the maximum byte length");
+        }
+        return byte_length;
+    }
+
+    static size_t CheckedMaximumLength(size_t byte_length, size_t max_byte_length) {
+        const size_t checked_byte_length = CheckedBufferLength(byte_length);
+        if (max_byte_length < checked_byte_length) {
+            throw std::length_error("ArrayBuffer maxByteLength is smaller than byteLength");
+        }
+        return CheckedBufferLength(max_byte_length);
+    }
+
+    static size_t CheckedBufferAllocationSize(size_t byte_length, size_t max_byte_length) {
+        const size_t checked_byte_length = CheckedBufferLength(byte_length);
+        const size_t checked_max = CheckedMaximumLength(checked_byte_length, max_byte_length);
+        return (max_byte_length > 0 && checked_max >= checked_byte_length)
+            ? checked_max : checked_byte_length;
+    }
+
+    static size_t CheckedExternalBuffer(uint8_t* external_data, size_t byte_length) {
+        if (byte_length != 0 && external_data == nullptr) {
+            throw std::length_error("external ArrayBuffer storage is null");
+        }
+        return CheckedBufferLength(byte_length);
+    }
+
+    static int64_t NormalizeIndex(int64_t index, int64_t length) noexcept {
+        if (index < 0) {
+            if (index < -length) return 0;
+            return length + index;
+        }
+        return std::min(index, length);
+    }
+
+    MemoryCharge storage_;
     uint8_t* data_{nullptr};
     size_t byte_length_{0};
     bool is_detached_{false};
@@ -216,8 +245,9 @@ public:
     JSTypedArray(TypedArrayKind kind, JSArrayBuffer* buffer, size_t byte_offset, size_t length, Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSTypedArray, shape),
           buffer_(buffer),
-          byte_offset_(byte_offset),
-          byte_length_(length * TypedArrayElementSize(kind)),
+          byte_offset_(CheckedTypedArrayOffset(kind, buffer, byte_offset, length)),
+          byte_length_(CheckedStorageBytes(length, TypedArrayElementSize(kind),
+                                           "TypedArray length overflow")),
           length_(length),
           kind_(kind) {}
 
@@ -251,7 +281,7 @@ public:
     }
 
     JSArrayBuffer* Buffer() const noexcept { return buffer_; }
-    size_t ByteOffset() const noexcept { return byte_offset_; }
+    size_t ByteOffset() const noexcept { return buffer_ && !buffer_->IsDetached() ? byte_offset_ : 0; }
     size_t ByteLength() const noexcept { return (buffer_ && !buffer_->IsDetached()) ? byte_length_ : 0; }
     size_t Length() const noexcept { return (buffer_ && !buffer_->IsDetached()) ? length_ : 0; }
     TypedArrayKind Kind() const noexcept { return kind_; }
@@ -260,7 +290,11 @@ public:
     uint8_t* Data() const noexcept {
         if (!buffer_ || buffer_->IsDetached()) return nullptr;
         uint8_t* raw = buffer_->Data();
-        return raw ? raw + byte_offset_ : nullptr;
+        if (!raw || byte_offset_ > buffer_->ByteLength() ||
+            byte_length_ > buffer_->ByteLength() - byte_offset_) {
+            return nullptr;
+        }
+        return raw + byte_offset_;
     }
 
     TaggedValue GetElement(size_t index) const {
@@ -454,20 +488,37 @@ public:
         }
     }
 
-    JSTypedArray* Subarray(int64_t begin, int64_t end, Shape* shape = nullptr) const {
-        if (!buffer_ || buffer_->IsDetached()) {
-            return new JSTypedArray(kind_, buffer_, 0, 0, shape);
-        }
-        int64_t len = static_cast<int64_t>(length_);
-        int64_t rel_begin = begin < 0 ? std::max<int64_t>(len + begin, 0) : std::min<int64_t>(begin, len);
-        int64_t rel_end = end < 0 ? std::max<int64_t>(len + end, 0) : std::min<int64_t>(end, len);
-        size_t new_len = static_cast<size_t>(std::max<int64_t>(rel_end - rel_begin, 0));
-        size_t new_byte_offset = byte_offset_ + (rel_begin * TypedArrayElementSize(kind_));
-
-        return new JSTypedArray(kind_, buffer_, new_byte_offset, new_len, shape);
-    }
+    JSTypedArray* Subarray(int64_t begin, int64_t end, Shape* shape = nullptr) const;
 
 private:
+    static size_t CheckedTypedArrayOffset(TypedArrayKind kind,
+                                          JSArrayBuffer* buffer,
+                                          size_t byte_offset,
+                                          size_t length) {
+        if (buffer == nullptr) {
+            throw std::length_error("TypedArray requires an ArrayBuffer");
+        }
+        if (kind > TypedArrayKind::BigUint64) throw std::length_error("invalid TypedArray kind");
+        const size_t element_size = TypedArrayElementSize(kind);
+        const size_t byte_length = CheckedStorageBytes(length, element_size,
+                                                        "TypedArray length overflow");
+        if (buffer->IsDetached()) throw std::length_error("TypedArray buffer is detached");
+        if (byte_offset % element_size != 0 ||
+            byte_offset > buffer->ByteLength() ||
+            byte_length > buffer->ByteLength() - byte_offset) {
+            throw std::length_error("TypedArray view is outside its ArrayBuffer");
+        }
+        return byte_offset;
+    }
+
+    static int64_t NormalizeIndex(int64_t index, int64_t length) noexcept {
+        if (index < 0) {
+            if (index < -length) return 0;
+            return length + index;
+        }
+        return std::min(index, length);
+    }
+
     JSArrayBuffer* buffer_{nullptr};
     size_t byte_offset_{0};
     size_t byte_length_{0};
@@ -483,8 +534,8 @@ public:
     JSDataView(JSArrayBuffer* buffer, size_t byte_offset, size_t byte_length, Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSDataView, shape),
           buffer_(buffer),
-          byte_offset_(byte_offset),
-          byte_length_(byte_length) {}
+          byte_offset_(CheckedDataViewOffset(buffer, byte_offset, byte_length)),
+          byte_length_(CheckedDataViewLength(buffer, byte_offset, byte_length)) {}
 
     JSDataView(JSDataView&& other) noexcept
         : JSObject(std::move(other)),
@@ -513,17 +564,23 @@ public:
     }
 
     JSArrayBuffer* Buffer() const noexcept { return buffer_; }
-    size_t ByteOffset() const noexcept { return byte_offset_; }
+    size_t ByteOffset() const noexcept { return buffer_ && !buffer_->IsDetached() ? byte_offset_ : 0; }
     size_t ByteLength() const noexcept { return (buffer_ && !buffer_->IsDetached()) ? byte_length_ : 0; }
 
     uint8_t* Data() const noexcept {
         if (!buffer_ || buffer_->IsDetached()) return nullptr;
         uint8_t* raw = buffer_->Data();
-        return raw ? raw + byte_offset_ : nullptr;
+        if (!raw || byte_offset_ > buffer_->ByteLength() ||
+            byte_length_ > buffer_->ByteLength() - byte_offset_) {
+            return nullptr;
+        }
+        return raw + byte_offset_;
     }
 
     bool CheckBounds(size_t offset, size_t size) const noexcept {
         return buffer_ && !buffer_->IsDetached() &&
+               byte_offset_ <= buffer_->ByteLength() &&
+               byte_length_ <= buffer_->ByteLength() - byte_offset_ &&
                offset <= byte_length_ && size <= byte_length_ - offset;
     }
 
@@ -616,6 +673,26 @@ public:
     }
 
 private:
+    static size_t CheckedDataViewOffset(JSArrayBuffer* buffer,
+                                        size_t byte_offset,
+                                        size_t byte_length) {
+        if (buffer == nullptr || buffer->IsDetached() ||
+            byte_offset > buffer->ByteLength() ||
+            byte_length > buffer->ByteLength() - byte_offset) {
+            throw std::length_error("DataView is outside its ArrayBuffer");
+        }
+        return byte_offset;
+    }
+
+    static size_t CheckedDataViewLength(JSArrayBuffer* buffer,
+                                        size_t byte_offset,
+                                        size_t byte_length) {
+        // Validate through the same subtraction-based range check.  Keeping
+        // this separate makes both constructor initializers overflow-safe.
+        (void)CheckedDataViewOffset(buffer, byte_offset, byte_length);
+        return byte_length;
+    }
+
     static uint16_t Read16(const uint8_t* p, bool le) noexcept {
         if (le) return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
         return (static_cast<uint16_t>(p[0]) << 8) | static_cast<uint16_t>(p[1]);

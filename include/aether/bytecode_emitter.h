@@ -24,6 +24,8 @@ class BytecodeEmitter : public ASTVisitor {
 public:
     BytecodeEmitter() = default;
 
+    // Inhibits collection only during emission. Execute roots the resulting
+    // constants; embedders retaining bytecode across explicit GC must root it.
     std::unique_ptr<BytecodeArray> Emit(ASTNode* root);
     std::unique_ptr<BytecodeArray> EmitFunction(FunctionDeclStmt* func);
 
@@ -61,6 +63,8 @@ public:
     void VisitAwait(AwaitExpr* node) override;
     void VisitImportMeta(ImportMetaExpr* node) override;
     void VisitDynamicImport(DynamicImportExpr* node) override;
+    void VisitPrivateIdentifier(PrivateIdentifierExpr* node) override;
+    void VisitClassExpr(ClassExpr* node) override;
 
     void VisitExprStmt(ExprStmt* node) override;
     void VisitVarDecl(VarDeclStmt* node) override;
@@ -139,6 +143,12 @@ private:
     // Function lookup
     JSFunction* LookupFunction(std::string_view name);
     void EmitBinaryOp(BinaryOp op, uint8_t rhs_reg);
+    void EmitCallArguments(const std::vector<std::unique_ptr<Expr>>& args,
+                           bool& out_has_spread,
+                           uint8_t& out_arr_reg,
+                           uint8_t& out_args_start,
+                           uint8_t& out_arg_count);
+    void CleanupCallArguments(bool has_spread, uint8_t arr_reg, uint8_t args_start, uint8_t arg_count);
 
     BytecodeEmitter* parent_emitter_{nullptr};
     JSObject* super_proto_{nullptr};
@@ -163,6 +173,16 @@ private:
         }
         return false;
     }
+
+    std::unordered_map<std::string, std::string> private_names_map_;
+    std::string LookupPrivateName(std::string_view name) const {
+        auto it = private_names_map_.find(std::string(name));
+        if (it != private_names_map_.end()) return it->second;
+        if (parent_emitter_) return parent_emitter_->LookupPrivateName(name);
+        return std::string(name);
+    }
+    template <typename TClassNode>
+    JSFunction* EmitClassDefinition(TClassNode* node);
 
     // Keep nested function bytecode arrays alive
     std::vector<std::unique_ptr<BytecodeArray>> compiled_routines_;

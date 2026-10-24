@@ -327,7 +327,7 @@ static std::vector<std::string> CanonicalizeLocaleList(TaggedValue locales_val) 
         if (!bcp.is_valid) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("RangeError", "Invalid language tag: " + std::string(tag))));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "Invalid language tag: " + std::string(tag))));
             }
             return false;
         }
@@ -904,7 +904,7 @@ void InitializeIntl(Realm& realm) {
             if (args.empty()) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(
-                        TaggedValue::FromHeapObject(new JSError("TypeError", "missing key argument to Intl.supportedValuesOf")));
+                        TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "missing key argument to Intl.supportedValuesOf")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -925,7 +925,7 @@ void InitializeIntl(Realm& realm) {
 
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("RangeError", "Invalid key: " + key)));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "Invalid key: " + key)));
             }
             return TaggedValue::Undefined();
         })), next_sid);
@@ -962,7 +962,7 @@ void InitializeIntl(Realm& realm) {
         if (opts.style == "currency" && opts.currency.empty()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(
-                    TaggedValue::FromHeapObject(new JSError("TypeError", "currency option is required when style is currency")));
+                    TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "currency option is required when style is currency")));
             }
             return TaggedValue::Undefined();
         }
@@ -1093,6 +1093,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    num_fmt_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(num_fmt_proto));
     num_fmt_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(num_fmt_proto), next_sid);
     intl_obj->SetNamedProperty("NumberFormat", TaggedValue::FromHeapObject(num_fmt_ctor), next_sid);
 
@@ -1222,6 +1223,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    dt_fmt_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(dt_fmt_proto));
     dt_fmt_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(dt_fmt_proto), next_sid);
     intl_obj->SetNamedProperty("DateTimeFormat", TaggedValue::FromHeapObject(dt_fmt_ctor), next_sid);
 
@@ -1299,6 +1301,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    collator_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(collator_proto));
     collator_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(collator_proto), next_sid);
     intl_obj->SetNamedProperty("Collator", TaggedValue::FromHeapObject(collator_ctor), next_sid);
 
@@ -1355,6 +1358,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    plural_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(plural_proto));
     plural_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(plural_proto), next_sid);
     intl_obj->SetNamedProperty("PluralRules", TaggedValue::FromHeapObject(plural_ctor), next_sid);
 
@@ -1421,6 +1425,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    list_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(list_proto));
     list_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(list_proto), next_sid);
     intl_obj->SetNamedProperty("ListFormat", TaggedValue::FromHeapObject(list_ctor), next_sid);
 
@@ -1483,6 +1488,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    rel_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(rel_proto));
     rel_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(rel_proto), next_sid);
     intl_obj->SetNamedProperty("RelativeTimeFormat", TaggedValue::FromHeapObject(rel_ctor), next_sid);
 
@@ -1556,6 +1562,7 @@ void InitializeIntl(Realm& realm) {
             auto* iter_fn = AllocateRuntime<JSNativeFunction>("[Symbol.iterator]", [segments_arr](TaggedValue, const std::vector<TaggedValue>&) -> TaggedValue {
                 return TaggedValue::FromHeapObject(segments_arr);
             }, root);
+            iter_fn->AddCapturedRoot(TaggedValue::FromHeapObject(segments_arr));
             segments_obj->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(iter_fn), next_sid);
 
             return TaggedValue::FromHeapObject(segments_obj);
@@ -1579,6 +1586,7 @@ void InitializeIntl(Realm& realm) {
             auto canon = CanonicalizeLocaleList(val);
             return TaggedValue::FromHeapObject(MakeStringArray(canon, realm));
         })), next_sid);
+    seg_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(seg_proto));
     seg_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(seg_proto), next_sid);
     intl_obj->SetNamedProperty("Segmenter", TaggedValue::FromHeapObject(seg_ctor), next_sid);
 
@@ -2034,7 +2042,7 @@ void InitializeDate(Realm& realm) {
             if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "Date.prototype[@@toPrimitive] called on non-object")));
+                        AllocateRuntime<JSError>("TypeError", "Date.prototype[@@toPrimitive] called on non-object")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2054,7 +2062,7 @@ void InitializeDate(Realm& realm) {
             } else {
                 if (Interpreter::Current()) {
                     Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                        new JSError("TypeError", "Invalid hint in Date.prototype[@@toPrimitive]")));
+                        AllocateRuntime<JSError>("TypeError", "Invalid hint in Date.prototype[@@toPrimitive]")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2076,11 +2084,12 @@ void InitializeDate(Realm& realm) {
             }
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    new JSError("TypeError", "Cannot convert object to primitive value")));
+                    AllocateRuntime<JSError>("TypeError", "Cannot convert object to primitive value")));
             }
             return TaggedValue::Undefined();
         })), next_sid);
 
+    date_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(date_proto));
     date_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(date_proto), next_sid);
     date_ctor->SetNamedProperty("length", TaggedValue::FromSmi(7), next_sid);
     date_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(date_ctor), next_sid);
@@ -2251,6 +2260,8 @@ void InitializeNumber(Realm& realm) {
             return TaggedValue::FromBoolean(std::isfinite(d) && std::floor(d) == d && d >= -9007199254740991.0 && d <= 9007199254740991.0);
         })), next_sid);
 
+    number_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
+    number_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(number_proto));
     number_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(number_proto), next_sid);
     number_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(number_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Number", TaggedValue::FromHeapObject(number_ctor), next_sid);
@@ -2365,7 +2376,7 @@ void InitializeBoolean(Realm& realm) {
                 if (o->HasNamedProperty("__boolean_data__")) return o->GetNamedProperty("__boolean_data__");
             }
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.valueOf called on incompatible receiver")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method Boolean.prototype.valueOf called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         })), next_sid);
@@ -2381,13 +2392,13 @@ void InitializeBoolean(Realm& realm) {
                     b = o->GetNamedProperty("__boolean_data__").AsBoolean();
                 } else {
                     if (Interpreter::Current()) {
-                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
+                        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
                     }
                     return TaggedValue::Undefined();
                 }
             } else {
                 if (Interpreter::Current()) {
-                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method Boolean.prototype.toString called on incompatible receiver")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2406,6 +2417,8 @@ void InitializeBoolean(Realm& realm) {
         return TaggedValue::FromBoolean(b);
     });
 
+    boolean_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
+    boolean_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(boolean_proto));
     boolean_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(boolean_proto), next_sid);
     boolean_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Boolean", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
@@ -2433,7 +2446,7 @@ void InitializeBigInt(Realm& realm) {
                 if (o->HasNamedProperty("__bigint_data__")) return o->GetNamedProperty("__bigint_data__");
             }
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method BigInt.prototype.valueOf called on incompatible receiver")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method BigInt.prototype.valueOf called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         })), next_sid);
@@ -2453,16 +2466,16 @@ void InitializeBigInt(Realm& realm) {
                 }
             }
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "Method BigInt.prototype.toString called on incompatible receiver")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Method BigInt.prototype.toString called on incompatible receiver")));
             }
             return TaggedValue::Undefined();
         })), next_sid);
 
-    auto* bigint_ctor = make_native("BigInt", [bigint_proto, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* bigint_ctor = make_native("BigInt", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
         if (is_construct) {
             if (Interpreter::Current()) {
-                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("TypeError", "BigInt is not a constructor")));
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "BigInt is not a constructor")));
             }
             return TaggedValue::Undefined();
         }
@@ -2480,7 +2493,7 @@ void InitializeBigInt(Realm& realm) {
             double d = v.AsDouble();
             if (std::isnan(d) || std::isinf(d) || std::trunc(d) != d) {
                 if (Interpreter::Current()) {
-                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("RangeError", "The number cannot be converted to a BigInt because it is not an integer")));
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "The number cannot be converted to a BigInt because it is not an integer")));
                 }
                 return TaggedValue::Undefined();
             }
@@ -2496,7 +2509,7 @@ void InitializeBigInt(Realm& realm) {
                 return TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(n));
             } catch (...) {
                 if (Interpreter::Current()) {
-                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(new JSError("SyntaxError", "Cannot convert to BigInt")));
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("SyntaxError", "Cannot convert to BigInt")));
                 }
                 return TaggedValue::Undefined();
             }

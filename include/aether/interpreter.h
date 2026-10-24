@@ -9,6 +9,8 @@
 
 namespace aether {
 
+class HandleScope;
+class IsolateHeap;
 
 struct ExceptionHandler {
     const uint8_t* target_pc{nullptr};
@@ -83,6 +85,15 @@ private:
 class Interpreter {
 public:
     Interpreter() = default;
+    ~Interpreter();
+    Interpreter(const Interpreter&) = delete;
+    Interpreter& operator=(const Interpreter&) = delete;
+
+    // Call at Agent startup, with its isolate current, before imposing a small
+    // budget. Execute also initializes lazily for standalone interpreters.
+    void InitializeResourceExceptions();
+    void SetResourceException(TaggedValue exception);
+    void ReportResourceError(std::string_view message = "Memory budget exceeded") noexcept;
 
     /**
      * @brief Executes a bytecode array and returns the resulting TaggedValue.
@@ -142,7 +153,9 @@ public:
 
     static Interpreter* Current() noexcept { return s_current_interpreter_; }
     static void SetCurrent(Interpreter* interp) noexcept { s_current_interpreter_ = interp; }
-    LexicalEnvironment* GetLastEnvironment() const noexcept { return last_environment_; }
+    LexicalEnvironment* GetLastEnvironment() const noexcept {
+        return last_environment_root_.IsHeapObject() ? last_environment_root_.As<LexicalEnvironment>() : nullptr;
+    }
     TaggedValue GetNewTarget() const noexcept { return current_new_target_; }
     void SetNewTarget(TaggedValue target) noexcept { current_new_target_ = target; }
     bool IsStrictMode() const noexcept { return is_strict_mode_; }
@@ -163,10 +176,29 @@ private:
     std::unique_ptr<Shape> root_shape_;
     bool has_pending_exception_{false};
     TaggedValue pending_exception_{TaggedValue::Undefined()};
-    LexicalEnvironment* last_environment_{nullptr};
+    TaggedValue last_environment_root_{TaggedValue::Undefined()};
     bool is_strict_mode_{false};
+    JSObject* last_lookup_base_{nullptr};
+    std::string last_lookup_name_{};
+    int last_lookup_reg_{-1};
+    void ClearLastLookup() noexcept {
+        last_lookup_base_ = nullptr;
+        last_lookup_name_.clear();
+        last_lookup_reg_ = -1;
+    }
     uint32_t call_depth_{0};
-    static constexpr uint32_t kMaxCallDepth = 5000;
+    static constexpr uint32_t kMaxCallDepth = 256;
+    IsolateHeap* root_heap_{nullptr};
+    TaggedValue resource_exception_{TaggedValue::Undefined()};
+    TaggedValue stack_exception_{TaggedValue::Undefined()};
+    TaggedValue last_result_{TaggedValue::Undefined()};
+    HandleScope* instruction_roots_{nullptr};
+    void EnsureRoots();
+    void SnapshotState(HandleScope& roots, const ExecutionFrame* frame = nullptr);
+    TaggedValue PublishResult(TaggedValue result);
+    TaggedValue ExecuteImpl(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env);
+    TaggedValue ResumeGeneratorImpl(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection, bool* out_is_await);
+    ExecutionFrame* top_level_frame_{nullptr};
     TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr, bool* out_is_await = nullptr);
 };
 

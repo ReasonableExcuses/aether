@@ -5,6 +5,10 @@
 #include "aether/value.h"
 #include "aether/heap_object.h"
 #include "aether/gc.h"
+#include "aether/memory_budget.h"
+#include <deque>
+#include <map>
+#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <functional>
@@ -15,6 +19,19 @@ namespace aether {
 class IsolateHeap;
 class HandleScope;
 class ConcurrentMarker;
+
+// Protect raw native temporaries, constructor arguments and partially built
+// objects. Exiting does NOT collect: publish/root the result before a safepoint.
+class NoGCScope {
+public:
+    explicit NoGCScope(IsolateHeap& heap);
+    explicit NoGCScope(IsolateHeap* heap = nullptr);
+    ~NoGCScope();
+    NoGCScope(const NoGCScope&) = delete;
+    NoGCScope& operator=(const NoGCScope&) = delete;
+private:
+    IsolateHeap* heap_;
+};
 
 template <typename T>
 class Handle {
@@ -49,10 +66,12 @@ class HandleScope {
 public:
     explicit HandleScope(IsolateHeap& heap);
     ~HandleScope();
+    HandleScope(const HandleScope&) = delete;
+    HandleScope& operator=(const HandleScope&) = delete;
 
     template <typename T>
     Handle<T> CreateHandle(T* obj) {
-        TaggedValue val = TaggedValue::FromHeapObject(obj);
+        TaggedValue val = obj ? TaggedValue::FromHeapObject(obj) : TaggedValue::Null();
         slots_.push_back(val);
         return Handle<T>(&slots_.back());
     }
@@ -62,12 +81,13 @@ public:
         return Handle<HeapObject>(&slots_.back());
     }
 
-    std::vector<TaggedValue>& Slots() noexcept { return slots_; }
+    std::deque<TaggedValue>& Slots() noexcept { return slots_; }
     HandleScope* PrevScope() const noexcept { return prev_scope_; }
 
 private:
+    friend class IsolateHeap;
     IsolateHeap& heap_;
-    std::vector<TaggedValue> slots_;
+    std::deque<TaggedValue> slots_;
     HandleScope* prev_scope_{nullptr};
 };
 
@@ -79,41 +99,25 @@ public:
     explicit IsolateHeap(size_t nursery_size = kDefaultNurserySemiSpaceSize);
     ~IsolateHeap();
 
-    // Allocation interface
+    // Precise managed allocation. Root all live values across allocation. For
+    // opaque constructor/native arguments use NoGCScope. Constructors always
+    // run with GC inhibited. Only argument-free/non-pointer scalar allocation
+    // may automatically move the nursery; other allocation pressure uses STW
+    // nonmoving MajorGC, with direct object/TaggedValue arguments rooted.
     template <typename T, typename... Args>
     T* Allocate(Args&&... args) {
-        size_t bytes = sizeof(T);
-        // Align to 8 bytes
-        bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
-
-        void* mem = nursery_.Allocate(bytes);
-        if (AETHER_UNLIKELY(!mem)) {
-            // Nursery exhausted: Trigger Minor GC
-            MinorGC();
-            mem = nursery_.Allocate(bytes);
-            if (AETHER_UNLIKELY(!mem)) {
-                // Nursery still full, allocate directly in Old Generation
-                mem = old_gen_.Allocate(bytes);
-                T* obj = new (mem) T(std::forward<Args>(args)...);
-                obj->SetOld(true);
-                return obj;
-            }
-        }
-
-        T* obj = new (mem) T(std::forward<Args>(args)...);
-        obj->SetOld(false);
-        return obj;
+        return AllocateImpl<T>(false, std::forward<Args>(args)...);
     }
 
     template <typename T, typename... Args>
     T* AllocateOld(Args&&... args) {
-        size_t bytes = sizeof(T);
-        bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
-        void* mem = old_gen_.Allocate(bytes);
-        assert(mem != nullptr && "Old Generation allocation failed");
-        T* obj = new (mem) T(std::forward<Args>(args)...);
-        obj->SetOld(true);
-        return obj;
+        return AllocateImpl<T>(true, std::forward<Args>(args)...);
+    }
+
+    template <typename T, typename... Args>
+    T* AllocateStable(Args&&... args) {
+        NoGCScope guard(*this);
+        return AllocateOld<T>(std::forward<Args>(args)...);
     }
 
     // Generational Write Barrier
@@ -122,7 +126,6 @@ public:
             HeapObject* target = value.AsHeapObject();
             if (target->IsYoung()) {
                 card_table_.MarkCard(source);
-                remembered_old_objects_.insert(source);
             }
         }
         NotifyConcurrentWrite(source, value);
@@ -135,12 +138,23 @@ public:
     void MajorGC(); // Full Mark-Sweep
     void StartConcurrentMark();
     void FinalizeConcurrentGC();
+    // Owning thread only, all native temporaries published/rooted; nonmoving.
+    // Returns false when inside NoGCScope. No deferred collection on scope exit.
+    bool CollectAtSafepoint();
+    bool GCAllowed() const noexcept { return no_gc_depth_ == 0 && !collecting_; }
+    void AssertOwnerThread() const;
 
     static IsolateHeap* Current() noexcept;
     static void SetCurrent(IsolateHeap* heap) noexcept;
+    // Thread-owned fallback heap (collectible at explicit safe boundaries and
+    // destroyed at thread exit). Prefer an explicit IsolateScope in embedders.
+    // Roots belong to the allocation heap; moving a value to another isolate
+    // does not transfer ownership or establish a root in this fallback heap.
+    static IsolateHeap& RuntimeFallbackHeap();
 
     // Root management
     void PushHandleScope(HandleScope* scope) noexcept {
+        scope->prev_scope_ = top_scope_;
         top_scope_ = scope;
     }
 
@@ -171,9 +185,92 @@ public:
     size_t MinorGCCount() const noexcept { return minor_gc_count_; }
     size_t MajorGCCount() const noexcept { return major_gc_count_; }
 
-private:
-    void EvacuateObject(TaggedValue& slot);
+    // Heap budget and pressure
+    size_t TotalAllocatedBytes() const noexcept { return budget_->ChargedBytes(); }
+    size_t ManagedBytes() const noexcept { return budget_->ManagedBytes(); }
+    size_t HeapBudget() const noexcept { return budget_->TotalLimit(); }
+    void SetHeapBudget(size_t budget) noexcept { budget_->SetTotalLimit(budget); }
+    std::shared_ptr<MemoryBudgetState> BudgetState() const noexcept { return budget_; }
+    double HeapPressure() const noexcept {
+        return HeapBudget() > 0 ? static_cast<double>(TotalAllocatedBytes()) / static_cast<double>(HeapBudget()) * 100.0 : 0.0;
+    }
 
+    size_t PendingFinalizationCount() const noexcept { return finalizers_.size(); }
+    // Called by the owning Agent outside sweep. Values stay rooted for the
+    // entire call; the sink must install its own roots if scheduling later.
+    size_t DrainFinalizationQueue(const std::function<void(TaggedValue, TaggedValue)>& sink);
+
+    // Mark-only STW entry used by the compatibility ConcurrentMarker facade.
+    size_t MarkFromRoots(const std::vector<HeapObject*>& roots, bool process_weak = false);
+
+private:
+    friend class NoGCScope;
+    template <typename A>
+    void RootArgument(HandleScope& roots, const A& arg) {
+        using U = std::remove_cvref_t<A>;
+        if constexpr (std::is_same_v<U, TaggedValue>) roots.CreateHandle(arg);
+        else if constexpr (std::is_pointer_v<U>) {
+            if constexpr (std::is_base_of_v<HeapObject, std::remove_pointer_t<U>>) {
+                if (arg) roots.CreateHandle(TaggedValue::FromHeapObject(arg));
+            }
+        } else if constexpr (std::is_same_v<U, std::vector<TaggedValue>>) {
+            for (auto value : arg) roots.CreateHandle(value);
+        }
+    }
+
+    template <typename T, typename... Args>
+    T* AllocateImpl(bool old, Args&&... args) {
+        static_assert(std::is_base_of_v<HeapObject, T>);
+        static_assert(alignof(T) <= kObjectAlignment, "over-aligned heap object");
+        AssertOwnerThread();
+        HandleScope argument_roots(*this);
+        (RootArgument(argument_roots, args), ...);
+        constexpr size_t bytes = (sizeof(T) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+        // Even a scalar lvalue can refer into a rooted object that moves.
+        constexpr bool movable_args = ((!std::is_lvalue_reference_v<Args> &&
+            (std::is_arithmetic_v<std::remove_cvref_t<Args>> ||
+            std::is_same_v<std::remove_cvref_t<Args>, std::nullptr_t> ||
+            std::is_same_v<std::remove_cvref_t<Args>, Shape*>)) && ...);
+        ReserveManaged(bytes);
+        void* mem = nullptr;
+        T* obj = nullptr;
+        try {
+            if (!old) {
+                mem = nursery_.Allocate(bytes);
+                if (!mem && GCAllowed() && movable_args) {
+                    MinorGC();
+                    mem = nursery_.Allocate(bytes);
+                }
+            }
+            if (!mem) { old = true; mem = old_gen_.Allocate(bytes); }
+            if (!mem) throw std::bad_alloc();
+            NoGCScope construction(*this);
+            // Member MemoryCharges must capture THIS heap even when callers
+            // invoke a heap directly while another isolate is current.
+            IsolateHeap* previous = Current();
+            SetCurrent(this);
+            try { obj = new (mem) T(std::forward<Args>(args)...); }
+            catch (...) { SetCurrent(previous); throw; }
+            SetCurrent(previous);
+            obj->SetOld(old);
+            if (old) old_gen_.RegisterObject(obj, true);
+            else young_.emplace(obj, bytes);
+            return obj;
+        } catch (...) {
+            if (obj) static_cast<HeapObject*>(obj)->~HeapObject();
+            if (old && mem) old_gen_.DiscardAllocation(mem);
+            budget_->ReleaseManaged(bytes);
+            throw;
+        }
+    }
+    void ReserveManaged(size_t bytes);
+    void VisitRoots(const std::function<void(TaggedValue&)>& visitor);
+    std::vector<HeapObject*> Trace(const std::vector<HeapObject*>& roots);
+    void ProcessWeak(const std::vector<HeapObject*>& live,
+                     const std::function<HeapObject*(HeapObject*)>& resolve);
+
+    std::shared_ptr<MemoryBudgetState> budget_{std::make_shared<MemoryBudgetState>()};
+    IsolateHeap* previous_current_heap_{nullptr};
     NurserySpace nursery_;
     ImmixSpace old_gen_;
     CardTable card_table_;
@@ -181,16 +278,21 @@ private:
 
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;
-    std::unordered_set<HeapObject*> remembered_old_objects_;
-    std::vector<HeapObject*> previously_marked_objects_;
+    std::map<HeapObject*, size_t> young_;
+    struct Finalization { TaggedValue callback; TaggedValue held_value; };
+    std::deque<Finalization> finalizers_;
 
     size_t minor_gc_count_{0};
     size_t major_gc_count_{0};
-    uintptr_t to_space_bump_{0};
+    size_t no_gc_depth_{0};
+    bool collecting_{false};
+    bool draining_finalizers_{false};
+    const std::thread::id owner_thread_{std::this_thread::get_id()};
 };
 
 inline HandleScope::HandleScope(IsolateHeap& heap)
     : heap_(heap), prev_scope_(nullptr) {
+    heap_.AssertOwnerThread();
     heap_.PushHandleScope(this);
 }
 
@@ -221,12 +323,20 @@ private:
 
 using Heap = IsolateHeap;
 
+/**
+ * @brief Enterprise-grade allocation facade.
+ *
+ * Stable, owned runtime allocation. Never collects inside this operation, since
+ * native expressions can hold unpublished raw pointers. Objects are NOT roots:
+ * install handles/extra roots and call CollectAtSafepoint at a safe boundary.
+ * Long-lived native captures need explicit roots for as long as they are used.
+ */
 template <typename T, typename... Args>
 inline T* AllocateRuntime(Args&&... args) {
     if (IsolateHeap* h = IsolateHeap::Current()) {
-        return h->Allocate<T>(std::forward<Args>(args)...);
+        return h->AllocateStable<T>(std::forward<Args>(args)...);
     }
-    return new T(std::forward<Args>(args)...);
+    return IsolateHeap::RuntimeFallbackHeap().AllocateStable<T>(std::forward<Args>(args)...);
 }
 
 } // namespace aether

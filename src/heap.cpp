@@ -1,6 +1,9 @@
 #include "aether/heap.h"
 #include "aether/concurrent_marker.h"
+#include "aether/advanced_intrinsics.h"
 #include <deque>
+#include <cstring>
+#include <stdexcept>
 
 namespace aether {
 
@@ -8,6 +11,43 @@ static thread_local IsolateHeap* s_current_heap_{nullptr};
 
 IsolateHeap* IsolateHeap::Current() noexcept { return s_current_heap_; }
 void IsolateHeap::SetCurrent(IsolateHeap* heap) noexcept { s_current_heap_ = heap; }
+
+std::shared_ptr<MemoryBudgetState> CurrentMemoryBudgetState() noexcept {
+    return IsolateHeap::Current() ? IsolateHeap::Current()->BudgetState() : nullptr;
+}
+
+NoGCScope::NoGCScope(IsolateHeap& heap) : NoGCScope(&heap) {}
+NoGCScope::NoGCScope(IsolateHeap* heap) : heap_(heap ? heap : IsolateHeap::Current()) {
+    if (heap_) {
+        heap_->AssertOwnerThread();
+        ++heap_->no_gc_depth_;
+    }
+}
+NoGCScope::~NoGCScope() { if (heap_) --heap_->no_gc_depth_; }
+
+namespace {
+struct CollectionScope {
+    explicit CollectionScope(bool& active) : active(active) { active = true; }
+    ~CollectionScope() { active = false; }
+    bool& active;
+};
+}
+
+void IsolateHeap::AssertOwnerThread() const {
+    if (owner_thread_ != std::this_thread::get_id()) {
+        throw std::logic_error("Isolate heap accessed from a non-owning thread");
+    }
+}
+
+IsolateHeap& IsolateHeap::RuntimeFallbackHeap() {
+    static thread_local std::unique_ptr<IsolateHeap> fallback;
+    if (!fallback) {
+        IsolateHeap* previous = Current();
+        fallback = std::make_unique<IsolateHeap>();
+        SetCurrent(previous);
+    }
+    return *fallback;
+}
 
 void RecordWriteBarrier(HeapObject* source, TaggedValue value) {
     if (s_current_heap_) {
@@ -19,127 +59,188 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
       card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
-    s_current_heap_ = this;
+    old_gen_.SetBudget(budget_);
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
     }
     concurrent_marker_ = std::make_unique<ConcurrentMarker>(*this);
+    previous_current_heap_ = s_current_heap_;
+    s_current_heap_ = this;
 }
 
 IsolateHeap::~IsolateHeap() {
     if (concurrent_marker_) {
         concurrent_marker_->Stop();
     }
+    collecting_ = true;
+    for (auto& [obj, bytes] : young_) {
+        obj->~HeapObject();
+        budget_->ReleaseManaged(bytes);
+    }
+    young_.clear();
+    old_gen_.DestroyAll();
     if (s_current_heap_ == this) {
-        s_current_heap_ = nullptr;
+        s_current_heap_ = previous_current_heap_;
     }
 }
 
-void IsolateHeap::EvacuateObject(TaggedValue& slot) {
-    if (!slot.IsHeapObject()) return;
-
-    HeapObject* obj = slot.AsHeapObject();
-    if (!nursery_.Contains(obj)) return; // Already tenured in Old Generation
-
-    if (obj->IsForwarded()) {
-        slot = TaggedValue::FromHeapObject(obj->GetForwardedAddress());
-        return;
+void IsolateHeap::ReserveManaged(size_t bytes) {
+    if (collecting_) throw std::logic_error("Allocation during GC/destruction");
+    if (budget_->TryReserveManaged(bytes)) return;
+    // No moving collection here: constructor argument roots are snapshots of
+    // raw parameters. Runtime/native allocation uses NoGCScope and must retry
+    // only after publishing its temporaries at a safe boundary.
+    if (GCAllowed()) {
+        MajorGC();
+        if (budget_->TryReserveManaged(bytes)) return;
     }
+    throw std::length_error("Aether managed heap budget exceeded");
+}
 
-    size_t obj_size = obj->ObjectSize();
-    obj_size = (obj_size + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
+    for (HandleScope* scope = top_scope_; scope; scope = scope->PrevScope()) {
+        for (auto& value : scope->Slots()) visitor(value);
+    }
+    for (auto* root : extra_roots_) if (root) visitor(*root);
+    for (auto& entry : finalizers_) {
+        visitor(entry.callback);
+        visitor(entry.held_value);
+    }
+}
 
-    obj->IncrementAge();
-    if (obj->GetAge() >= kTenuringAgeThreshold) {
-        // Tenure object into Immix Old Generation
-        void* old_mem = old_gen_.Allocate(obj_size);
-        assert(old_mem != nullptr && "Old Generation out of memory");
-        HeapObject* tenured = obj->RelocateTo(old_mem);
-        tenured->SetOld(true);
-        obj->SetForwardedAddress(tenured);
-        slot = TaggedValue::FromHeapObject(tenured);
-    } else {
-        // Evacuate object into Nursery To-space
-        uintptr_t to_limit = nursery_.ToSpaceLimit();
+std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& roots) {
+    old_gen_.ClearMarks();
+    for (auto& [obj, bytes] : young_) obj->SetMarked(false);
+    std::unordered_set<HeapObject*> seen;
+    std::vector<HeapObject*> live;
+    auto mark = [&](HeapObject* obj) {
+        if (obj && seen.insert(obj).second) {
+            live.push_back(obj);
+            obj->SetMarked(true);
+        }
+    };
+    auto visit = [&](TaggedValue& slot) { if (slot.IsHeapObject()) mark(slot.AsHeapObject()); };
+    VisitRoots(visit);
+    for (auto* root : roots) mark(root);
+    size_t scanned = 0;
+    for (;;) {
+        while (scanned < live.size()) {
+            HeapObject* obj = live[scanned++];
+            old_gen_.MarkObject(obj);
+            obj->IteratePointers(visit);
+        }
+        const size_t before = live.size();
+        // Repeat until no ephemeron adds a strong edge, including newly
+        // discovered maps and chains whose keys become reachable via values.
+        for (size_t i = 0; i < live.size(); ++i) {
+            if (live[i]->IsWeakMap()) {
+                static_cast<JSWeakMap*>(live[i])->TraceEphemerons(
+                    [&](HeapObject* key) { return seen.contains(key); }, visit);
+            }
+        }
+        if (live.size() == before) break;
+    }
+    return live;
+}
 
-        if (to_space_bump_ + obj_size <= to_limit) {
-            void* to_mem = reinterpret_cast<void*>(to_space_bump_);
-            to_space_bump_ += obj_size;
-            HeapObject* evacuated = obj->RelocateTo(to_mem);
-            evacuated->SetOld(false);
-            obj->SetForwardedAddress(evacuated);
-            slot = TaggedValue::FromHeapObject(evacuated);
-        } else {
-            // To-space exhausted during scavenge, promote to Old Gen
-            void* old_mem = old_gen_.Allocate(obj_size);
-            HeapObject* tenured = obj->RelocateTo(old_mem);
-            tenured->SetOld(true);
-            obj->SetForwardedAddress(tenured);
-            slot = TaggedValue::FromHeapObject(tenured);
+void IsolateHeap::ProcessWeak(const std::vector<HeapObject*>& live,
+                             const std::function<HeapObject*(HeapObject*)>& resolve) {
+    for (auto* obj : live) {
+        if (obj->IsWeakRef()) {
+            auto* weak = static_cast<JSWeakRef*>(obj);
+            weak->SetTarget(resolve(weak->Target()));
+        } else if (obj->IsWeakMap()) {
+            static_cast<JSWeakMap*>(obj)->ResolveWeakKeys(resolve);
+        } else if (obj->IsWeakSet()) {
+            static_cast<JSWeakSet*>(obj)->ResolveWeakEntries(resolve);
+        } else if (obj->IsFinalizationRegistry()) {
+            static_cast<JSFinalizationRegistry*>(obj)->ProcessWeakTargets(resolve,
+                [this](TaggedValue callback, TaggedValue held) {
+                    finalizers_.push_back({callback, held});
+                });
         }
     }
 }
 
 void IsolateHeap::MinorGC() {
-    to_space_bump_ = nursery_.ToSpaceStart();
-    uintptr_t scan_ptr = to_space_bump_;
+    AssertOwnerThread();
+    if (!GCAllowed()) return;
+    CollectionScope collecting(collecting_);
+    // Until every mutation path has a complete barrier, scan all tenured
+    // objects. This is conservative for a minor cycle, not permanent rooting.
+    auto live = Trace(old_gen_.Objects());
+    std::unordered_set<HeapObject*> alive(live.begin(), live.end());
+    ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
+        return alive.contains(obj) ? obj : nullptr;
+    });
 
-    // 1. Evacuate roots from all active HandleScopes
-    HandleScope* scope = top_scope_;
-    while (scope != nullptr) {
-        for (TaggedValue& root_val : scope->Slots()) {
-            EvacuateObject(root_val);
-        }
-        scope = scope->PrevScope();
-    }
-
-    // 2. Evacuate extra roots
-    for (TaggedValue* root_ptr : extra_roots_) {
-        if (root_ptr) {
-            EvacuateObject(*root_ptr);
-        }
-    }
-
-    // 3. Scan Remembered Set (Old-to-Young references recorded in CardTable)
-    for (auto it = remembered_old_objects_.begin(); it != remembered_old_objects_.end(); ) {
-        HeapObject* old_obj = *it;
-        bool has_young_reference = false;
-        old_obj->IteratePointers([this, &has_young_reference](TaggedValue& slot) {
-            if (slot.IsHeapObject() && slot.AsHeapObject()->IsYoung()) {
-                EvacuateObject(slot);
-                if (slot.IsHeapObject() && slot.AsHeapObject()->IsYoung()) {
-                    has_young_reference = true;
-                }
+    struct Move { HeapObject* source; HeapObject* destination; bool old; };
+    std::vector<Move> moves;
+    moves.reserve(young_.size());
+    std::map<HeapObject*, HeapObject*> forwarding;
+    std::map<HeapObject*, size_t> survivors;
+    uintptr_t bump = nursery_.ToSpaceStart();
+    // Reserve all destinations and metadata before the first move. OS OOM
+    // leaves the original graph intact. RelocateTo must be a nonthrowing move.
+    try {
+        for (auto& [obj, bytes] : young_) {
+            if (!alive.contains(obj)) continue;
+            bool old = obj->GetAge() + 1 >= kTenuringAgeThreshold;
+            auto* destination = old ? static_cast<HeapObject*>(old_gen_.Allocate(bytes))
+                : reinterpret_cast<HeapObject*>(bump);
+            moves.push_back({obj, destination, old});
+            forwarding.emplace(obj, destination);
+            if (!old) {
+                assert(bytes <= nursery_.ToSpaceLimit() - bump);
+                bump += bytes;
+                survivors.emplace(destination, bytes);
             }
-        });
-        if (!has_young_reference) {
-            it = remembered_old_objects_.erase(it);
-        } else {
-            ++it;
         }
+    } catch (...) {
+        for (auto& move : moves) if (move.old) old_gen_.DiscardAllocation(move.destination);
+        throw;
     }
-
-    // 4. Cheney-style breadth-first traversal in To-space
-    while (scan_ptr < to_space_bump_) {
-        HeapObject* obj = reinterpret_cast<HeapObject*>(scan_ptr);
-        size_t size = obj->ObjectSize();
-        if (size == 0) break;
-        size = (size + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
-
-        obj->IteratePointers([this](TaggedValue& child) {
-            EvacuateObject(child);
-        });
-
-        scan_ptr += size;
+    auto resolve = [&](HeapObject* obj) -> HeapObject* {
+        auto it = forwarding.find(obj);
+        return it == forwarding.end() ? obj : it->second;
+    };
+    std::function<void(TaggedValue&)> relocate = [&](TaggedValue& slot) {
+        if (slot.IsHeapObject()) slot = TaggedValue::FromHeapObject(resolve(slot.AsHeapObject()));
+    };
+    std::function<HeapObject*(HeapObject*)> resolve_weak = resolve;
+    std::function<bool(HeapObject*)> all_keys_live = [](HeapObject*) { return true; };
+    // All core nursery RelocateTo implementations move noexcept C++ members.
+    // A custom object violating this contract cannot be safely recovered after
+    // a partial move; fail closed rather than expose an inconsistent heap.
+    try {
+        for (auto& move : moves) {
+            HeapObject* moved = move.source->RelocateTo(move.destination);
+            assert(moved == move.destination);
+            moved->IncrementAge();
+            moved->SetOld(move.old);
+            if (move.old) old_gen_.RegisterObject(moved, true);
+        }
+        VisitRoots(relocate);
+        for (auto*& obj : live) obj = resolve(obj);
+        for (auto* obj : live) {
+            // Includes promoted survivors: their children must be relocated.
+            obj->IteratePointers(relocate);
+            if (obj->IsWeakMap()) {
+                static_cast<JSWeakMap*>(obj)->TraceEphemerons(all_keys_live, relocate);
+            }
+        }
+        ProcessWeak(live, resolve_weak);
+    } catch (...) {
+        std::terminate();
     }
-
-    // 5. Flip semi-spaces and re-synchronize card table with remembered set
-    nursery_.Flip();
+    for (auto& [obj, bytes] : young_) {
+        obj->~HeapObject(); // also destroys the moved-from C++ object
+        if (!forwarding.contains(obj)) budget_->ReleaseManaged(bytes);
+    }
+    young_.swap(survivors);
+    nursery_.Flip(bump);
     card_table_.Clear();
-    for (HeapObject* old_obj : remembered_old_objects_) {
-        card_table_.MarkCard(old_obj);
-    }
-    minor_gc_count_++;
+    ++minor_gc_count_;
 }
 
 void IsolateHeap::NotifyConcurrentWrite(HeapObject* source, TaggedValue value) noexcept {
@@ -153,112 +254,81 @@ ConcurrentMarker* IsolateHeap::GetConcurrentMarker() noexcept {
 }
 
 void IsolateHeap::StartConcurrentMark() {
-    if (!concurrent_marker_) return;
-
-    // Reset marks from previous cycle
-    for (HeapObject* obj : previously_marked_objects_) {
-        obj->SetMarked(false);
-    }
-    previously_marked_objects_.clear();
-
-    std::vector<HeapObject*> roots;
-    HandleScope* scope = top_scope_;
-    while (scope != nullptr) {
-        for (TaggedValue& root_val : scope->Slots()) {
-            if (root_val.IsHeapObject()) {
-                roots.push_back(root_val.AsHeapObject());
-            }
-        }
-        scope = scope->PrevScope();
-    }
-
-    for (TaggedValue* root_ptr : extra_roots_) {
-        if (root_ptr && root_ptr->IsHeapObject()) {
-            roots.push_back(root_ptr->AsHeapObject());
-        }
-    }
-
-    concurrent_marker_->Start(roots);
+    AssertOwnerThread();
+    if (GCAllowed() && concurrent_marker_) concurrent_marker_->Start({});
 }
 
 void IsolateHeap::FinalizeConcurrentGC() {
-    if (!concurrent_marker_) return;
-
-    concurrent_marker_->FinalizeMarking();
-    old_gen_.Sweep();
-    major_gc_count_++;
+    AssertOwnerThread();
+    if (!GCAllowed()) return;
+    // A fresh STW trace sees the current graph, not an obsolete snapshot.
+    MajorGC();
+    if (concurrent_marker_) concurrent_marker_->Stop();
 }
 
 void IsolateHeap::MajorGC() {
-    if (concurrent_marker_ && concurrent_marker_->IsActive()) {
-        FinalizeConcurrentGC();
-        return;
+    AssertOwnerThread();
+    if (!GCAllowed()) return;
+    CollectionScope collecting(collecting_);
+    auto live = Trace({});
+    std::unordered_set<HeapObject*> alive(live.begin(), live.end());
+    // Membership, not poisoned mark bits, decides weak liveness. All weak
+    // processing and cleanup queue allocation precedes any reclamation.
+    ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
+        return alive.contains(obj) ? obj : nullptr;
+    });
+    for (auto it = young_.begin(); it != young_.end(); ) {
+        if (alive.contains(it->first)) { ++it; continue; }
+        HeapObject* obj = it->first;
+        size_t bytes = it->second;
+        obj->~HeapObject();
+        std::memset(static_cast<void*>(obj), kNurseryPoisonByte, bytes);
+        budget_->ReleaseManaged(bytes);
+        it = young_.erase(it);
     }
+    if (young_.empty()) nursery_.ResetBumpPointer();
+    old_gen_.Sweep();
+    card_table_.Clear();
+    ++major_gc_count_;
+}
 
-    // 0. Reset marks on objects from previous GC cycle
-    for (HeapObject* obj : previously_marked_objects_) {
-        obj->SetMarked(false);
-    }
-    previously_marked_objects_.clear();
+bool IsolateHeap::CollectAtSafepoint() {
+    AssertOwnerThread();
+    if (!GCAllowed()) return false;
+    MajorGC();
+    return true;
+}
 
-    std::vector<HeapObject*> mark_stack;
-    std::vector<HeapObject*> marked_objects;
-
-    // 1. Mark phase starting from HandleScope roots
-    HandleScope* scope = top_scope_;
-    while (scope != nullptr) {
-        for (TaggedValue& root_val : scope->Slots()) {
-            if (root_val.IsHeapObject()) {
-                HeapObject* obj = root_val.AsHeapObject();
-                if (!obj->IsMarked()) {
-                    obj->SetMarked(true);
-                    mark_stack.push_back(obj);
-                    marked_objects.push_back(obj);
-                }
-            }
-        }
-        scope = scope->PrevScope();
-    }
-
-    for (TaggedValue* root_ptr : extra_roots_) {
-        if (root_ptr && root_ptr->IsHeapObject()) {
-            HeapObject* obj = root_ptr->AsHeapObject();
-            if (!obj->IsMarked()) {
-                obj->SetMarked(true);
-                mark_stack.push_back(obj);
-                marked_objects.push_back(obj);
-            }
-        }
-    }
-
-    // Drain mark stack
-    while (!mark_stack.empty()) {
-        HeapObject* curr = mark_stack.back();
-        mark_stack.pop_back();
-
-        if (old_gen_.Contains(curr)) {
-            old_gen_.MarkObject(curr);
-        }
-
-        curr->IteratePointers([&mark_stack, &marked_objects](TaggedValue& child) {
-            if (child.IsHeapObject()) {
-                HeapObject* child_obj = child.AsHeapObject();
-                if (!child_obj->IsMarked()) {
-                    child_obj->SetMarked(true);
-                    mark_stack.push_back(child_obj);
-                    marked_objects.push_back(child_obj);
-                }
-            }
+size_t IsolateHeap::MarkFromRoots(const std::vector<HeapObject*>& roots, bool process_weak) {
+    AssertOwnerThread();
+    if (!GCAllowed()) throw std::logic_error("Marking inside NoGCScope");
+    CollectionScope collecting(collecting_);
+    auto live = Trace(roots);
+    if (process_weak) {
+        std::unordered_set<HeapObject*> alive(live.begin(), live.end());
+        ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
+            return alive.contains(obj) ? obj : nullptr;
         });
     }
+    return live.size();
+}
 
-    // 2. Sweep phase in Old Generation Immix space
-    old_gen_.Sweep();
-
-    // 3. Save marked objects so their mark bits can be reset before the next Major GC cycle
-    previously_marked_objects_ = std::move(marked_objects);
-
-    major_gc_count_++;
+size_t IsolateHeap::DrainFinalizationQueue(const std::function<void(TaggedValue, TaggedValue)>& sink) {
+    AssertOwnerThread();
+    if (collecting_ || draining_finalizers_ || !sink) return 0;
+    CollectionScope draining(draining_finalizers_);
+    const size_t count = finalizers_.size();
+    for (size_t i = 0; i < count; ++i) {
+        // Pop before invoking so a throwing sink cannot deliver a callback
+        // twice. Scope roots protect both values across nested GC/callbacks.
+        HandleScope roots(*this);
+        auto callback = roots.CreateHandle(finalizers_.front().callback);
+        auto held = roots.CreateHandle(finalizers_.front().held_value);
+        finalizers_.pop_front();
+        NoGCScope native_temporaries(*this);
+        sink(callback.GetTagged(), held.GetTagged());
+    }
+    return count;
 }
 
 } // namespace aether

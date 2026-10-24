@@ -18,13 +18,21 @@ namespace aether {
 // ============================================================================
 
 SourceTextModuleRecord::SourceTextModuleRecord(std::string_view specifier, Realm& realm)
-    : specifier_(specifier), realm_(realm) {
-    environment_ = new JSObject(realm_.GetRootShape());
+    : specifier_(specifier), realm_(realm),
+      roots_(std::make_unique<NativeRootSet>(realm.GetHeap())),
+      ast_roots_(std::make_unique<NativeRootSet>(realm.GetHeap())),
+      bytecode_roots_(std::make_unique<NativeRootSet>(realm.GetHeap())) {
+    NoGCScope guard(realm.GetHeap());
+    environment_ = realm.GetHeap().AllocateStable<JSObject>(realm_.GetRootShape());
+    roots_->Add(TaggedValue::FromHeapObject(environment_));
 }
 
 SourceTextModuleRecord::~SourceTextModuleRecord() = default;
 
 void SourceTextModuleRecord::Parse(std::string_view source) {
+    IsolateScope isolate(realm_.GetHeap());
+    NoGCScope guard(realm_.GetHeap());
+    ast_roots_->Clear();
     source_code_ = std::string(source);
     Lexer lexer(source_code_);
     Parser parser(lexer);
@@ -40,8 +48,11 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
     // Top-Level Await Detection Visitor
     class AwaitScanner : public ASTVisitor {
     public:
+        explicit AwaitScanner(NativeRootSet& roots) : roots(roots) {}
+        NativeRootSet& roots;
+        size_t function_depth{0};
         bool has_await{false};
-        void VisitLiteral(LiteralExpr*) override {}
+        void VisitLiteral(LiteralExpr* n) override { roots.Add(n->Value()); }
         void VisitIdentifier(IdentifierExpr*) override {}
         void VisitUnary(UnaryExpr* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
         void VisitBinary(BinaryExpr* n) override {
@@ -51,6 +62,11 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
         void VisitAssign(AssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
         void VisitArrayDestructureAssign(ArrayDestructureAssignExpr* n) override { if (n->Value()) n->Value()->Accept(this); }
         void VisitUpdate(UpdateExpr*) override {}
+        void VisitUpdateProperty(UpdatePropertyExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
+        void VisitUpdateIndex(UpdateIndexExpr* n) override {
+            if (n->Object()) n->Object()->Accept(this);
+            if (n->Index()) n->Index()->Accept(this);
+        }
         void VisitPropertyAccess(PropertyAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
         void VisitPrivateAccess(PrivateAccessExpr* n) override { if (n->Object()) n->Object()->Accept(this); }
         void VisitPropertyAssign(PropertyAssignExpr* n) override {
@@ -65,7 +81,12 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Callee()) n->Callee()->Accept(this);
             for (const auto& a : n->Args()) a->Accept(this);
         }
-        void VisitFunctionExpr(FunctionExpr*) override {} // Don't descend into nested functions!
+        void VisitFunctionExpr(FunctionExpr* n) override {
+            ++function_depth;
+            for (const auto& value : n->ParamDefaults()) if (value) value->Accept(this);
+            if (n->Body()) n->Body()->Accept(this);
+            --function_depth;
+        }
         void VisitObjectLiteral(ObjectLiteralExpr* n) override {
             for (const auto& p : n->Properties()) {
                 if (p.computed_key) p.computed_key->Accept(this);
@@ -73,7 +94,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             }
         }
         void VisitArrayLiteral(ArrayLiteralExpr* n) override {
-            for (const auto& e : n->Elements()) e->Accept(this);
+            for (const auto& e : n->Elements()) if (e) e->Accept(this);
         }
         void VisitIndexAccess(IndexAccessExpr* n) override {
             if (n->Object()) n->Object()->Accept(this);
@@ -118,8 +139,11 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             for (const auto& a : n->Args()) a->Accept(this);
         }
         void VisitSpread(SpreadExpr* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
-        void VisitYield(YieldExpr*) override {}
-        void VisitAwait(AwaitExpr*) override { has_await = true; }
+        void VisitYield(YieldExpr* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
+        void VisitAwait(AwaitExpr* n) override {
+            if (!function_depth) has_await = true;
+            if (n->GetExpr()) n->GetExpr()->Accept(this);
+        }
         void VisitImportMeta(ImportMetaExpr*) override {}
         void VisitDynamicImport(DynamicImportExpr* n) override { if (n->Specifier()) n->Specifier()->Accept(this); }
 
@@ -155,8 +179,24 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             }
         }
         void VisitDebugger(DebuggerStmt*) override {}
-        void VisitFunctionDecl(FunctionDeclStmt*) override {} // Don't descend into nested functions!
-        void VisitClassDecl(ClassDeclStmt*) override {}
+        void VisitFunctionDecl(FunctionDeclStmt* n) override {
+            ++function_depth;
+            for (const auto& value : n->ParamDefaults()) if (value) value->Accept(this);
+            if (n->Body()) n->Body()->Accept(this);
+            --function_depth;
+        }
+        void VisitClassDecl(ClassDeclStmt* n) override {
+            ++function_depth;
+            for (const auto& method : n->Methods()) method->Accept(this);
+            for (const auto& field : n->Fields()) if (field.initializer) field.initializer->Accept(this);
+            --function_depth;
+        }
+        void VisitClassExpr(ClassExpr* n) override {
+            ++function_depth;
+            for (const auto& method : n->Methods()) method->Accept(this);
+            for (const auto& field : n->Fields()) if (field.initializer) field.initializer->Accept(this);
+            --function_depth;
+        }
         void VisitImportDecl(ImportDeclStmt*) override {}
         void VisitExportDecl(ExportDeclStmt* n) override {
             if (n->Declaration()) n->Declaration()->Accept(this);
@@ -176,7 +216,7 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
         void VisitProgram(Program* n) override { for (const auto& s : n->Statements()) s->Accept(this); }
     };
 
-    AwaitScanner scanner;
+    AwaitScanner scanner(*ast_roots_);
     ast_->Accept(&scanner);
     has_top_level_await_ = scanner.has_await;
 
@@ -272,12 +312,13 @@ SourceTextModuleRecord::ResolvedBinding SourceTextModuleRecord::ResolveExport(
             } else {
                 // Re-export: export { x as y } from "mod"
                 auto it = loaded_dependencies_.find(e.module_request);
-                if (it != loaded_dependencies_.end() && it->second) {
+                auto dep = it != loaded_dependencies_.end() ? it->second.lock() : nullptr;
+                if (dep) {
                     if (e.import_name == "*") {
                         // export * as ns from "mod"
-                        return ResolvedBinding{it->second.get(), "", true, false};
+                        return ResolvedBinding{dep.get(), "", true, false};
                     }
-                    return it->second->ResolveExport(e.import_name, seen);
+                    return dep->ResolveExport(e.import_name, seen);
                 }
             }
         }
@@ -288,8 +329,9 @@ SourceTextModuleRecord::ResolvedBinding SourceTextModuleRecord::ResolveExport(
         for (const auto& e : export_entries_) {
             if (e.export_name == "*" && e.import_name == "*" && !e.module_request.empty()) {
                 auto it = loaded_dependencies_.find(e.module_request);
-                if (it != loaded_dependencies_.end() && it->second) {
-                    auto res = it->second->ResolveExport(name, seen);
+                auto dep = it != loaded_dependencies_.end() ? it->second.lock() : nullptr;
+                if (dep) {
+                    auto res = dep->ResolveExport(name, seen);
                     if (res.module != nullptr) {
                         return res;
                     }
@@ -307,7 +349,9 @@ SourceTextModuleRecord::ResolvedBinding SourceTextModuleRecord::ResolveExport(
 }
 
 void SourceTextModuleRecord::Link(ModuleLoader& loader) {
-    if (status_ == ModuleStatus::Linked || status_ == ModuleStatus::Evaluating || status_ == ModuleStatus::Evaluated) {
+    IsolateScope isolate(realm_.GetHeap());
+    NoGCScope guard(realm_.GetHeap());
+    if (status_ == ModuleStatus::Linking || status_ == ModuleStatus::Linked || status_ == ModuleStatus::Evaluating || status_ == ModuleStatus::Evaluated) {
         return;
     }
     status_ = ModuleStatus::Linking;
@@ -326,7 +370,7 @@ void SourceTextModuleRecord::Link(ModuleLoader& loader) {
     // 2. Resolve all imported bindings
     resolved_imports_.clear();
     for (const auto& imp : import_entries_) {
-        auto dep = loaded_dependencies_[imp.module_request];
+        auto dep = loaded_dependencies_[imp.module_request].lock();
         if (!dep) {
             throw std::runtime_error("Cannot find module '" + imp.module_request + "'");
         }
@@ -364,14 +408,22 @@ void SourceTextModuleRecord::Link(ModuleLoader& loader) {
     }
 
     // 3. Compile bytecode for this module
+    for (const auto& [name, binding] : resolved_imports_) {
+        if (binding.target_env) roots_->Add(TaggedValue::FromHeapObject(binding.target_env));
+        if (binding.namespace_obj) roots_->Add(TaggedValue::FromHeapObject(binding.namespace_obj));
+    }
     BytecodeEmitter emitter;
     emitter.SetModuleRecord(this);
     bytecode_ = emitter.Emit(ast_.get());
+    bytecode_roots_->Clear();
+    bytecode_->IterateConstants([this](TaggedValue& value) { bytecode_roots_->Add(value); });
 
     status_ = ModuleStatus::Linked;
 }
 
 TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
+    IsolateScope isolate(realm_.GetHeap());
+    NoGCScope guard(realm_.GetHeap());
     if (status_ == ModuleStatus::Evaluated) {
         return TaggedValue::Undefined();
     }
@@ -383,9 +435,10 @@ TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
     // 1. Post-order DFS: evaluate dependencies first
     for (const auto& req : requested_modules_) {
         auto it = loaded_dependencies_.find(req);
-        if (it != loaded_dependencies_.end() && it->second) {
-            if (it->second->Status() != ModuleStatus::Evaluated) {
-                it->second->Evaluate(agent);
+        auto dep = it != loaded_dependencies_.end() ? it->second.lock() : nullptr;
+        if (dep) {
+            if (dep->Status() != ModuleStatus::Evaluated) {
+                dep->Evaluate(agent);
             }
         }
     }
@@ -398,7 +451,7 @@ TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
                 BytecodeEmitter fn_emitter;
                 fn_emitter.SetModuleRecord(this);
                 auto fn_bc = fn_emitter.EmitFunction(fn_decl);
-                auto* fn_obj = new JSFunction(fn_decl->Name(), std::move(fn_bc), nullptr, realm_.GetRootShape());
+                auto* fn_obj = AllocateRuntime<JSFunction>(fn_decl->Name(), std::move(fn_bc), nullptr, realm_.GetRootShape());
                 fn_obj->SetAsync(fn_decl->IsAsync());
                 fn_obj->SetGenerator(fn_decl->IsGenerator());
                 environment_->SetNamedProperty(fn_decl->Name(), TaggedValue::FromHeapObject(fn_obj), dummy_id);
@@ -408,7 +461,7 @@ TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
                         BytecodeEmitter fn_emitter;
                         fn_emitter.SetModuleRecord(this);
                         auto fn_bc = fn_emitter.EmitFunction(exp_fn_decl);
-                        auto* fn_obj = new JSFunction(exp_fn_decl->Name(), std::move(fn_bc), nullptr, realm_.GetRootShape());
+                        auto* fn_obj = AllocateRuntime<JSFunction>(exp_fn_decl->Name(), std::move(fn_bc), nullptr, realm_.GetRootShape());
                         fn_obj->SetAsync(exp_fn_decl->IsAsync());
                         fn_obj->SetGenerator(exp_fn_decl->IsGenerator());
                         environment_->SetNamedProperty(exp_fn_decl->Name(), TaggedValue::FromHeapObject(fn_obj), dummy_id);
@@ -426,10 +479,12 @@ TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
     if (bytecode_) {
         if (has_top_level_await_) {
             top_level_promise_ = AllocateRuntime<JSPromise>(realm_.GetRootShape());
+            roots_->Add(TaggedValue::FromHeapObject(top_level_promise_));
             if (realm_.GetPromisePrototype()) top_level_promise_->SetPrototype(realm_.GetPromisePrototype());
-            auto* fn_obj = new JSFunction(specifier_, bytecode_.get(), nullptr, realm_.GetRootShape());
+            auto* fn_obj = AllocateRuntime<JSFunction>(specifier_, bytecode_.get(), nullptr, realm_.GetRootShape());
             fn_obj->SetAsync(true);
-            auto* gen = new JSGeneratorObject(fn_obj, {}, TaggedValue::Undefined(), nullptr, realm_.GetRootShape());
+            std::vector<TaggedValue> empty_args;
+            auto* gen = AllocateRuntime<JSGeneratorObject>(fn_obj, empty_args, TaggedValue::Undefined(), nullptr, realm_.GetRootShape());
             gen->SetAsyncPromise(top_level_promise_);
             agent.GetInterpreter().RunAsyncStep(gen, TaggedValue::Undefined(), false);
             result = TaggedValue::FromHeapObject(top_level_promise_);
@@ -446,14 +501,18 @@ TaggedValue SourceTextModuleRecord::Evaluate(Agent& agent) {
 }
 
 JSObject* SourceTextModuleRecord::GetNamespaceObject(Agent& agent) {
+    IsolateScope isolate(realm_.GetHeap());
+    NoGCScope guard(realm_.GetHeap());
     if (!namespace_object_) {
         uint32_t shape_id = 9500;
-        namespace_object_ = new JSObject(realm_.GetRootShape());
+        auto* object = AllocateRuntime<JSObject>(realm_.GetRootShape());
+        roots_->Add(TaggedValue::FromHeapObject(object));
+        namespace_object_ = object;
         namespace_object_->SetPrototype(environment_);
         TaggedValue tag_sym = realm_.GetSymbolToStringTag();
         if (!tag_sym.IsUndefined() && tag_sym.IsSymbol()) {
             std::string sym_key = static_cast<JSSymbol*>(tag_sym.AsHeapObject())->Key();
-            namespace_object_->SetNamedProperty(sym_key, TaggedValue::FromHeapObject(new JSString("Module")), shape_id);
+            namespace_object_->SetNamedProperty(sym_key, TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Module")), shape_id);
         }
     }
 
@@ -478,13 +537,17 @@ JSObject* SourceTextModuleRecord::GetNamespaceObject(Agent& agent) {
 }
 
 JSObject* SourceTextModuleRecord::GetImportMeta(Realm* realm) {
+    IsolateScope isolate(realm_.GetHeap());
+    NoGCScope guard(realm_.GetHeap());
     if (!import_meta_) {
-        import_meta_ = new JSObject(realm ? realm->GetRootShape() : realm_.GetRootShape());
+        auto* object = AllocateRuntime<JSObject>(realm ? realm->GetRootShape() : realm_.GetRootShape());
+        roots_->Add(TaggedValue::FromHeapObject(object));
+        import_meta_ = object;
         uint32_t sid = 9600;
-        import_meta_->SetNamedProperty("url", TaggedValue::FromHeapObject(new JSString("file:///" + specifier_)), sid);
-        import_meta_->SetNamedProperty("filename", TaggedValue::FromHeapObject(new JSString(specifier_)), sid);
+        import_meta_->SetNamedProperty("url", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("file:///" + specifier_)), sid);
+        import_meta_->SetNamedProperty("filename", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(specifier_)), sid);
         std::string dirname = std::filesystem::path(specifier_).parent_path().string();
-        import_meta_->SetNamedProperty("dirname", TaggedValue::FromHeapObject(new JSString(dirname)), sid);
+        import_meta_->SetNamedProperty("dirname", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(dirname)), sid);
     }
     return import_meta_;
 }
@@ -496,11 +559,16 @@ JSObject* SourceTextModuleRecord::GetImportMeta(Realm* realm) {
 ModuleLoader::ModuleLoader(Agent& agent)
     : agent_(agent) {}
 
+ModuleRecord::ModuleRecord() = default;
+ModuleRecord::~ModuleRecord() = default;
+
 void ModuleLoader::RegisterVirtualModule(std::string_view specifier, std::string_view source) {
     virtual_modules_[std::string(specifier)] = std::string(source);
 }
 
 std::shared_ptr<SourceTextModuleRecord> ModuleLoader::LoadModule(std::string_view specifier, std::string_view referrer_dir) {
+    IsolateScope isolate(agent_.GetHeap());
+    NoGCScope guard(agent_.GetHeap());
     s_current_loader_ = this;
     std::string spec(specifier);
     std::string resolved_id = spec;
@@ -592,6 +660,8 @@ TaggedValue ModuleLoader::EvaluateModule(SourceTextModuleRecord* module) {
 }
 
 TaggedValue ModuleLoader::ImportDynamic(std::string_view specifier, std::string_view referrer_dir) {
+    IsolateScope isolate(agent_.GetHeap());
+    NoGCScope guard(agent_.GetHeap());
     auto* promise = AllocateRuntime<JSPromise>(agent_.GetRealm().GetRootShape());
     if (agent_.GetRealm().GetPromisePrototype()) {
         promise->SetPrototype(agent_.GetRealm().GetPromisePrototype());
@@ -608,8 +678,12 @@ TaggedValue ModuleLoader::ImportDynamic(std::string_view specifier, std::string_
 
             if (eval_res.IsHeapObject() && eval_res.AsHeapObject()->IsPromise()) {
                 auto* t_promise = static_cast<JSPromise*>(eval_res.AsHeapObject());
-                auto* on_ok = AllocateRuntime<JSNativeFunction>("", [this, promise, mod](const std::vector<TaggedValue>&) -> TaggedValue {
-                    promise->Fulfill(TaggedValue::FromHeapObject(mod->GetNamespaceObject(this->agent_)), this->agent_.GetMicrotasks());
+                // The loader owns the module. A strong host capture here would
+                // cycle through its rooted top-level promise and this reaction.
+                auto* on_ok = AllocateRuntime<JSNativeFunction>("", [this, promise, weak_mod = std::weak_ptr(mod)](const std::vector<TaggedValue>&) -> TaggedValue {
+                    if (auto module = weak_mod.lock()) {
+                        promise->Fulfill(TaggedValue::FromHeapObject(module->GetNamespaceObject(this->agent_)), this->agent_.GetMicrotasks());
+                    }
                     return TaggedValue::Undefined();
                 });
                 auto* on_err = AllocateRuntime<JSNativeFunction>("", [this, promise](const std::vector<TaggedValue>& args) -> TaggedValue {
@@ -617,19 +691,37 @@ TaggedValue ModuleLoader::ImportDynamic(std::string_view specifier, std::string_
                     promise->Reject(err, this->agent_.GetMicrotasks());
                     return TaggedValue::Undefined();
                 });
+                on_ok->AddCapturedRoot(TaggedValue::FromHeapObject(promise));
+                on_err->AddCapturedRoot(TaggedValue::FromHeapObject(promise));
                 t_promise->AddReaction(TaggedValue::FromHeapObject(on_ok), TaggedValue::FromHeapObject(on_err), nullptr, this->agent_.GetMicrotasks());
             } else {
                 promise->Fulfill(TaggedValue::FromHeapObject(mod->GetNamespaceObject(this->agent_)), this->agent_.GetMicrotasks());
             }
+        } catch (const std::length_error& e) {
+            RaiseResourceError(e.what());
+            if (auto* interpreter = Interpreter::Current()) {
+                TaggedValue reason = interpreter->PendingException();
+                interpreter->ClearPendingException();
+                promise->Reject(reason, this->agent_.GetMicrotasks());
+            }
+        } catch (const std::bad_alloc&) {
+            RaiseResourceError("Dynamic import allocation failed");
+            if (auto* interpreter = Interpreter::Current()) {
+                TaggedValue reason = interpreter->PendingException();
+                interpreter->ClearPendingException();
+                promise->Reject(reason, this->agent_.GetMicrotasks());
+            }
         } catch (const std::exception& e) {
-            promise->Reject(TaggedValue::FromHeapObject(new JSError("Error", e.what())), this->agent_.GetMicrotasks());
+            promise->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("Error", e.what())), this->agent_.GetMicrotasks());
         }
-    });
+    }, {TaggedValue::FromHeapObject(promise)});
 
     return TaggedValue::FromHeapObject(promise);
 }
 
 TaggedValue ModuleLoader::Require(std::string_view specifier, std::string_view referrer_dir) {
+    IsolateScope isolate(agent_.GetHeap());
+    NoGCScope guard(agent_.GetHeap());
     s_current_loader_ = this;
     std::string spec(specifier);
     std::string resolved_id = spec;
@@ -700,10 +792,12 @@ TaggedValue ModuleLoader::Require(std::string_view specifier, std::string_view r
     record->id = resolved_id;
     record->filename = resolved_filename;
     record->dirname = resolved_dirname;
-    record->module_object = new JSObject(agent_.GetRealm().GetRootShape());
-    auto* exports_obj = new JSObject(agent_.GetRealm().GetRootShape());
+    record->module_object = AllocateRuntime<JSObject>(agent_.GetRealm().GetRootShape());
+    record->roots = std::make_unique<NativeRootSet>(agent_.GetHeap());
+    record->roots->Add(TaggedValue::FromHeapObject(record->module_object));
+    auto* exports_obj = AllocateRuntime<JSObject>(agent_.GetRealm().GetRootShape());
     record->module_object->SetNamedProperty("exports", TaggedValue::FromHeapObject(exports_obj), shape_id);
-    record->module_object->SetNamedProperty("id", TaggedValue::FromHeapObject(new JSString(resolved_id)), shape_id);
+    record->module_object->SetNamedProperty("id", TaggedValue::FromHeapObject(AllocateRuntime<JSString>(resolved_id)), shape_id);
     record->module_object->SetNamedProperty("loaded", TaggedValue::FromBoolean(false), shape_id);
     module_cache_[resolved_id] = record;
 
@@ -713,7 +807,7 @@ TaggedValue ModuleLoader::Require(std::string_view specifier, std::string_view r
 
     // 7. Create module-specific require function
     std::string cur_dir = resolved_dirname;
-    auto* local_require = new JSNativeFunction("require", [this, cur_dir](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* local_require = AllocateRuntime<JSNativeFunction>("require", [this, cur_dir](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty()) return TaggedValue::Undefined();
         std::string s = args[0].ToString();
         return this->Require(s, cur_dir);
@@ -723,8 +817,8 @@ TaggedValue ModuleLoader::Require(std::string_view specifier, std::string_view r
     TaggedValue exports_val = record->module_object->GetNamedProperty("exports");
     TaggedValue require_val = TaggedValue::FromHeapObject(local_require);
     TaggedValue module_val = TaggedValue::FromHeapObject(record->module_object);
-    TaggedValue filename_val = TaggedValue::FromHeapObject(new JSString(resolved_filename));
-    TaggedValue dirname_val = TaggedValue::FromHeapObject(new JSString(resolved_dirname));
+    TaggedValue filename_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(resolved_filename));
+    TaggedValue dirname_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(resolved_dirname));
 
     CallFunction(wrapper_fn, TaggedValue::Undefined(), {
         exports_val,
@@ -740,12 +834,15 @@ TaggedValue ModuleLoader::Require(std::string_view specifier, std::string_view r
 }
 
 void ModuleLoader::InitializeModuleGlobals(const std::vector<std::string>& cli_args) {
+    IsolateScope isolate(agent_.GetHeap());
+    NoGCScope guard(agent_.GetHeap());
+    agent_.GetMicrotasks().InitializeRoots(agent_.GetHeap());
     s_current_loader_ = this;
     JSObject* global = agent_.GetRealm().GetGlobalObject();
     uint32_t shape_id = 2000;
 
     // 1. global require
-    auto* global_require = new JSNativeFunction("require", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* global_require = AllocateRuntime<JSNativeFunction>("require", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty()) return TaggedValue::Undefined();
         std::string spec = args[0].ToString();
         return this->Require(spec, "");
@@ -753,48 +850,48 @@ void ModuleLoader::InitializeModuleGlobals(const std::vector<std::string>& cli_a
     global->SetNamedProperty("require", TaggedValue::FromHeapObject(global_require), shape_id);
 
     // 2. process object
-    auto* process_obj = new JSObject(agent_.GetRealm().GetRootShape());
+    auto* process_obj = AllocateRuntime<JSObject>(agent_.GetRealm().GetRootShape());
 
     // process.argv
-    auto* argv_arr = new JSArray(agent_.GetRealm().GetRootShape(), cli_args.size());
+    auto* argv_arr = AllocateRuntime<JSArray>(agent_.GetRealm().GetRootShape(), cli_args.size());
     if (agent_.GetRealm().GetArrayPrototype()) {
         argv_arr->SetPrototype(agent_.GetRealm().GetArrayPrototype());
     }
     for (size_t i = 0; i < cli_args.size(); ++i) {
-        argv_arr->SetElement(static_cast<uint32_t>(i), TaggedValue::FromHeapObject(new JSString(cli_args[i])));
+        argv_arr->SetElement(static_cast<uint32_t>(i), TaggedValue::FromHeapObject(AllocateRuntime<JSString>(cli_args[i])));
     }
     process_obj->SetNamedProperty("argv", TaggedValue::FromHeapObject(argv_arr), shape_id);
 
     // process.version
-    process_obj->SetNamedProperty("version", TaggedValue::FromHeapObject(new JSString("v22.0.0-aether")), shape_id);
+    process_obj->SetNamedProperty("version", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("v22.0.0-aether")), shape_id);
 
     // process.platform
 #if defined(_WIN32)
-    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(new JSString("win32")), shape_id);
+    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("win32")), shape_id);
 #elif defined(__APPLE__)
-    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(new JSString("darwin")), shape_id);
+    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("darwin")), shape_id);
 #else
-    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(new JSString("linux")), shape_id);
+    process_obj->SetNamedProperty("platform", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("linux")), shape_id);
 #endif
 
     // process.arch
 #if defined(_M_X64) || defined(__x86_64__)
-    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(new JSString("x64")), shape_id);
+    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("x64")), shape_id);
 #elif defined(_M_ARM64) || defined(__aarch64__)
-    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(new JSString("arm64")), shape_id);
+    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("arm64")), shape_id);
 #else
-    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(new JSString("ia32")), shape_id);
+    process_obj->SetNamedProperty("arch", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("ia32")), shape_id);
 #endif
 
     // process.cwd()
-    auto* cwd_fn = new JSNativeFunction("cwd", [](const std::vector<TaggedValue>&) -> TaggedValue {
+    auto* cwd_fn = AllocateRuntime<JSNativeFunction>("cwd", [](const std::vector<TaggedValue>&) -> TaggedValue {
         std::string cwd = std::filesystem::current_path().string();
-        return TaggedValue::FromHeapObject(new JSString(cwd));
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(cwd));
     });
     process_obj->SetNamedProperty("cwd", TaggedValue::FromHeapObject(cwd_fn), shape_id);
 
     // process.exit(code)
-    auto* exit_fn = new JSNativeFunction("exit", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* exit_fn = AllocateRuntime<JSNativeFunction>("exit", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
         int code = 0;
         if (!args.empty()) code = static_cast<int>(args[0].AsNumber());
         this->SetExit(code);
@@ -804,12 +901,12 @@ void ModuleLoader::InitializeModuleGlobals(const std::vector<std::string>& cli_a
     process_obj->SetNamedProperty("exit", TaggedValue::FromHeapObject(exit_fn), shape_id);
 
     // process.nextTick(callback)
-    auto* nextTick_fn = new JSNativeFunction("nextTick", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
+    auto* nextTick_fn = AllocateRuntime<JSNativeFunction>("nextTick", [this](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!args.empty()) {
             TaggedValue cb = args[0];
             this->agent_.GetMicrotasks().Enqueue([cb]() {
                 CallFunction(cb, TaggedValue::Undefined(), {});
-            });
+            }, {cb});
         }
         return TaggedValue::Undefined();
     });

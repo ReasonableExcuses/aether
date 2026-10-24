@@ -18,6 +18,7 @@ class Realm;
 class ModuleLoader;
 class Program;
 class BytecodeArray;
+class NativeRootSet;
 
 enum class ModuleStatus {
     Unlinked,
@@ -103,7 +104,8 @@ private:
     std::vector<ImportEntry> import_entries_;
     std::vector<ExportEntry> export_entries_;
 
-    std::unordered_map<std::string, std::shared_ptr<SourceTextModuleRecord>> loaded_dependencies_;
+    // The loader owns records; dependency cycles must not retain host roots.
+    std::unordered_map<std::string, std::weak_ptr<SourceTextModuleRecord>> loaded_dependencies_;
     std::unordered_map<std::string, ResolvedImport> resolved_imports_;
     std::unordered_set<std::string> module_variables_;
 
@@ -112,17 +114,23 @@ private:
     JSObject* import_meta_{nullptr};
     JSPromise* top_level_promise_{nullptr};
     bool has_top_level_await_{false};
+    std::unique_ptr<NativeRootSet> roots_;
+    std::unique_ptr<NativeRootSet> ast_roots_;
+    std::unique_ptr<NativeRootSet> bytecode_roots_;
 };
 
 /**
  * @brief CommonJS Module metadata and cached export record.
  */
 struct ModuleRecord {
+    ModuleRecord();
+    ~ModuleRecord();
     std::string id;
     std::string filename;
     std::string dirname;
     JSObject* module_object{nullptr};
     bool loaded{false};
+    std::unique_ptr<NativeRootSet> roots;
 };
 
 /**

@@ -13,6 +13,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::LdaNull:            return "LdaNull";
         case Opcode::LdaTrue:            return "LdaTrue";
         case Opcode::LdaFalse:           return "LdaFalse";
+        case Opcode::LdaEmpty:           return "LdaEmpty";
         case Opcode::Ldar:               return "Ldar";
         case Opcode::Star:               return "Star";
         case Opcode::Mov:                return "Mov";
@@ -37,6 +38,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::TestInstanceOf:     return "TestInstanceOf";
         case Opcode::TestIn:             return "TestIn";
         case Opcode::TestInWith:         return "TestInWith";
+        case Opcode::TestPrivateIn:      return "TestPrivateIn";
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
@@ -48,6 +50,11 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::StaKeyed:           return "StaKeyed";
         case Opcode::DeleteNamed:        return "DeleteNamed";
         case Opcode::DeleteKeyed:        return "DeleteKeyed";
+        case Opcode::DeleteGlobal:       return "DeleteGlobal";
+        case Opcode::DefineGetter:       return "DefineGetter";
+        case Opcode::DefineSetter:       return "DefineSetter";
+        case Opcode::DefineGetterKeyed:  return "DefineGetterKeyed";
+        case Opcode::DefineSetterKeyed:  return "DefineSetterKeyed";
         case Opcode::LogicalNot:         return "LogicalNot";
         case Opcode::Negate:             return "Negate";
         case Opcode::BitwiseNot:         return "BitwiseNot";
@@ -65,7 +72,11 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::Inc:                return "Inc";
         case Opcode::Dec:                return "Dec";
         case Opcode::Call:               return "Call";
+        case Opcode::CallDirectEval:     return "CallDirectEval";
         case Opcode::CallMethod:         return "CallMethod";
+        case Opcode::CallSuper:          return "CallSuper";
+        case Opcode::CallWithSpread:     return "CallWithSpread";
+        case Opcode::CallMethodWithSpread: return "CallMethodWithSpread";
         case Opcode::CreateObject:       return "CreateObject";
         case Opcode::CreateArray:        return "CreateArray";
         case Opcode::Construct:          return "Construct";
@@ -74,6 +85,7 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::ArraySpread:        return "ArraySpread";
         case Opcode::ObjectSpread:       return "ObjectSpread";
         case Opcode::CreateRestArray:    return "CreateRestArray";
+        case Opcode::CreateArguments:    return "CreateArguments";
         case Opcode::CreateClosure:      return "CreateClosure";
         case Opcode::CreateFunctionContext: return "CreateFunctionContext";
         case Opcode::LdaContextSlot:     return "LdaContextSlot";
@@ -221,6 +233,21 @@ std::string BytecodeArray::Disassemble() const {
                    << " [feedback_slot: " << slot << "]";
                 break;
             }
+            case Opcode::DefineGetter:
+            case Opcode::DefineSetter: {
+                uint8_t obj = bytes_[pc++];
+                uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "r" << static_cast<int>(obj) << "." << constants_[name_idx].ToString() << " = acc";
+                break;
+            }
+            case Opcode::DefineGetterKeyed:
+            case Opcode::DefineSetterKeyed: {
+                uint8_t obj = bytes_[pc++];
+                uint8_t key = bytes_[pc++];
+                ss << "r" << static_cast<int>(obj) << "[r" << static_cast<int>(key) << "] = acc";
+                break;
+            }
             case Opcode::ArrayPush: {
                 uint8_t arr = bytes_[pc++];
                 uint8_t val = bytes_[pc++];
@@ -241,6 +268,11 @@ std::string BytecodeArray::Disassemble() const {
                 ss << "dest: r" << static_cast<int>(dest) << ", start_idx: " << start_idx;
                 break;
             }
+            case Opcode::CreateArguments: {
+                uint8_t dest = bytes_[pc++];
+                ss << "dest: r" << static_cast<int>(dest);
+                break;
+            }
             case Opcode::CreateArray: {
                 uint8_t start = bytes_[pc++];
                 uint16_t count = bytes_[pc] | (bytes_[pc + 1] << 8);
@@ -248,7 +280,9 @@ std::string BytecodeArray::Disassemble() const {
                 ss << "start: r" << static_cast<int>(start) << ", count: " << count;
                 break;
             }
-            case Opcode::Call: {
+            case Opcode::Call:
+            case Opcode::CallDirectEval:
+            case Opcode::CallSuper: {
                 uint8_t callee = bytes_[pc++];
                 uint8_t args = bytes_[pc++];
                 uint8_t count = bytes_[pc++];
@@ -274,6 +308,28 @@ std::string BytecodeArray::Disassemble() const {
                    << " [feedback_slot: " << slot << "]";
                 break;
             }
+            case Opcode::CallWithSpread: {
+                uint8_t callee = bytes_[pc++];
+                uint8_t arr = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "callee: r" << static_cast<int>(callee)
+                   << ", arr: r" << static_cast<int>(arr)
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::CallMethodWithSpread: {
+                uint8_t callee = bytes_[pc++];
+                uint8_t this_reg = bytes_[pc++];
+                uint8_t arr = bytes_[pc++];
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "callee: r" << static_cast<int>(callee)
+                   << ", this: r" << static_cast<int>(this_reg)
+                   << ", arr: r" << static_cast<int>(arr)
+                   << " [feedback_slot: " << slot << "]";
+                break;
+            }
             case Opcode::Construct: {
                 uint8_t ctor = bytes_[pc++];
                 uint8_t args = bytes_[pc++];
@@ -294,7 +350,9 @@ std::string BytecodeArray::Disassemble() const {
             }
             case Opcode::TypeOfGlobal:
             case Opcode::LdaGlobal:
-            case Opcode::StaGlobal: {
+            case Opcode::StaGlobal:
+            case Opcode::DeleteGlobal:
+            case Opcode::TestPrivateIn: {
                 uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
                 pc += 2;
                 ss << "const[" << name_idx << "]";
@@ -332,6 +390,7 @@ std::string BytecodeArray::Disassemble() const {
             case Opcode::LdaNull:
             case Opcode::LdaTrue:
             case Opcode::LdaFalse:
+            case Opcode::LdaEmpty:
             case Opcode::Yield:
             case Opcode::Await:
             case Opcode::Return:

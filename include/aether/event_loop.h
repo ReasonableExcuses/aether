@@ -13,6 +13,7 @@
 namespace aether {
 
 class Agent;
+class NativeRootSet;
 
 /**
  * @brief Represents a scheduled timer task (setTimeout / setInterval).
@@ -25,6 +26,7 @@ struct TimerEntry {
     std::vector<TaggedValue> args;
     bool is_interval{false};
     bool cancelled{false};
+    std::shared_ptr<NativeRootSet> roots;
 };
 
 /**
@@ -44,6 +46,7 @@ struct ImmediateEntry {
     TaggedValue callback{TaggedValue::Undefined()};
     std::vector<TaggedValue> args;
     bool cancelled{false};
+    std::shared_ptr<NativeRootSet> roots;
 };
 
 /**

@@ -26,53 +26,75 @@ namespace aether {
  */
 class JSWeakMap : public JSObject {
 public:
+    using EntryStorage = std::unordered_map<HeapObject*, TaggedValue,
+        std::hash<HeapObject*>, std::equal_to<HeapObject*>,
+        detail::StorageAllocator<std::pair<HeapObject* const, TaggedValue>>>;
     explicit JSWeakMap(Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSWeakMap, shape) {}
 
     JSWeakMap(JSWeakMap&& other) noexcept
         : JSObject(std::move(other)),
+          storage_charge_(std::move(other.storage_charge_)),
           entries_(std::move(other.entries_)) {}
 
-    size_t Size() const noexcept { return entries_.size(); }
+    size_t Size() const noexcept { return entries_->size(); }
 
     void Set(HeapObject* key, TaggedValue val) {
-        entries_[key] = val;
+        if (!entries_->contains(key) && entries_->size() >= kMaxObjectProperties) {
+            throw std::length_error("WeakMap size limit exceeded");
+        }
+        (*entries_)[key] = val;
     }
 
     TaggedValue Get(HeapObject* key) const {
-        auto it = entries_.find(key);
-        if (it != entries_.end()) {
+        auto it = entries_->find(key);
+        if (it != entries_->end()) {
             return it->second;
         }
         return TaggedValue::Undefined();
     }
 
     bool Has(HeapObject* key) const {
-        return entries_.find(key) != entries_.end();
+        return entries_->find(key) != entries_->end();
     }
 
     bool Delete(HeapObject* key) {
-        return entries_.erase(key) > 0;
+        return entries_->erase(key) > 0;
     }
 
     void Clear() {
-        entries_.clear();
+        entries_->clear();
     }
 
-    const std::unordered_map<HeapObject*, TaggedValue>& Entries() const noexcept {
-        return entries_;
+    const EntryStorage& Entries() const noexcept {
+        return *entries_;
     }
 
     size_t ObjectSize() const override {
-        return sizeof(JSWeakMap) + entries_.size() * (sizeof(void*) + sizeof(TaggedValue));
+        return sizeof(JSWeakMap);
     }
 
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
         JSObject::IteratePointers(visitor);
-        // WeakMap keys are held weakly (not traced as roots).
-        // Tracing values ensures mapped objects remain alive while map is rooted.
-        for (auto& [k, v] : entries_) {
-            if (!v.IsEmpty()) visitor(v);
+        // Both halves of an ephemeron are handled by the collector's fixed
+        // point pass: a value is strong only once its key is known to be live.
+    }
+
+    void TraceEphemerons(const std::function<bool(HeapObject*)>& is_alive,
+                         const std::function<void(TaggedValue&)>& visitor) {
+        for (auto& [key, value] : *entries_) if (is_alive(key)) visitor(value);
+    }
+
+    void ResolveWeakKeys(const std::function<HeapObject*(HeapObject*)>& resolve) {
+        for (auto it = entries_->begin(); it != entries_->end(); ) {
+            auto current = it++;
+            HeapObject* key = resolve(current->first);
+            if (!key) entries_->erase(current);
+            else if (key != current->first) {
+                auto node = entries_->extract(current);
+                node.key() = key;
+                entries_->insert(std::move(node));
+            }
         }
     }
 
@@ -81,9 +103,9 @@ public:
     }
 
     void PruneDeadKeys(const std::function<bool(HeapObject*)>& is_alive) {
-        for (auto it = entries_.begin(); it != entries_.end(); ) {
+        for (auto it = entries_->begin(); it != entries_->end(); ) {
             if (!is_alive(it->first)) {
-                it = entries_.erase(it);
+                it = entries_->erase(it);
             } else {
                 ++it;
             }
@@ -91,7 +113,10 @@ public:
     }
 
 private:
-    std::unordered_map<HeapObject*, TaggedValue> entries_;
+    // Indirection makes nursery relocation allocation-free even on MSVC,
+    // whose unordered_map move constructor allocates an empty sentinel.
+    MemoryCharge storage_charge_{sizeof(EntryStorage)};
+    std::unique_ptr<EntryStorage> entries_{std::make_unique<EntryStorage>()};
 };
 
 /**
@@ -99,37 +124,43 @@ private:
  */
 class JSWeakSet : public JSObject {
 public:
+    using EntryStorage = std::unordered_set<HeapObject*, std::hash<HeapObject*>,
+        std::equal_to<HeapObject*>, detail::StorageAllocator<HeapObject*>>;
     explicit JSWeakSet(Shape* shape = nullptr)
         : JSObject(HeapObjectType::JSWeakSet, shape) {}
 
     JSWeakSet(JSWeakSet&& other) noexcept
         : JSObject(std::move(other)),
+          storage_charge_(std::move(other.storage_charge_)),
           entries_(std::move(other.entries_)) {}
 
-    size_t Size() const noexcept { return entries_.size(); }
+    size_t Size() const noexcept { return entries_->size(); }
 
     void Add(HeapObject* val) {
-        entries_.insert(val);
+        if (!entries_->contains(val) && entries_->size() >= kMaxObjectProperties) {
+            throw std::length_error("WeakSet size limit exceeded");
+        }
+        entries_->insert(val);
     }
 
     bool Has(HeapObject* val) const {
-        return entries_.find(val) != entries_.end();
+        return entries_->find(val) != entries_->end();
     }
 
     bool Delete(HeapObject* val) {
-        return entries_.erase(val) > 0;
+        return entries_->erase(val) > 0;
     }
 
     void Clear() {
-        entries_.clear();
+        entries_->clear();
     }
 
-    const std::unordered_set<HeapObject*>& Entries() const noexcept {
-        return entries_;
+    const EntryStorage& Entries() const noexcept {
+        return *entries_;
     }
 
     size_t ObjectSize() const override {
-        return sizeof(JSWeakSet) + entries_.size() * sizeof(void*);
+        return sizeof(JSWeakSet);
     }
 
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
@@ -142,17 +173,31 @@ public:
     }
 
     void PruneDeadEntries(const std::function<bool(HeapObject*)>& is_alive) {
-        for (auto it = entries_.begin(); it != entries_.end(); ) {
+        for (auto it = entries_->begin(); it != entries_->end(); ) {
             if (!is_alive(*it)) {
-                it = entries_.erase(it);
+                it = entries_->erase(it);
             } else {
                 ++it;
             }
         }
     }
 
+    void ResolveWeakEntries(const std::function<HeapObject*(HeapObject*)>& resolve) {
+        for (auto it = entries_->begin(); it != entries_->end(); ) {
+            auto current = it++;
+            HeapObject* value = resolve(*current);
+            if (!value) entries_->erase(current);
+            else if (value != *current) {
+                auto node = entries_->extract(current);
+                node.value() = value;
+                entries_->insert(std::move(node));
+            }
+        }
+    }
+
 private:
-    std::unordered_set<HeapObject*> entries_;
+    MemoryCharge storage_charge_{sizeof(EntryStorage)};
+    std::unique_ptr<EntryStorage> entries_{std::make_unique<EntryStorage>()};
 };
 
 /**
@@ -176,6 +221,7 @@ public:
 
     HeapObject* Target() const noexcept { return target_; }
     void ClearTarget() noexcept { target_ = nullptr; }
+    void SetTarget(HeapObject* target) noexcept { target_ = target; }
 
     size_t ObjectSize() const override { return sizeof(JSWeakRef); }
 
@@ -210,11 +256,14 @@ public:
     JSFinalizationRegistry(JSFinalizationRegistry&& other) noexcept
         : JSObject(std::move(other)),
           cleanup_callback_(other.cleanup_callback_),
+          registrations_charge_(std::move(other.registrations_charge_)),
           registrations_(std::move(other.registrations_)) {
         other.cleanup_callback_ = TaggedValue::Undefined();
     }
 
     void Register(HeapObject* target, TaggedValue held_value, HeapObject* token = nullptr) {
+        detail::ReserveStorage(registrations_, registrations_charge_, registrations_.size() + 1,
+                               kMaxObjectProperties);
         registrations_.push_back({target, held_value, token});
     }
 
@@ -230,6 +279,22 @@ public:
     TaggedValue CleanupCallback() const noexcept { return cleanup_callback_; }
     const std::vector<Registration>& Registrations() const noexcept { return registrations_; }
     size_t RegistrationCount() const noexcept { return registrations_.size(); }
+
+    // GC queues cleanup only; it never invokes JavaScript while sweeping.
+    void ProcessWeakTargets(const std::function<HeapObject*(HeapObject*)>& resolve,
+                            const std::function<void(TaggedValue, TaggedValue)>& enqueue) {
+        for (auto it = registrations_.begin(); it != registrations_.end(); ) {
+            HeapObject* target = resolve(it->target);
+            if (!target) {
+                enqueue(cleanup_callback_, it->held_value);
+                it = registrations_.erase(it);
+            } else {
+                it->target = target;
+                it->unregister_token = resolve(it->unregister_token);
+                ++it;
+            }
+        }
+    }
 
     size_t CleanupForTarget(HeapObject* target, const std::function<void(TaggedValue, TaggedValue)>& invoke_fn = nullptr) {
         size_t cleaned = 0;
@@ -248,7 +313,7 @@ public:
     }
 
     size_t ObjectSize() const override {
-        return sizeof(JSFinalizationRegistry) + registrations_.capacity() * sizeof(Registration);
+        return sizeof(JSFinalizationRegistry);
     }
 
     void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
@@ -265,6 +330,7 @@ public:
 
 private:
     TaggedValue cleanup_callback_{TaggedValue::Undefined()};
+    MemoryCharge registrations_charge_;
     std::vector<Registration> registrations_;
 };
 

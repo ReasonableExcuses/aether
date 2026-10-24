@@ -26,6 +26,7 @@ enum class Opcode : uint8_t {
     LdaNull,            // [Op]                        acc = Null
     LdaTrue,            // [Op]                        acc = True
     LdaFalse,           // [Op]                        acc = False
+    LdaEmpty,           // [Op]                        acc = Empty
 
     // Register Transfers
     Ldar,               // [Op, reg: u8]               acc = Reg[reg]
@@ -58,6 +59,7 @@ enum class Opcode : uint8_t {
     TestInstanceOf,         // [Op, reg: u8]           acc = (acc instanceof Reg[reg])
     TestIn,                 // [Op, reg: u8]           acc = (Reg[reg] in acc)
     TestInWith,             // [Op, reg: u8]           acc = HasBindingWith(acc, Reg[reg])
+    TestPrivateIn,          // [Op, name_idx: u16]     acc = (#name in acc)
 
     // Control Flow
     Jump,               // [Op, offset: i32]           pc += offset
@@ -75,6 +77,11 @@ enum class Opcode : uint8_t {
     StaKeyed,           // [Op, obj: u8, key: u8, slot: u16]        obj[key] = acc
     DeleteNamed,        // [Op, obj: u8, name_idx: u16]             acc = delete obj.name
     DeleteKeyed,        // [Op, obj: u8, key: u8]                   acc = delete obj[key]
+    DeleteGlobal,       // [Op, name_idx: u16]                      acc = delete global[name]
+    DefineGetter,       // [Op, obj: u8, name_idx: u16]             define getter obj.name = acc
+    DefineSetter,       // [Op, obj: u8, name_idx: u16]             define setter obj.name = acc
+    DefineGetterKeyed,  // [Op, obj: u8, key: u8]                   define getter obj[key] = acc
+    DefineSetterKeyed,  // [Op, obj: u8, key: u8]                   define setter obj[key] = acc
 
     // Unary Operations
     LogicalNot,             // [Op]                    acc = !ToBoolean(acc)
@@ -96,7 +103,11 @@ enum class Opcode : uint8_t {
 
     // Function Calls & Object Instantiation
     Call,                   // [Op, callee: u8, args: u8, count: u8, slot: u16]
+    CallDirectEval,         // [Op, callee: u8, args: u8, count: u8, slot: u16]
     CallMethod,             // [Op, callee: u8, this: u8, args: u8, count: u8, slot: u16]
+    CallSuper,              // [Op, callee: u8, args: u8, count: u8, slot: u16]
+    CallWithSpread,         // [Op, callee: u8, arg_array: u8, slot: u16]
+    CallMethodWithSpread,   // [Op, callee: u8, this: u8, arg_array: u8, slot: u16]
     CreateObject,           // [Op]                    acc = new JSObject()
     CreateArray,            // [Op, start_reg: u8, count: u16] acc = new JSArray(...)
     Construct,              // [Op, ctor: u8, args: u8, count: u8, slot: u16]
@@ -105,6 +116,7 @@ enum class Opcode : uint8_t {
     ArraySpread,            // [Op, target_reg: u8, src_reg: u8] arr.push(...src)
     ObjectSpread,           // [Op, target_reg: u8, src_reg: u8] Object.assign(target, src)
     CreateRestArray,        // [Op, dest_reg: u8, start_idx: u16] dest = args.slice(start_idx)
+    CreateArguments,        // [Op, dest_reg: u8] dest = arguments object
 
     // Closures & Lexical Scopes
     CreateClosure,          // [Op, const_idx: u16]    acc = new JSFunction(const[idx], env)
@@ -213,7 +225,9 @@ public:
           is_strict_(other.is_strict_),
           invocation_count_(other.invocation_count_.load(std::memory_order_relaxed)),
           is_compiling_tier2_(other.is_compiling_tier2_.load(std::memory_order_relaxed)),
-          feedback_(std::move(other.feedback_)) {
+          feedback_(std::move(other.feedback_)),
+          register_scope_(std::move(other.register_scope_)),
+          context_slots_(std::move(other.context_slots_)) {
         std::lock_guard<std::mutex> lock(other.tier_mutex_);
         tier1_code_ = std::move(other.tier1_code_);
         tier2_code_ = std::move(other.tier2_code_);
@@ -229,6 +243,8 @@ public:
             invocation_count_.store(other.invocation_count_.load(std::memory_order_relaxed));
             is_compiling_tier2_.store(other.is_compiling_tier2_.load(std::memory_order_relaxed));
             feedback_ = std::move(other.feedback_);
+            register_scope_ = std::move(other.register_scope_);
+            context_slots_ = std::move(other.context_slots_);
             std::scoped_lock lock(tier_mutex_, other.tier_mutex_);
             tier1_code_ = std::move(other.tier1_code_);
             tier2_code_ = std::move(other.tier2_code_);
@@ -253,6 +269,12 @@ public:
     }
     void SetLength(uint32_t len) noexcept { length_ = len; }
     void SetStrict(bool s) noexcept { is_strict_ = s; }
+
+    const std::unordered_map<std::string, uint8_t>& GetRegisterScope() const noexcept { return register_scope_; }
+    void SetRegisterScope(std::unordered_map<std::string, uint8_t> s) { register_scope_ = std::move(s); }
+
+    const std::unordered_map<std::string, uint16_t>& GetContextSlots() const noexcept { return context_slots_; }
+    void SetContextSlots(std::unordered_map<std::string, uint16_t> cs) { context_slots_ = std::move(cs); }
 
     // Emission primitives
     size_t CurrentOffset() const noexcept { return bytes_.size(); }
@@ -336,6 +358,8 @@ private:
     mutable std::shared_ptr<ExecutableMemory> tier1_code_{nullptr};
     mutable std::shared_ptr<ExecutableMemory> tier2_code_{nullptr};
     mutable TypeFeedbackVector feedback_;
+    std::unordered_map<std::string, uint8_t> register_scope_;
+    std::unordered_map<std::string, uint16_t> context_slots_;
 };
 
 } // namespace aether

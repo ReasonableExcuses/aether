@@ -333,6 +333,7 @@ static bool IsOptionalChain(const Expr* expr) {
 }
 
 std::unique_ptr<Program> Parser::ParseProgram() {
+    NoGCScope compilation;
     auto prog = std::make_unique<Program>();
     bool in_directive_prologue = true;
     while (!Check(TokenKind::EndOfFile)) {
@@ -352,6 +353,7 @@ std::unique_ptr<Program> Parser::ParseProgram() {
 }
 
 std::unique_ptr<Stmt> Parser::ParseStatement() {
+    NoGCScope compilation;
     if (Match(TokenKind::Var)) {
         return ParseVarDecl(/*is_const=*/false, VarDeclStmt::Kind::Var);
     }
@@ -613,20 +615,36 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl(bool is_const, VarDeclStmt::Kind kind
 std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
     Consume(TokenKind::Function, "Expected 'function'");
     bool is_generator = Match(TokenKind::Star);
-    Token name_tok = Consume(TokenKind::Identifier, "Expected function name");
+    Token name_tok;
+    if (Check(TokenKind::Identifier)) {
+        name_tok = Advance();
+    } else if (Check(TokenKind::Await) && !is_async && !in_async_ && !is_module_) {
+        name_tok = Advance();
+    } else if (Check(TokenKind::Yield) && !is_generator && !in_generator_ && !strict_mode_) {
+        name_tok = Advance();
+    } else {
+        name_tok = Consume(TokenKind::Identifier, "Expected function name");
+    }
     Consume(TokenKind::OpenParen, "Expected '(' after function name");
+
+    auto parse_fn_param = [&]() -> Token {
+        if (Check(TokenKind::Identifier)) return Advance();
+        if (Check(TokenKind::Await) && !is_async && !in_async_ && !is_module_) return Advance();
+        if (Check(TokenKind::Yield) && !is_generator && !in_generator_ && !strict_mode_) return Advance();
+        return Consume(TokenKind::Identifier, "Expected parameter name");
+    };
 
     std::vector<std::string> params;
     std::vector<std::unique_ptr<Expr>> param_defaults;
     std::string rest_param = "";
     if (!Check(TokenKind::CloseParen)) {
         if (Match(TokenKind::DotDotDot)) {
-            Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+            Token r = parse_fn_param();
             if (Check(TokenKind::Equal)) throw std::runtime_error("SyntaxError: Rest parameter may not have a default initializer");
             if (Check(TokenKind::Comma)) throw std::runtime_error("SyntaxError: Rest parameter may not have a trailing comma");
             rest_param = r.text;
         } else {
-            Token param = Consume(TokenKind::Identifier, "Expected parameter name");
+            Token param = parse_fn_param();
             std::unique_ptr<Expr> def = nullptr;
             if (Match(TokenKind::Equal)) {
                 def = ParseExpression();
@@ -636,13 +654,13 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
             while (Match(TokenKind::Comma)) {
                 if (Check(TokenKind::CloseParen)) break;
                 if (Match(TokenKind::DotDotDot)) {
-                    Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                    Token r = parse_fn_param();
                     if (Check(TokenKind::Equal)) throw std::runtime_error("SyntaxError: Rest parameter may not have a default initializer");
                     if (Check(TokenKind::Comma)) throw std::runtime_error("SyntaxError: Rest parameter may not have a trailing comma");
                     rest_param = r.text;
                     break;
                 }
-                Token next_param = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                Token next_param = parse_fn_param();
                 std::unique_ptr<Expr> next_def = nullptr;
                 if (Match(TokenKind::Equal)) {
                     next_def = ParseExpression();
@@ -1004,58 +1022,106 @@ std::unique_ptr<Stmt> Parser::ParseTryCatch() {
     return std::make_unique<TryCatchStmt>(std::move(try_block), catch_param, std::move(catch_block), std::move(finally_block));
 }
 
-std::unique_ptr<Stmt> Parser::ParseClassDecl() {
-    Token name_tok = Consume(TokenKind::Identifier, "Expected class name");
-    std::string super_name = "";
-    if (Match(TokenKind::Extends)) {
-        Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
-        super_name = super_tok.text;
+Parser::ParsedClassBody Parser::ParseClassElements(std::string_view super_name) {
+    bool prev_strict = strict_mode_;
+    strict_mode_ = true;
+    Consume(TokenKind::OpenBrace, "Expected '{' in class body");
+
+    // Pre-scan class body for declared private names
+    std::unordered_set<std::string> declared_in_this_class;
+    Lexer scan_lexer = lexer_;
+    Token scan_cur = current_token_;
+    int scan_brace_depth = 1;
+    while (scan_brace_depth > 0 && scan_cur.kind != TokenKind::EndOfFile) {
+        if (scan_cur.kind == TokenKind::OpenBrace) {
+            scan_brace_depth++;
+        } else if (scan_cur.kind == TokenKind::CloseBrace) {
+            scan_brace_depth--;
+            if (scan_brace_depth == 0) break;
+        } else if (scan_brace_depth == 1 && scan_cur.kind == TokenKind::Hash) {
+            Token next = scan_lexer.NextToken();
+            if (next.kind == TokenKind::Identifier) {
+                Token after_next = scan_lexer.PeekToken();
+                if (after_next.kind != TokenKind::In) {
+                    declared_in_this_class.insert(next.text);
+                }
+            }
+            scan_cur = scan_lexer.NextToken();
+            continue;
+        }
+        scan_cur = scan_lexer.NextToken();
     }
-    Consume(TokenKind::OpenBrace, "Expected '{' in class declaration");
-    std::vector<std::unique_ptr<FunctionDeclStmt>> methods;
-    auto class_node = std::make_unique<ClassDeclStmt>(name_tok.text, super_name, std::move(methods));
+    declared_private_names_stack_.push_back(std::move(declared_in_this_class));
+
+    ParsedClassBody body;
     while (!Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
         if (Match(TokenKind::Semicolon)) continue;
+
         bool is_static = false;
         if (Check(TokenKind::Static) || (Check(TokenKind::Identifier) && current_token_.text == "static")) {
             Token next = lexer_.PeekToken();
-            if (next.kind == TokenKind::Identifier || next.kind == TokenKind::Hash ||
-                next.text == "get" || next.text == "set") {
+            if (next.kind != TokenKind::OpenParen && next.kind != TokenKind::Equal &&
+                next.kind != TokenKind::Semicolon && next.kind != TokenKind::CloseBrace) {
                 Advance();
                 is_static = true;
             }
         }
+
+        bool is_async = false;
+        if (Check(TokenKind::Async) || (Check(TokenKind::Identifier) && current_token_.text == "async")) {
+            Token next = lexer_.PeekToken();
+            if (next.kind != TokenKind::OpenParen && next.kind != TokenKind::Equal &&
+                next.kind != TokenKind::Semicolon && next.kind != TokenKind::CloseBrace) {
+                Advance();
+                is_async = true;
+            }
+        }
+
+        bool is_generator = false;
+        if (Match(TokenKind::Star)) {
+            is_generator = true;
+        }
+
+        bool is_getter = false;
+        bool is_setter = false;
+        if (!is_async && !is_generator && Check(TokenKind::Identifier) &&
+            (current_token_.text == "get" || current_token_.text == "set")) {
+            Token next = lexer_.PeekToken();
+            if (next.kind != TokenKind::OpenParen && next.kind != TokenKind::Equal &&
+                next.kind != TokenKind::Semicolon && next.kind != TokenKind::CloseBrace) {
+                Token gs = Advance();
+                if (gs.text == "get") is_getter = true;
+                else is_setter = true;
+            }
+        }
+
         std::string method_name_text;
         Token first = Advance();
         if (first.kind == TokenKind::Hash) {
-            Token private_name = Consume(TokenKind::Identifier, "Expected private name");
+            Token private_name = Consume(TokenKind::Identifier, "Expected private name after '#'");
             method_name_text = "#" + private_name.text;
-        } else if ((first.text == "get" || first.text == "set") && Check(TokenKind::Hash)) {
-            bool is_getter = first.text == "get";
-            Advance();
-            Token private_name = Consume(TokenKind::Identifier, "Expected private accessor name");
-            method_name_text = std::string(is_getter ? "__get__#" : "__set__#") + private_name.text;
-        } else if ((first.text == "get" || first.text == "set") && Check(TokenKind::Identifier)) {
-            bool is_getter = first.text == "get";
-            Token prop_name = Advance();
-            method_name_text = std::string(is_getter ? "__get__" : "__set__") + prop_name.text;
         } else {
             method_name_text = first.text;
+        }
+
+        if (is_getter) {
+            method_name_text = (method_name_text.front() == '#' ? "__get__#" + method_name_text.substr(1) : "__get__" + method_name_text);
+        } else if (is_setter) {
+            method_name_text = (method_name_text.front() == '#' ? "__set__#" + method_name_text.substr(1) : "__set__" + method_name_text);
         }
 
         if (is_static) {
             method_name_text = "__static__" + method_name_text;
         }
 
-        if (Check(TokenKind::Semicolon) || Check(TokenKind::Equal)) {
+        if (Check(TokenKind::Semicolon) || Check(TokenKind::Equal) || !Check(TokenKind::OpenParen)) {
             std::unique_ptr<Expr> initializer;
             if (Match(TokenKind::Equal)) initializer = ParseExpression(Precedence::Comma);
             Match(TokenKind::Semicolon);
-            class_node->AddField(method_name_text, std::move(initializer));
+            body.fields.push_back({method_name_text, std::move(initializer)});
             continue;
         }
 
-        Token method_name{TokenKind::Identifier, method_name_text, 0.0, false, 0, false, first.location};
         Consume(TokenKind::OpenParen, "Expected '(' after method name");
         std::vector<std::string> params;
         std::vector<std::unique_ptr<Expr>> param_defaults;
@@ -1078,19 +1144,46 @@ std::unique_ptr<Stmt> Parser::ParseClassDecl() {
             }
         }
         Consume(TokenKind::CloseParen, "Expected ')' after method parameters");
+
         bool prev_in_derived = in_derived_constructor_;
-        if (method_name.text == "constructor") {
+        if (method_name_text == "constructor") {
             in_derived_constructor_ = !super_name.empty();
         } else {
             in_derived_constructor_ = false;
         }
-        auto body = ParseBlock();
+
+        std::unique_ptr<BlockStmt> block_body;
+        {
+            FunctionContextGuard guard(*this, is_generator, is_async);
+            block_body = ParseBlock();
+        }
         in_derived_constructor_ = prev_in_derived;
-        auto method_decl = std::make_unique<FunctionDeclStmt>(method_name.text, std::move(params), std::move(body));
+
+        auto method_decl = std::make_unique<FunctionDeclStmt>(method_name_text, std::move(params), std::move(block_body));
         method_decl->SetParamDefaults(std::move(param_defaults));
-        class_node->AddMethod(std::move(method_decl));
+        method_decl->SetAsync(is_async);
+        method_decl->SetGenerator(is_generator);
+        body.methods.push_back(std::move(method_decl));
     }
+
     Consume(TokenKind::CloseBrace, "Expected '}' after class body");
+    declared_private_names_stack_.pop_back();
+    strict_mode_ = prev_strict;
+    return body;
+}
+
+std::unique_ptr<Stmt> Parser::ParseClassDecl() {
+    Token name_tok = Consume(TokenKind::Identifier, "Expected class name");
+    std::string super_name = "";
+    if (Match(TokenKind::Extends)) {
+        Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
+        super_name = super_tok.text;
+    }
+    auto body = ParseClassElements(super_name);
+    auto class_node = std::make_unique<ClassDeclStmt>(name_tok.text, super_name, std::move(body.methods));
+    for (auto& f : body.fields) {
+        class_node->AddField(f.name, std::move(f.initializer));
+    }
     return class_node;
 }
 
@@ -1310,7 +1403,8 @@ std::unique_ptr<Stmt> Parser::ParseExportDecl() {
 }
 
 std::unique_ptr<Expr> Parser::ParseExpression(Precedence precedence) {
-    auto lhs = ParsePrefix();
+    NoGCScope compilation;
+    auto lhs = ParsePrefix(precedence);
 
     while (precedence <= GetPrecedence(Peek().kind)) {
         if ((Peek().kind == TokenKind::PlusPlus || Peek().kind == TokenKind::MinusMinus) &&
@@ -1324,7 +1418,7 @@ std::unique_ptr<Expr> Parser::ParseExpression(Precedence precedence) {
     return lhs;
 }
 
-std::unique_ptr<Expr> Parser::ParsePrefix() {
+std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
     Token tok = Advance();
     switch (tok.kind) {
         case TokenKind::Number: {
@@ -1333,7 +1427,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 if (!s.empty() && (s.back() == 'n' || s.back() == 'N')) {
                     s.pop_back();
                 }
-                return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSBigInt(s)));
+                return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSBigInt>(s)));
             }
             if (tok.is_integer) {
                 return std::make_unique<LiteralExpr>(TaggedValue::FromSmi(tok.int_value));
@@ -1341,13 +1435,13 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<LiteralExpr>(TaggedValue::FromDouble(tok.number_value));
         }
         case TokenKind::String: {
-            auto* s = new JSString(tok.text);
+            auto* s = AllocateRuntime<JSString>(tok.text);
             return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(s));
         }
         case TokenKind::RegExp: {
             std::vector<std::unique_ptr<Expr>> args;
-            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString(tok.text))));
-            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString(tok.regex_flags))));
+            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(tok.text))));
+            args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(tok.regex_flags))));
             return std::make_unique<NewExpr>(std::make_unique<IdentifierExpr>("RegExp"), std::move(args));
         }
         case TokenKind::True:
@@ -1365,7 +1459,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 }
             }
             if (tok.template_exprs.empty()) {
-                auto* s = new JSString(tok.template_quasis.empty() ? "" : tok.template_quasis[0]);
+                auto* s = AllocateRuntime<JSString>(tok.template_quasis.empty() ? "" : tok.template_quasis[0]);
                 return std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(s));
             }
             std::vector<std::unique_ptr<Expr>> expr_nodes;
@@ -1384,6 +1478,9 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 throw std::runtime_error("SyntaxError: Escaped characters not allowed in reserved words");
             }
             if (Check(TokenKind::Arrow)) {
+                if (precedence > Precedence::Assignment) {
+                    throw std::runtime_error("SyntaxError: Unexpected token '=>'");
+                }
                 if (current_token_.has_leading_newline) {
                     throw std::runtime_error("SyntaxError: Line terminator not allowed before '=>'");
                 }
@@ -1495,6 +1592,9 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             }
 
             if (is_arrow) {
+                if (precedence > Precedence::Assignment) {
+                    throw std::runtime_error("SyntaxError: Unexpected token '=>'");
+                }
                 if (arrow_has_newline) {
                     throw std::runtime_error("SyntaxError: Line terminator not allowed before '=>'");
                 }
@@ -1730,7 +1830,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                             auto is_fn = std::make_unique<BinaryExpr>(
                                 BinaryOp::StrictEqual,
                                 std::move(ret_type),
-                                std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString("function"))));
+                                std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSString>("function"))));
                             auto close_cond = std::make_unique<BinaryExpr>(
                                 BinaryOp::LogicalAnd,
                                 std::move(step_not_done),
@@ -1763,7 +1863,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                             std::move(cond_undef),
                             std::move(cond_null));
                         std::vector<std::unique_ptr<Expr>> err_args;
-                        err_args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(new JSString("Cannot destructure undefined or null"))));
+                        err_args.push_back(std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Cannot destructure undefined or null"))));
                         auto new_err = std::make_unique<NewExpr>(
                             std::make_unique<IdentifierExpr>("TypeError"),
                             std::move(err_args));
@@ -2426,6 +2526,31 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             return std::make_unique<IdentifierExpr>("this");
         case TokenKind::Super:
             return std::make_unique<IdentifierExpr>("super");
+        case TokenKind::Hash: {
+            if (declared_private_names_stack_.empty()) {
+                throw std::runtime_error("SyntaxError: Unexpected private identifier outside class");
+            }
+            Token name_tok = Consume(TokenKind::Identifier, "Expected identifier after '#'");
+            std::string field_name = name_tok.text;
+
+            bool declared = false;
+            for (auto it = declared_private_names_stack_.rbegin(); it != declared_private_names_stack_.rend(); ++it) {
+                if (it->count(field_name)) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (!declared) {
+                throw std::runtime_error("SyntaxError: Private field '#" + field_name + "' must be declared in an enclosing class");
+            }
+            if (!allow_in_) {
+                throw std::runtime_error("SyntaxError: Private field in expression is not allowed here");
+            }
+            if (!Check(TokenKind::In)) {
+                throw std::runtime_error("SyntaxError: Private identifier must be followed by 'in'");
+            }
+            return std::make_unique<PrivateIdentifierExpr>(field_name);
+        }
         case TokenKind::Class: {
             std::string name = "";
             if (Check(TokenKind::Identifier)) {
@@ -2436,41 +2561,12 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                 Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
                 super_name = super_tok.text;
             }
-            Consume(TokenKind::OpenBrace, "Expected '{' in class declaration");
-            int class_brace_depth = 1;
-            bool has_static_name = false;
-            while (class_brace_depth > 0 && !Check(TokenKind::EndOfFile)) {
-                if (Check(TokenKind::OpenBrace)) {
-                    class_brace_depth++;
-                } else if (Check(TokenKind::CloseBrace)) {
-                    class_brace_depth--;
-                    if (class_brace_depth == 0) {
-                        Advance();
-                        break;
-                    }
-                }
-                if (class_brace_depth == 1 && Check(TokenKind::Static)) {
-                    Advance();
-                    if (!Check(TokenKind::OpenParen) && !Check(TokenKind::Semicolon) && !Check(TokenKind::Equal)) {
-                        if (Check(TokenKind::Identifier) && (current_token_.text == "get" || current_token_.text == "set" || current_token_.text == "async")) {
-                            Advance();
-                        }
-                        if (Check(TokenKind::Star)) {
-                            Advance();
-                        }
-                        if ((Check(TokenKind::Identifier) || Check(TokenKind::String)) && current_token_.text == "name") {
-                            has_static_name = true;
-                        }
-                    }
-                    continue;
-                }
-                Advance();
+            auto body = ParseClassElements(super_name);
+            auto class_expr = std::make_unique<ClassExpr>(name, super_name, std::move(body.methods));
+            for (auto& f : body.fields) {
+                class_expr->AddField(f.name, std::move(f.initializer));
             }
-            auto fn = std::make_unique<FunctionExpr>(name, std::vector<std::string>{}, std::make_unique<BlockStmt>());
-            if (has_static_name) {
-                fn->SetHasStaticName(true);
-            }
-            return fn;
+            return class_expr;
         }
         case TokenKind::New: {
             if (Match(TokenKind::Dot)) {
@@ -2720,17 +2816,29 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
             std::string name = "";
             if (Check(TokenKind::Identifier)) {
                 name = Advance().text;
+            } else if (Check(TokenKind::Await) && !in_async_ && !is_module_) {
+                name = Advance().text;
+            } else if (Check(TokenKind::Yield) && !is_generator && !in_generator_ && !strict_mode_) {
+                name = Advance().text;
             }
             Consume(TokenKind::OpenParen, "Expected '(' after 'function'");
+
+            auto parse_fn_expr_param = [&]() -> Token {
+                if (Check(TokenKind::Identifier)) return Advance();
+                if (Check(TokenKind::Await) && !in_async_ && !is_module_) return Advance();
+                if (Check(TokenKind::Yield) && !is_generator && !in_generator_ && !strict_mode_) return Advance();
+                return Consume(TokenKind::Identifier, "Expected parameter name");
+            };
+
             std::vector<std::string> params;
             std::vector<std::unique_ptr<Expr>> param_defaults;
             std::string rest_param = "";
             if (!Check(TokenKind::CloseParen)) {
                 if (Match(TokenKind::DotDotDot)) {
-                    Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                    Token r = parse_fn_expr_param();
                     rest_param = r.text;
                 } else {
-                    Token p = Consume(TokenKind::Identifier, "Expected parameter name");
+                    Token p = parse_fn_expr_param();
                     std::unique_ptr<Expr> def = nullptr;
                     if (Match(TokenKind::Equal)) {
                         def = ParseExpression();
@@ -2739,11 +2847,11 @@ std::unique_ptr<Expr> Parser::ParsePrefix() {
                     param_defaults.push_back(std::move(def));
                     while (Match(TokenKind::Comma)) {
                         if (Match(TokenKind::DotDotDot)) {
-                            Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
+                            Token r = parse_fn_expr_param();
                             rest_param = r.text;
                             break;
                         }
-                        Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
+                        Token np = parse_fn_expr_param();
                         std::unique_ptr<Expr> next_def = nullptr;
                         if (Match(TokenKind::Equal)) {
                             next_def = ParseExpression();
@@ -2919,7 +3027,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
                 }
             }
             Consume(TokenKind::CloseParen, "Expected ')' after argument list in optional call");
-            return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args));
+            return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args), true);
         }
         if (current_token_.text.empty() || (!std::isalpha(static_cast<unsigned char>(current_token_.text[0])) && current_token_.text[0] != '_' && current_token_.text[0] != '$')) {
             throw std::runtime_error("SyntaxError: Expected property identifier after '?.'");
@@ -2967,7 +3075,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         }
         Consume(TokenKind::CloseParen, "Expected ')' after argument list");
         if (IsOptionalChain(lhs.get())) {
-            return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args));
+            return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args), false);
         }
         return std::make_unique<CallExpr>(std::move(lhs), std::move(args));
     }
@@ -3137,22 +3245,22 @@ std::unique_ptr<CallExpr> Parser::MakeTaggedTemplateCall(std::unique_ptr<Expr> t
     Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
     JSObject* arr_proto = Realm::Current() ? Realm::Current()->GetArrayPrototype() : nullptr;
 
-    auto* template_arr = new JSArray(root, op_token.template_quasis.size());
+    auto* template_arr = AllocateRuntime<JSArray>(root, op_token.template_quasis.size());
     if (arr_proto) template_arr->SetPrototype(arr_proto);
 
-    auto* raw_arr = new JSArray(root, op_token.template_raw_quasis.size());
+    auto* raw_arr = AllocateRuntime<JSArray>(root, op_token.template_raw_quasis.size());
     if (arr_proto) raw_arr->SetPrototype(arr_proto);
 
     for (size_t i = 0; i < op_token.template_quasis.size(); ++i) {
         if (i < op_token.template_has_invalid_escape.size() && op_token.template_has_invalid_escape[i]) {
             template_arr->SetElement(i, TaggedValue::Undefined());
         } else {
-            template_arr->SetElement(i, TaggedValue::FromHeapObject(new JSString(op_token.template_quasis[i])));
+            template_arr->SetElement(i, TaggedValue::FromHeapObject(AllocateRuntime<JSString>(op_token.template_quasis[i])));
         }
     }
 
     for (size_t i = 0; i < op_token.template_raw_quasis.size(); ++i) {
-        raw_arr->SetElement(i, TaggedValue::FromHeapObject(new JSString(op_token.template_raw_quasis[i])));
+        raw_arr->SetElement(i, TaggedValue::FromHeapObject(AllocateRuntime<JSString>(op_token.template_raw_quasis[i])));
     }
 
     uint32_t dummy_shape_id = 9999;
