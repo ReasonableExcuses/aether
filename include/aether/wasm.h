@@ -542,6 +542,11 @@ private:
 
 void InitializeWebAssembly(Realm& realm);
 
+// Host-Object Registry Garbage Collection Hooks
+void WasmRegistryPruneDead(const std::function<bool(JSObject*)>& is_alive);
+void WasmRegistryRelocate(const std::function<JSObject*(JSObject*)>& resolve);
+size_t WasmRegistryTotalEntries();
+
 } // namespace aether
 
 #endif // AETHER_WASM_H

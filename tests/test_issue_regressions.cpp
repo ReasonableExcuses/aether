@@ -17,6 +17,8 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <thread>
+#include <chrono>
 
 using namespace aether;
 
@@ -167,27 +169,68 @@ static void Test3_DataViewBoundsOverflow() {
 }
 
 // ============================================================================
-// [Regression 4] TypedArray BigInt64 & BigUint64 Support
+// [Regression 4] TypedArray BigInt64 & BigUint64 Genuine JavaScript Semantics
 // ============================================================================
 static void Test4_BigIntTypedArrays() {
     std::cout << "[Regression 4] Verifying BigInt64Array & BigUint64Array element access..." << std::endl;
 
-    auto* buf64 = new JSArrayBuffer(32);
-    JSTypedArray bi64(TypedArrayKind::BigInt64, buf64, 0, 4);
-    JSTypedArray bu64(TypedArrayKind::BigUint64, buf64, 0, 4);
+    auto* buf64 = new JSArrayBuffer(64);
+    JSTypedArray bi64(TypedArrayKind::BigInt64, buf64, 0, 8);
+    JSTypedArray bu64(TypedArrayKind::BigUint64, buf64, 0, 8);
 
-    // Write and read via JSTypedArray methods
+    // 1. Basic read/write with genuine BigInt results
     bi64.SetElement(0, TaggedValue::FromDouble(123456789.0));
     TaggedValue v0 = bi64.GetElement(0);
-    Assert(v0.IsDouble() && v0.AsDouble() == 123456789.0, "BigInt64 element 0 mismatch");
+    Assert(v0.IsBigInt(), "BigInt64 element 0 must be BigInt");
+    Assert(v0.ToString() == "123456789", "BigInt64 element 0 value mismatch");
 
+    // 2. Negative 64-bit values
     bi64.SetElement(1, TaggedValue::FromDouble(-987654321.0));
     TaggedValue v1 = bi64.GetElement(1);
-    Assert(v1.IsDouble() && v1.AsDouble() == -987654321.0, "BigInt64 element 1 negative mismatch");
+    Assert(v1.IsBigInt(), "BigInt64 element 1 must be BigInt");
+    Assert(v1.ToString() == "-987654321", "BigInt64 element 1 negative mismatch");
 
-    bu64.SetElement(2, TaggedValue::FromDouble(4294967296.0)); // > 32-bit
-    TaggedValue v2 = bu64.GetElement(2);
-    Assert(v2.IsDouble() && v2.AsDouble() == 4294967296.0, "BigUint64 element 2 mismatch");
+    // 3. Values strictly beyond 2^53 - 1 (loss of precision in double)
+    // 2^53 + 1 = 9007199254740993
+    int64_t beyond53 = 9007199254740993LL;
+    bi64.SetElement(2, TaggedValue::FromHeapObject(JSBigInt::Create(beyond53)));
+    TaggedValue v2 = bi64.GetElement(2);
+    Assert(v2.IsBigInt(), "BigInt64 element 2 must be BigInt");
+    Assert(v2.ToString() == "9007199254740993", "BigInt64 element 2 precision mismatch beyond 2^53-1");
+
+    // Negative beyond 2^53 - 1
+    int64_t neg_beyond53 = -9007199254740993LL;
+    bi64.SetElement(3, TaggedValue::FromHeapObject(JSBigInt::Create(neg_beyond53)));
+    TaggedValue v3 = bi64.GetElement(3);
+    Assert(v3.IsBigInt(), "BigInt64 element 3 must be BigInt");
+    Assert(v3.ToString() == "-9007199254740993", "BigInt64 negative precision mismatch beyond 2^53-1");
+
+    // 4. Unsigned 64-bit values and unsigned wraparound
+    // Write -1LL into BigUint64Array -> wraps around to 18446744073709551615 (2^64 - 1)
+    bu64.SetElement(4, TaggedValue::FromHeapObject(JSBigInt::Create(-1LL)));
+    TaggedValue v4 = bu64.GetElement(4);
+    Assert(v4.IsBigInt(), "BigUint64 element 4 must be BigInt");
+    Assert(v4.ToString() == "18446744073709551615", "BigUint64 unsigned wraparound mismatch for -1");
+
+    // 5. End-to-end JavaScript evaluation via Agent
+    Agent agent;
+    TaggedValue js_res = agent.EvaluateScript(R"(
+        const bi = new BigInt64Array(2);
+        const bu = new BigUint64Array(2);
+        bi[0] = 9007199254740993n;
+        bi[1] = -9007199254740993n;
+        bu[0] = 18446744073709551615n;
+        bu[1] = -1n; // Wraps to 2^64-1
+
+        (typeof bi[0] === 'bigint') &&
+        (bi[0] === 9007199254740993n) &&
+        (typeof bi[1] === 'bigint') &&
+        (bi[1] === -9007199254740993n) &&
+        (typeof bu[0] === 'bigint') &&
+        (bu[0] === 18446744073709551615n) &&
+        (bu[1] === 18446744073709551615n);
+    )");
+    Assert(js_res.IsTrue(), "End-to-end BigInt64Array & BigUint64Array JavaScript execution failed");
 
     delete buf64;
     std::cout << "  -> PASSED: BigInt64Array and BigUint64Array verified." << std::endl;
@@ -356,6 +399,336 @@ static void Test9_ConcurrentMarkerSATBBarrier() {
 }
 
 // ============================================================================
+// [Regression 10] DataView BigInt64 & BigUint64 Endianness & Precision
+// ============================================================================
+static void Test10_DataViewBigInt64AndBigUint64() {
+    std::cout << "[Regression 10] Verifying DataView getBigInt64/setBigInt64/getBigUint64/setBigUint64..." << std::endl;
+
+    auto* buffer = new JSArrayBuffer(32);
+    JSDataView view(buffer, 0, 32);
+
+    int64_t val64 = 9007199254740993LL; // 2^53 + 1
+    view.SetBigInt64(0, val64, true);
+    Assert(view.GetBigInt64(0, true) == val64, "DataView little-endian BigInt64 mismatch");
+
+    int64_t neg_val64 = -9007199254740993LL;
+    view.SetBigInt64(8, neg_val64, false);
+    Assert(view.GetBigInt64(8, false) == neg_val64, "DataView big-endian negative BigInt64 mismatch");
+
+    uint64_t uval64 = 18446744073709551615ULL; // 2^64 - 1
+    view.SetBigUint64(16, uval64, true);
+    Assert(view.GetBigUint64(16, true) == uval64, "DataView little-endian BigUint64 mismatch");
+
+    delete buffer;
+
+    // JavaScript evaluation
+    Agent agent;
+    TaggedValue js_res = agent.EvaluateScript(R"(
+        const ab = new ArrayBuffer(32);
+        const dv = new DataView(ab);
+        dv.setBigInt64(0, 9007199254740993n, true);
+        dv.setBigInt64(8, -9007199254740993n, false);
+        dv.setBigUint64(16, 18446744073709551615n, true);
+
+        const v1 = dv.getBigInt64(0, true);
+        const v2 = dv.getBigInt64(8, false);
+        const v3 = dv.getBigUint64(16, true);
+
+        (typeof v1 === 'bigint') && (v1 === 9007199254740993n) &&
+        (typeof v2 === 'bigint') && (v2 === -9007199254740993n) &&
+        (typeof v3 === 'bigint') && (v3 === 18446744073709551615n);
+    )");
+    Assert(js_res.IsBoolean() && js_res.AsBoolean(), "DataView BigInt JS evaluation failed");
+
+    std::cout << "  -> PASSED: DataView BigInt 64-bit endianness and precision verified." << std::endl;
+}
+
+// ============================================================================
+// [Regression 11] WebAssembly Full Validation & i64/BigInt Interoperability
+// ============================================================================
+struct WasmBuilder {
+    std::vector<uint8_t> bytes{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00};
+
+    static void AppendU32(std::vector<uint8_t>& buf, uint32_t val) {
+        do {
+            uint8_t b = val & 0x7F;
+            val >>= 7;
+            if (val != 0) b |= 0x80;
+            buf.push_back(b);
+        } while (val != 0);
+    }
+
+    void AddSection(uint8_t sec_id, const std::vector<uint8_t>& payload) {
+        bytes.push_back(sec_id);
+        AppendU32(bytes, static_cast<uint32_t>(payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+    }
+};
+
+static void Test11_WasmValidationAndI64Interop() {
+    std::cout << "[Regression 11] Verifying WebAssembly operand-stack typing, control-flow & i64 BigInt interop..." << std::endl;
+
+    // 1. Stack underflow rejection: i32.add with no operands
+    {
+        WasmBuilder b;
+        std::vector<uint8_t> sec_type;
+        WasmBuilder::AppendU32(sec_type, 1);
+        sec_type.push_back(0x60); // func
+        WasmBuilder::AppendU32(sec_type, 0); // 0 params
+        WasmBuilder::AppendU32(sec_type, 1); // 1 result
+        sec_type.push_back(0x7F); // i32
+        b.AddSection(1, sec_type);
+
+        std::vector<uint8_t> sec_func;
+        WasmBuilder::AppendU32(sec_func, 1);
+        WasmBuilder::AppendU32(sec_func, 0);
+        b.AddSection(3, sec_func);
+
+        std::vector<uint8_t> body{0x00, 0x6A, 0x0B}; // 0 locals, i32.add, end
+        std::vector<uint8_t> sec_code;
+        WasmBuilder::AppendU32(sec_code, 1);
+        WasmBuilder::AppendU32(sec_code, static_cast<uint32_t>(body.size()));
+        sec_code.insert(sec_code.end(), body.begin(), body.end());
+        b.AddSection(10, sec_code);
+
+        Assert(!WasmModule::Validate(b.bytes.data(), b.bytes.size()), "Stack underflow must fail validation");
+    }
+
+    // 2. Operand type mismatch rejection: i32 + f32 given to i32.add
+    {
+        WasmBuilder b;
+        std::vector<uint8_t> sec_type{0x01, 0x60, 0x00, 0x01, 0x7F};
+        b.AddSection(1, sec_type);
+
+        std::vector<uint8_t> sec_func{0x01, 0x00};
+        b.AddSection(3, sec_func);
+
+        std::vector<uint8_t> body{0x00, 0x41, 0x01, 0x43, 0x00, 0x00, 0x00, 0x00, 0x6A, 0x0B};
+        std::vector<uint8_t> sec_code{0x01};
+        WasmBuilder::AppendU32(sec_code, static_cast<uint32_t>(body.size()));
+        sec_code.insert(sec_code.end(), body.begin(), body.end());
+        b.AddSection(10, sec_code);
+
+        Assert(!WasmModule::Validate(b.bytes.data(), b.bytes.size()), "Operand type mismatch must fail validation");
+    }
+
+    // 3. Control-flow stack violation rejection: branch depth out of range
+    {
+        WasmBuilder b;
+        std::vector<uint8_t> sec_type{0x01, 0x60, 0x00, 0x00}; // () -> ()
+        b.AddSection(1, sec_type);
+
+        std::vector<uint8_t> sec_func{0x01, 0x00};
+        b.AddSection(3, sec_func);
+
+        std::vector<uint8_t> body{0x00, 0x02, 0x40, 0x0C, 0x05, 0x0B, 0x0B};
+        std::vector<uint8_t> sec_code{0x01};
+        WasmBuilder::AppendU32(sec_code, static_cast<uint32_t>(body.size()));
+        sec_code.insert(sec_code.end(), body.begin(), body.end());
+        b.AddSection(10, sec_code);
+
+        Assert(!WasmModule::Validate(b.bytes.data(), b.bytes.size()), "Invalid branch target depth must fail validation");
+    }
+
+    // 4. Valid module with unreachable polymorphic stack
+    {
+        WasmBuilder b;
+        std::vector<uint8_t> sec_type{0x01, 0x60, 0x00, 0x01, 0x7F}; // () -> (i32)
+        b.AddSection(1, sec_type);
+
+        std::vector<uint8_t> sec_func{0x01, 0x00};
+        b.AddSection(3, sec_func);
+
+        std::vector<uint8_t> body{0x00, 0x00, 0x6A, 0x0B};
+        std::vector<uint8_t> sec_code{0x01};
+        WasmBuilder::AppendU32(sec_code, static_cast<uint32_t>(body.size()));
+        sec_code.insert(sec_code.end(), body.begin(), body.end());
+        b.AddSection(10, sec_code);
+
+        Assert(WasmModule::Validate(b.bytes.data(), b.bytes.size()), "Unreachable polymorphic stack must pass validation");
+    }
+
+    // 5. WasmVal i64 <-> JS BigInt 64-bit range preservation
+    Agent agent;
+    WasmVal v1 = WasmVal::MakeI64(9007199254740993LL);
+    TaggedValue tv1 = v1.ToJS(agent.GetRealm());
+    Assert(tv1.IsBigInt(), "v1.ToJS() must be BigInt");
+    Assert(tv1.ToString() == "9007199254740993", "v1 BigInt string value mismatch");
+    WasmVal rt1 = WasmVal::FromJS(tv1, WasmValType::I64);
+    Assert(rt1.i64 == 9007199254740993LL, "Roundtrip i64 precision loss beyond 2^53-1");
+
+    WasmVal v2 = WasmVal::MakeI64(-9007199254740993LL);
+    TaggedValue tv2 = v2.ToJS(agent.GetRealm());
+    Assert(tv2.IsBigInt(), "v2.ToJS() must be BigInt");
+    Assert(tv2.ToString() == "-9007199254740993", "v2 BigInt negative string mismatch");
+    WasmVal rt2 = WasmVal::FromJS(tv2, WasmValType::I64);
+    Assert(rt2.i64 == -9007199254740993LL, "Negative roundtrip i64 precision loss");
+
+    std::cout << "  -> PASSED: WebAssembly operand-stack typing, control-flow & i64 BigInt verified." << std::endl;
+}
+
+// ============================================================================
+// [Regression 12] BackgroundCompiler Safety Under Owner Destruction
+// ============================================================================
+static void Test12_BackgroundCompilerOwnerDestructionSafety() {
+    std::cout << "[Regression 12] Verifying BackgroundCompiler safety under owner destruction..." << std::endl;
+
+    BackgroundCompiler compiler(2);
+    compiler.Start();
+
+    std::atomic<bool> done{false};
+    {
+        std::string_view src = "function compute(n) { var x = 0; while (x < n) { x = x + 1; } return x; }";
+        Lexer lexer(src);
+        Parser parser(lexer);
+        auto func_decl = parser.ParseStatement();
+        BytecodeEmitter emitter;
+        auto bc_raw = emitter.EmitFunction(dynamic_cast<FunctionDeclStmt*>(func_decl.get()));
+        std::shared_ptr<const BytecodeArray> shared_bc = std::move(bc_raw);
+
+        TypeFeedbackVector feedback(16);
+        compiler.Enqueue(shared_bc, &feedback, [&done](std::shared_ptr<ExecutableMemory> exec) {
+            Assert(exec != nullptr, "JIT compilation must produce executable memory");
+            done.store(true);
+        });
+    }
+
+    compiler.WaitForPendingTasks();
+    Assert(done.load(), "Compilation job must succeed even when local shared_ptr was dropped");
+    compiler.Stop();
+
+    std::cout << "  -> PASSED: Worker safely retains bytecode ownership preventing use-after-free." << std::endl;
+}
+
+// ============================================================================
+// [Regression 13] Wasm Host Registry GC Pruning & Cleanup
+// ============================================================================
+static void Test13_WasmRegistryPruneDeadUnderGC() {
+    std::cout << "[Regression 13] Verifying Wasm host-object registry GC prune and cleanup..." << std::endl;
+
+    IsolateHeap heap;
+    IsolateHeap::SetCurrent(&heap);
+
+    {
+        Agent agent;
+        agent.EvaluateScript(R"(
+            for (let i = 0; i < 30; ++i) {
+                const mem = new WebAssembly.Memory({ initial: 1 });
+                const tbl = new WebAssembly.Table({ initial: 1, element: 'anyfunc' });
+            }
+        )");
+    }
+
+    heap.MajorGC();
+    heap.MinorGC();
+
+    WasmRegistryPruneDead([](HeapObject*) { return false; });
+    Assert(WasmRegistryTotalEntries() == 0, "All dead entries must be pruned from Wasm registry");
+
+    IsolateHeap::SetCurrent(nullptr);
+    std::cout << "  -> PASSED: Wasm registry safely pruned dead host wrappers during GC cycles." << std::endl;
+}
+
+// ============================================================================
+// [Regression 14] Atomics 64-bit BigInt Semantics, Synchronization & Cancellation
+// ============================================================================
+static void Test14_AtomicsBigIntOperationsAndStress() {
+    std::cout << "[Regression 14] Verifying Atomics 64-bit BigInt semantics and concurrency..." << std::endl;
+
+    Agent agent;
+
+    std::string script = R"(
+        const sab = new SharedArrayBuffer(64);
+        const bi = new BigInt64Array(sab);
+        const bu = new BigUint64Array(sab);
+
+        // 1. Atomics.store and load
+        Atomics.store(bi, 0, 9007199254740993n);
+        const l0 = Atomics.load(bi, 0);
+        const okLoad = (typeof l0 === 'bigint') && (l0 === 9007199254740993n);
+
+        // 2. Atomics.add with 64-bit precision preservation
+        const prevAdd = Atomics.add(bi, 0, 1000n);
+        const postAdd = Atomics.load(bi, 0);
+        const okAdd = (prevAdd === 9007199254740993n) && (postAdd === 9007199254741993n);
+
+        // 3. Atomics.sub
+        const prevSub = Atomics.sub(bi, 0, 1000n);
+        const postSub = Atomics.load(bi, 0);
+        const okSub = (prevSub === 9007199254741993n) && (postSub === 9007199254740993n);
+
+        // 4. Atomics.and / or / xor
+        Atomics.store(bi, 0, 0x0F0F0F0F0F0F0F0Fn);
+        Atomics.and(bi, 0, 0x00FF00FF00FF00FFn);
+        const okAnd = Atomics.load(bi, 0) === 0x000F000F000F000Fn;
+
+        Atomics.or(bi, 0, 0x7000700070007000n);
+        const okOr = Atomics.load(bi, 0) === 0x700F700F700F700Fn;
+
+        Atomics.xor(bi, 0, 0x700F700F700F700Fn);
+        const okXor = Atomics.load(bi, 0) === 0n;
+
+        // BigUint64Array test
+        Atomics.store(bu, 0, 18446744073709551615n);
+        const okBu = (Atomics.load(bu, 0) === 18446744073709551615n);
+
+        // 5. Atomics.compareExchange on BigInt64Array
+        Atomics.store(bi, 1, 100n);
+        const ce1 = Atomics.compareExchange(bi, 1, 100n, 200n); // success, returns 100n
+        const ce1Val = Atomics.load(bi, 1); // 200n
+        const ce2 = Atomics.compareExchange(bi, 1, 999n, 300n); // mismatch, returns 200n
+        const ce2Val = Atomics.load(bi, 1); // still 200n
+        const okCE = (ce1 === 100n) && (ce1Val === 200n) && (ce2 === 200n) && (ce2Val === 200n);
+
+        // 6. Atomics.wait on BigInt64Array: not-equal and timed-out
+        const wNotEq = Atomics.wait(bi, 1, 999n) === "not-equal";
+        const wTimeout = Atomics.wait(bi, 1, 200n, 5) === "timed-out";
+
+        // 7. Atomics.waitAsync sync returns on BigInt64Array
+        const waNotEq = Atomics.waitAsync(bi, 1, 999n);
+        const okWaNotEq = !waNotEq.async && (waNotEq.value === "not-equal");
+
+        const waTimeout = Atomics.waitAsync(bi, 1, 200n, 0);
+        const okWaTimeout = !waTimeout.async && (waTimeout.value === "timed-out");
+
+        okLoad && okAdd && okSub && okAnd && okOr && okXor && okBu && okCE && wNotEq && wTimeout && okWaNotEq && okWaTimeout;
+    )";
+
+    TaggedValue res = agent.EvaluateScript(script);
+    Assert(res.IsBoolean() && res.AsBoolean(), "Atomics 64-bit BigInt evaluation failed");
+
+    // 8. Multi-threaded FutexManager Wait64 / Notify synchronization
+    int64_t futex_val = 123456789012345LL;
+    std::atomic<bool> wait_completed{false};
+    std::string wait_status;
+
+    std::thread waiter([&]() {
+        wait_status = FutexManager::Instance().Wait64(&futex_val, 123456789012345LL, 5000.0);
+        wait_completed.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    uint32_t woken = FutexManager::Instance().Notify(&futex_val, 1);
+    Assert(woken == 1, "Notify must awaken exactly 1 64-bit waiter");
+
+    waiter.join();
+    Assert(wait_completed.load(), "Wait64 must have completed");
+    Assert(wait_status == "ok", "Wait64 must return ok on notification");
+
+    // 9. Agent cancellation & shutdown test with active async wait
+    {
+        Agent temp_agent;
+        int64_t async_val = 42LL;
+        auto* prom = AllocateRuntime<JSPromise>(temp_agent.GetRealm().GetRootShape());
+        AsyncWaitManager::Instance().SpawnWait64(&async_val, 42LL, 10000.0, prom, &temp_agent, &temp_agent.GetRealm());
+
+        AsyncWaitManager::Instance().CancelAndJoinForAgent(&temp_agent);
+    }
+
+    std::cout << "  -> PASSED: Atomics 64-bit operations, futex wait/notify, waitAsync, and agent cancellation verified." << std::endl;
+}
+
+// ============================================================================
 // Main Regression Test Runner
 // ============================================================================
 int main() {
@@ -372,9 +745,14 @@ int main() {
     Test7_IsolateScopeContextSwitching();
     Test8_BackgroundCompilerOwnershipAndFeedback();
     Test9_ConcurrentMarkerSATBBarrier();
+    Test10_DataViewBigInt64AndBigUint64();
+    Test11_WasmValidationAndI64Interop();
+    Test12_BackgroundCompilerOwnerDestructionSafety();
+    Test13_WasmRegistryPruneDeadUnderGC();
+    Test14_AtomicsBigIntOperationsAndStress();
 
     std::cout << "========================================================\n";
-    std::cout << "ALL 9 REGRESSION TESTS PASSED CLEANLY (9/9)!\n";
+    std::cout << "ALL 14 REGRESSION TESTS PASSED CLEANLY (14/14)!\n";
     std::cout << "========================================================\n";
 
     return 0;

@@ -63,7 +63,7 @@ private:
 
 struct AsyncWaitState : AsyncWaitManager::WaitTask {
     std::optional<MicrotaskQueue::PendingTask> completion;
-    int32_t* address{nullptr};
+    void* address{nullptr};
     std::atomic<bool> finished{false};
     std::string result;
     bool resource_failed{false};
@@ -144,6 +144,59 @@ void AsyncWaitManager::SpawnWait(int32_t* ptr, int32_t expected, double timeout,
     }
 }
 
+void AsyncWaitManager::SpawnWait64(int64_t* ptr, int64_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm) {
+    (void)realm;
+    NoGCScope guard;
+    if (std::isnan(timeout)) timeout = std::numeric_limits<double>::infinity();
+    if (timeout < 0.0) timeout = 0.0;
+    auto& queue = agent ? agent->GetMicrotasks() : CurrentMicrotaskQueue();
+    auto task = std::make_shared<AsyncWaitState>();
+    task->agent = agent;
+    task->address = static_cast<void*>(ptr);
+    std::vector<TaggedValue> roots{TaggedValue::FromHeapObject(promise)};
+    auto* wait_promise = dynamic_cast<AsyncWaitPromise*>(promise);
+    if (wait_promise) roots.push_back(wait_promise->BufferRoot());
+    task->completion.emplace(queue.Prepare([this, promise, task, &queue]() {
+        if (task->worker.joinable()) task->worker.join();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            std::erase(tasks_, task);
+        }
+        if (task->cancelled.load(std::memory_order_acquire)) return;
+        if (task->resource_failed) {
+            RaiseResourceError("Async wait allocation failed");
+            if (auto* interpreter = Interpreter::Current()) {
+                TaggedValue reason = interpreter->PendingException();
+                interpreter->ClearPendingException();
+                promise->Reject(reason, queue);
+            }
+            return;
+        }
+        promise->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(task->result)), queue);
+    }, std::move(roots)));
+    if (wait_promise) wait_promise->ReleaseBuffer();
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        tasks_.push_back(task);
+        task->worker = std::thread([ptr, expected, timeout, task]() {
+            try {
+                if (!task->cancelled.load(std::memory_order_acquire)) {
+                    task->result = FutexManager::Instance().Wait64(ptr, expected, timeout);
+                }
+            } catch (...) {
+                task->resource_failed = true;
+            }
+            task->completion->Publish();
+            task->finished.store(true, std::memory_order_release);
+        });
+    } catch (...) {
+        std::erase(tasks_, task);
+        task->completion->Cancel();
+        throw;
+    }
+}
+
 void AsyncWaitManager::CancelAndJoinForAgent(Agent* agent) {
     std::vector<std::shared_ptr<WaitTask>> agent_tasks;
     {
@@ -183,8 +236,97 @@ void AsyncWaitManager::Shutdown() {
 }
 
 // ============================================================================
-// Helper: Atomic Operations Dispatcher for Atomics.*
+// Helper: ECMAScript Conversion & Atomic Operations Dispatcher for Atomics.*
 // ============================================================================
+
+static bool ECMAScriptToIndex(TaggedValue val, size_t max_len, size_t& out_idx, std::string* err_type, std::string* err_msg) {
+    if (val.IsSmi()) {
+        int32_t s = val.AsSmi();
+        if (s < 0 || static_cast<size_t>(s) >= max_len) {
+            if (err_type) *err_type = "RangeError";
+            if (err_msg) *err_msg = "index out of bounds";
+            return false;
+        }
+        out_idx = static_cast<size_t>(s);
+        return true;
+    }
+    if (val.IsDouble()) {
+        double d = val.AsDouble();
+        if (std::isnan(d) || d < 0.0 || d >= static_cast<double>(max_len) || d != std::floor(d)) {
+            if (err_type) *err_type = "RangeError";
+            if (err_msg) *err_msg = "index out of bounds";
+            return false;
+        }
+        out_idx = static_cast<size_t>(d);
+        return true;
+    }
+    if (val.IsHeapObject() && val.AsHeapObject()->IsString()) {
+        try {
+            int64_t s = std::stoll(static_cast<JSString*>(val.AsHeapObject())->Value());
+            if (s < 0 || static_cast<size_t>(s) >= max_len) {
+                if (err_type) *err_type = "RangeError";
+                if (err_msg) *err_msg = "index out of bounds";
+                return false;
+            }
+            out_idx = static_cast<size_t>(s);
+            return true;
+        } catch (...) {
+            if (err_type) *err_type = "RangeError";
+            if (err_msg) *err_msg = "invalid index";
+            return false;
+        }
+    }
+    double d = ValueToNumber(val);
+    if (std::isnan(d) || d < 0.0 || d >= static_cast<double>(max_len) || d != std::floor(d)) {
+        if (err_type) *err_type = "RangeError";
+        if (err_msg) *err_msg = "index out of bounds";
+        return false;
+    }
+    out_idx = static_cast<size_t>(d);
+    return true;
+}
+
+static int64_t ECMAScriptToBigInt64(TaggedValue val) {
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->GetType() == HeapObjectType::JSBigInt) {
+            return static_cast<JSBigInt*>(ho)->ToInt64();
+        }
+        if (ho->GetType() == HeapObjectType::String) {
+            try {
+                return std::stoll(static_cast<JSString*>(ho)->Value());
+            } catch (...) {
+                return 0;
+            }
+        }
+        return static_cast<int64_t>(ValueToNumber(val));
+    }
+    if (val.IsSmi()) return static_cast<int64_t>(val.AsSmi());
+    if (val.IsDouble()) return static_cast<int64_t>(val.AsDouble());
+    if (val.IsBoolean()) return val.ToBoolean() ? 1LL : 0LL;
+    return static_cast<int64_t>(ValueToNumber(val));
+}
+
+static uint64_t ECMAScriptToBigUint64(TaggedValue val) {
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->GetType() == HeapObjectType::JSBigInt) {
+            return static_cast<JSBigInt*>(ho)->ToUint64();
+        }
+        if (ho->GetType() == HeapObjectType::String) {
+            try {
+                return std::stoull(static_cast<JSString*>(ho)->Value());
+            } catch (...) {
+                return 0;
+            }
+        }
+        return static_cast<uint64_t>(ValueToNumber(val));
+    }
+    if (val.IsSmi()) return static_cast<uint64_t>(val.AsSmi());
+    if (val.IsDouble()) return static_cast<uint64_t>(val.AsDouble());
+    if (val.IsBoolean()) return val.ToBoolean() ? 1ULL : 0ULL;
+    return static_cast<uint64_t>(ValueToNumber(val));
+}
 
 template <typename Op>
 static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::string_view op_name, Op&& op) {
@@ -223,28 +365,16 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
         return TaggedValue::Undefined();
     }
 
-    int64_t idx = -1;
-    if (args[1].IsSmi()) {
-        idx = args[1].AsSmi();
-    } else if (args[1].IsNumber()) {
-        idx = static_cast<int64_t>(args[1].AsNumber());
-    } else {
+    size_t uidx = 0;
+    std::string err_type, err_msg;
+    if (!ECMAScriptToIndex(args[1], ta->Length(), uidx, &err_type, &err_msg)) {
         if (Interpreter::Current()) {
             Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                AllocateRuntime<JSError>("TypeError", std::string(op_name) + ": invalid index")));
+                AllocateRuntime<JSError>(err_type, std::string(op_name) + ": " + err_msg)));
         }
         return TaggedValue::Undefined();
     }
 
-    if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
-        if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                AllocateRuntime<JSError>("RangeError", std::string(op_name) + ": index out of bounds")));
-        }
-        return TaggedValue::Undefined();
-    }
-
-    size_t uidx = static_cast<size_t>(idx);
     uint8_t* ptr = ta->Data() + uidx * ta->BytesPerElement();
 
     switch (ta->Kind()) {
@@ -283,22 +413,20 @@ static TaggedValue PerformAtomicOp(const std::vector<TaggedValue>& args, std::st
             std::atomic_ref<int64_t> ref(*p);
             int64_t arg_val = 0;
             if (args.size() > 2) {
-                if (args[2].IsSmi()) arg_val = args[2].AsSmi();
-                else if (args[2].IsDouble()) arg_val = static_cast<int64_t>(args[2].AsDouble());
-                else arg_val = static_cast<int64_t>(ValueToNumber(args[2]));
+                arg_val = ECMAScriptToBigInt64(args[2]);
             }
-            return TaggedValue::FromDouble(static_cast<double>(op(ref, arg_val)));
+            int64_t res = op(ref, arg_val);
+            return TaggedValue::FromHeapObject(JSBigInt::Create(res));
         }
         case TypedArrayKind::BigUint64: {
             auto* p = reinterpret_cast<uint64_t*>(ptr);
             std::atomic_ref<uint64_t> ref(*p);
             uint64_t arg_val = 0;
             if (args.size() > 2) {
-                if (args[2].IsSmi()) arg_val = static_cast<uint64_t>(args[2].AsSmi());
-                else if (args[2].IsDouble()) arg_val = static_cast<uint64_t>(args[2].AsDouble());
-                else arg_val = static_cast<uint64_t>(ValueToNumber(args[2]));
+                arg_val = ECMAScriptToBigUint64(args[2]);
             }
-            return TaggedValue::FromDouble(static_cast<double>(op(ref, arg_val)));
+            uint64_t res = op(ref, arg_val);
+            return TaggedValue::FromHeapObject(JSBigInt::Create(res));
         }
         default: {
             if (Interpreter::Current()) {
@@ -712,15 +840,24 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             }
             return TaggedValue::Undefined();
         }
-        int64_t idx = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber());
-        if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
+        if (ta->Kind() == TypedArrayKind::Uint8Clamped ||
+            ta->Kind() == TypedArrayKind::Float32 ||
+            ta->Kind() == TypedArrayKind::Float64) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("RangeError", "Atomics.compareExchange: index out of bounds")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.compareExchange: unsupported TypedArray element type")));
             }
             return TaggedValue::Undefined();
         }
-        size_t uidx = static_cast<size_t>(idx);
+        size_t uidx = 0;
+        std::string err_type, err_msg;
+        if (!ECMAScriptToIndex(args[1], ta->Length(), uidx, &err_type, &err_msg)) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>(err_type, "Atomics.compareExchange: " + err_msg)));
+            }
+            return TaggedValue::Undefined();
+        }
         uint8_t* ptr = ta->Data() + uidx * ta->BytesPerElement();
 
         if (ta->Kind() == TypedArrayKind::Int32) {
@@ -765,6 +902,20 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             uint16_t replacement = static_cast<uint16_t>(ValueToNumber(args[3]));
             ref.compare_exchange_strong(expected, replacement, std::memory_order_seq_cst);
             return TaggedValue::FromSmi(expected);
+        } else if (ta->Kind() == TypedArrayKind::BigInt64) {
+            auto* p = reinterpret_cast<int64_t*>(ptr);
+            std::atomic_ref<int64_t> ref(*p);
+            int64_t expected = ECMAScriptToBigInt64(args[2]);
+            int64_t replacement = ECMAScriptToBigInt64(args[3]);
+            ref.compare_exchange_strong(expected, replacement, std::memory_order_seq_cst);
+            return TaggedValue::FromHeapObject(JSBigInt::Create(expected));
+        } else if (ta->Kind() == TypedArrayKind::BigUint64) {
+            auto* p = reinterpret_cast<uint64_t*>(ptr);
+            std::atomic_ref<uint64_t> ref(*p);
+            uint64_t expected = ECMAScriptToBigUint64(args[2]);
+            uint64_t replacement = ECMAScriptToBigUint64(args[3]);
+            ref.compare_exchange_strong(expected, replacement, std::memory_order_seq_cst);
+            return TaggedValue::FromHeapObject(JSBigInt::Create(expected));
         }
 
         if (Interpreter::Current()) {
@@ -786,15 +937,15 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: argument 0 must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
         auto* ta = static_cast<JSTypedArray*>(args[0].AsHeapObject());
-        if (ta->Kind() != TypedArrayKind::Int32) {
+        if (ta->Kind() != TypedArrayKind::Int32 && ta->Kind() != TypedArrayKind::BigInt64) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.wait: typedArray must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -806,16 +957,16 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             return TaggedValue::Undefined();
         }
 
-        int64_t idx = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber());
-        if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
+        size_t uidx = 0;
+        std::string err_type, err_msg;
+        if (!ECMAScriptToIndex(args[1], ta->Length(), uidx, &err_type, &err_msg)) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("RangeError", "Atomics.wait: index out of bounds")));
+                    AllocateRuntime<JSError>(err_type, "Atomics.wait: " + err_msg)));
             }
             return TaggedValue::Undefined();
         }
 
-        int32_t expected = static_cast<int32_t>(ValueToNumber(args[2]));
         double timeout = std::numeric_limits<double>::infinity();
         if (args.size() > 3 && !args[3].IsUndefined()) {
             timeout = args[3].AsNumber();
@@ -823,7 +974,15 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             if (timeout < 0.0) timeout = 0.0;
         }
 
-        int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + static_cast<size_t>(idx) * sizeof(int32_t));
+        if (ta->Kind() == TypedArrayKind::BigInt64) {
+            int64_t expected = ECMAScriptToBigInt64(args[2]);
+            int64_t* ptr = reinterpret_cast<int64_t*>(ta->Data() + uidx * sizeof(int64_t));
+            std::string res = FutexManager::Instance().Wait64(ptr, expected, timeout);
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
+        }
+
+        int32_t expected = static_cast<int32_t>(ValueToNumber(args[2]));
+        int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + uidx * sizeof(int32_t));
         std::string res = FutexManager::Instance().Wait32(ptr, expected, timeout);
         return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
     })), next_sid);
@@ -840,15 +999,15 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: argument 0 must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
         auto* ta = static_cast<JSTypedArray*>(args[0].AsHeapObject());
-        if (ta->Kind() != TypedArrayKind::Int32) {
+        if (ta->Kind() != TypedArrayKind::Int32 && ta->Kind() != TypedArrayKind::BigInt64) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.notify: typedArray must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -860,11 +1019,12 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             return TaggedValue::Undefined();
         }
 
-        int64_t idx = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber());
-        if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
+        size_t uidx = 0;
+        std::string err_type, err_msg;
+        if (!ECMAScriptToIndex(args[1], ta->Length(), uidx, &err_type, &err_msg)) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("RangeError", "Atomics.notify: index out of bounds")));
+                    AllocateRuntime<JSError>(err_type, "Atomics.notify: " + err_msg)));
             }
             return TaggedValue::Undefined();
         }
@@ -873,9 +1033,10 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (args.size() > 2 && !args[2].IsUndefined()) {
             double d = args[2].AsNumber();
             if (d >= 0.0) count = static_cast<uint32_t>(d);
+            else count = 0;
         }
 
-        void* ptr = static_cast<void*>(ta->Data() + static_cast<size_t>(idx) * sizeof(int32_t));
+        void* ptr = static_cast<void*>(ta->Data() + uidx * ta->BytesPerElement());
         uint32_t awakened = FutexManager::Instance().Notify(ptr, count);
         return TaggedValue::FromSmi(static_cast<int32_t>(awakened));
     })), next_sid);
@@ -892,15 +1053,15 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         if (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsTypedArray()) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: argument 0 must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: argument 0 must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
         auto* ta = static_cast<JSTypedArray*>(args[0].AsHeapObject());
-        if (ta->Kind() != TypedArrayKind::Int32) {
+        if (ta->Kind() != TypedArrayKind::Int32 && ta->Kind() != TypedArrayKind::BigInt64) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: typedArray must be an Int32Array")));
+                    AllocateRuntime<JSError>("TypeError", "Atomics.waitAsync: typedArray must be an Int32Array or BigInt64Array")));
             }
             return TaggedValue::Undefined();
         }
@@ -912,16 +1073,16 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             return TaggedValue::Undefined();
         }
 
-        int64_t idx = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber());
-        if (idx < 0 || static_cast<size_t>(idx) >= ta->Length()) {
+        size_t uidx = 0;
+        std::string err_type, err_msg;
+        if (!ECMAScriptToIndex(args[1], ta->Length(), uidx, &err_type, &err_msg)) {
             if (Interpreter::Current()) {
                 Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
-                    AllocateRuntime<JSError>("RangeError", "Atomics.waitAsync: index out of bounds")));
+                    AllocateRuntime<JSError>(err_type, "Atomics.waitAsync: " + err_msg)));
             }
             return TaggedValue::Undefined();
         }
 
-        int32_t expected = static_cast<int32_t>(ValueToNumber(args[2]));
         double timeout = std::numeric_limits<double>::infinity();
         if (args.size() > 3 && !args[3].IsUndefined()) {
             timeout = args[3].AsNumber();
@@ -929,11 +1090,41 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
             if (timeout < 0.0) timeout = 0.0;
         }
 
-        int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + static_cast<size_t>(idx) * sizeof(int32_t));
-        std::atomic_ref<int32_t> ref(*ptr);
-
         auto* res_obj = AllocateRuntime<JSObject>(root);
         uint32_t sid = 9100;
+
+        if (ta->Kind() == TypedArrayKind::BigInt64) {
+            int64_t expected = ECMAScriptToBigInt64(args[2]);
+            int64_t* ptr = reinterpret_cast<int64_t*>(ta->Data() + uidx * sizeof(int64_t));
+            std::atomic_ref<int64_t> ref(*ptr);
+
+            if (ref.load(std::memory_order_seq_cst) != expected) {
+                res_obj->SetNamedProperty("async", TaggedValue::FromBoolean(false), sid);
+                res_obj->SetNamedProperty("value", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("not-equal")), sid);
+                return TaggedValue::FromHeapObject(res_obj);
+            }
+
+            if (timeout == 0.0) {
+                res_obj->SetNamedProperty("async", TaggedValue::FromBoolean(false), sid);
+                res_obj->SetNamedProperty("value", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("timed-out")), sid);
+                return TaggedValue::FromHeapObject(res_obj);
+            }
+
+            auto* promise = AllocateRuntime<AsyncWaitPromise>(TaggedValue::FromHeapObject(ta->Buffer()), root);
+            if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+                promise->SetPrototype(Realm::Current()->GetPromisePrototype());
+            }
+
+            AsyncWaitManager::Instance().SpawnWait64(ptr, expected, timeout, promise, Agent::Current(), Realm::Current());
+
+            res_obj->SetNamedProperty("async", TaggedValue::FromBoolean(true), sid);
+            res_obj->SetNamedProperty("value", TaggedValue::FromHeapObject(promise), sid);
+            return TaggedValue::FromHeapObject(res_obj);
+        }
+
+        int32_t expected = static_cast<int32_t>(ValueToNumber(args[2]));
+        int32_t* ptr = reinterpret_cast<int32_t*>(ta->Data() + uidx * sizeof(int32_t));
+        std::atomic_ref<int32_t> ref(*ptr);
 
         if (ref.load(std::memory_order_seq_cst) != expected) {
             res_obj->SetNamedProperty("async", TaggedValue::FromBoolean(false), sid);

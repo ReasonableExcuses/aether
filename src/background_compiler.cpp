@@ -72,6 +72,7 @@ void BackgroundCompiler::Stop() {
 bool BackgroundCompiler::Enqueue(std::shared_ptr<const BytecodeArray> bytecode,
                                  const TypeFeedbackVector* feedback,
                                  std::function<void(std::shared_ptr<ExecutableMemory>)> on_complete) {
+    if (!bytecode) return false;
     if (!is_running_.load(std::memory_order_acquire)) {
         Start();
     }
@@ -79,7 +80,7 @@ bool BackgroundCompiler::Enqueue(std::shared_ptr<const BytecodeArray> bytecode,
     BackgroundCompilationJob job;
     job.bytecode_shared = std::move(bytecode);
     if (feedback) {
-        job.feedback_snapshot = std::make_unique<TypeFeedbackVector>(*feedback);
+        job.feedback_snapshot = feedback->Snapshot();
     }
     job.on_complete = std::move(on_complete);
 
@@ -98,9 +99,10 @@ bool BackgroundCompiler::Enqueue(const BytecodeArray& bytecode, const TypeFeedba
     }
 
     BackgroundCompilationJob job;
+    job.bytecode_shared = bytecode.GetShared();
     job.bytecode_raw = &bytecode;
     if (feedback) {
-        job.feedback_snapshot = std::make_unique<TypeFeedbackVector>(*feedback);
+        job.feedback_snapshot = feedback->Snapshot();
     }
     job.on_complete = std::move(on_complete);
 
@@ -153,11 +155,17 @@ void BackgroundCompiler::WorkerLoop() {
             if (opt_code) {
                 std::shared_ptr<ExecutableMemory> shared = std::move(opt_code);
                 bcode->SetTier2Code(shared);
+                if (job.bytecode_raw && job.bytecode_raw != bcode) {
+                    job.bytecode_raw->SetTier2Code(shared);
+                }
                 if (job.on_complete) {
                     job.on_complete(shared);
                 }
             } else {
                 bcode->FinishTier2Compilation();
+                if (job.bytecode_raw && job.bytecode_raw != bcode) {
+                    job.bytecode_raw->FinishTier2Compilation();
+                }
             }
         }
 

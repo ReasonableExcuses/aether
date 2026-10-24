@@ -390,6 +390,46 @@ public:
         return "ok";
     }
 
+    std::string Wait64(int64_t* ptr, int64_t expected, double timeout_ms) {
+        auto waiter = std::make_shared<Waiter>();
+        waiter->addr = static_cast<void*>(ptr);
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        std::atomic_ref<int64_t> ref(*ptr);
+        if (ref.load(std::memory_order_seq_cst) != expected) {
+            return "not-equal";
+        }
+
+        if (timeout_ms == 0.0) {
+            return "timed-out";
+        }
+
+        waiters_.push_back(waiter);
+
+        bool timed_out = false;
+        if (std::isinf(timeout_ms) || timeout_ms < 0.0) {
+            waiter->cv.wait(lock, [&] { return waiter->notified; });
+        } else {
+            auto dur = std::chrono::duration<double, std::milli>(timeout_ms);
+            auto cv_status = waiter->cv.wait_for(lock, std::chrono::duration_cast<std::chrono::milliseconds>(dur), [&] {
+                return waiter->notified;
+            });
+            if (!cv_status && !waiter->notified) {
+                timed_out = true;
+            }
+        }
+
+        auto it = std::find(waiters_.begin(), waiters_.end(), waiter);
+        if (it != waiters_.end()) {
+            waiters_.erase(it);
+        }
+
+        if (timed_out) {
+            return "timed-out";
+        }
+        return "ok";
+    }
+
     uint32_t Notify(void* addr, uint32_t count) {
         std::lock_guard<std::mutex> lock(mutex_);
         uint32_t awakened = 0;
@@ -448,6 +488,7 @@ public:
     };
 
     void SpawnWait(int32_t* ptr, int32_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm);
+    void SpawnWait64(int64_t* ptr, int64_t expected, double timeout, JSPromise* promise, Agent* agent, Realm* realm);
     void CancelAndJoinForAgent(Agent* agent);
     void Shutdown();
 

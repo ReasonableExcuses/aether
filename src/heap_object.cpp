@@ -977,6 +977,10 @@ JSBigInt* JSBigInt::Create(int64_t value) {
     return Create(JSBigInt(value));
 }
 
+JSBigInt* JSBigInt::Create(uint64_t value) {
+    return Create(JSBigInt(value));
+}
+
 JSBigInt* JSBigInt::Create(bool negative, const std::vector<uint32_t>& limbs) {
     return Create(JSBigInt(negative, limbs));
 }

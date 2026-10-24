@@ -670,32 +670,37 @@ AetherVM incorporates comprehensive guarantees addressing low-level concurrency,
    - `WebAssembly.Memory.prototype.grow()` detaches all existing `JSArrayBuffer` instances and typed array views prior to reallocating the underlying linear memory vector.
    - Prevents stale pointers and use-after-free conditions; views reflect `byteLength === 0` immediately upon detachment.
 
-2. **WebAssembly Full Bytecode Validation Pass**:
-   - Decodes instruction streams instruction-by-instruction with structural validation.
-   - Verifies block/loop/if nesting, table/memory initial and maximum limits (`initial <= maximum`), and start function index bounds.
+2. **WebAssembly Complete Validation & 64-Bit Integer Interop**:
+   - Comprehensive operand-stack type-checking and control-flow validation adhering to the official Wasm 1.0 MVP specification.
+   - Enforces instruction operand stack signatures, block/loop/if/else nesting, branch target depth limits, and polymorphic unreachable stack typing.
+   - Lossless 64-bit integer (`i64`) bidirectional interoperability converting to and from ECMAScript `BigInt` across host function calls, globals, and exports.
 
-3. **Background JIT Compiler Concurrency & Lifetime Safety**:
+3. **Background JIT Compiler Shared Ownership & Feedback Snapshotting**:
    - Background compilation jobs own immutable `BytecodeArray` references via `std::shared_ptr<const BytecodeArray>`.
-   - Snapshots `TypeFeedbackVector` state to insulate parallel Sea-of-Nodes workers from mutator IC mutations.
-   - Serializes `Start()` and `Stop()` transitions via `lifecycle_mutex_`.
+   - Dual-dispatch entry points ensure background workers safely retain bytecode ownership preventing use-after-free conditions upon caller owner teardown.
+   - Thread-safe `TypeFeedbackVector::Snapshot()` serializes IC slot state under a dedicated mutex, completely isolating parallel Sea-of-Nodes workers from mutator IC mutations.
 
 4. **SATB Concurrent GC Write Barrier & STW Remark**:
    - Enforces the Snapshot-At-The-Beginning (SATB) tri-color invariant during background Immix marking.
    - Write barrier records mutated source objects into a thread-safe dirty buffer, re-tracing modified slots during the Stop-The-World (STW) remark phase.
 
-5. **Managed Async Wait Synchronization (`Atomics.waitAsync`)**:
-   - Validates that typed arrays are backed by a valid `SharedArrayBuffer` (rejecting unshared buffers and disallowed kinds like `Uint8Clamped`, `Float32`, and `Float64`).
-   - Roots pending promises in the owning `Realm` and routes task completions directly into the owning agent's thread-safe microtask queue.
-   - Automatically cancels and cleanly joins outstanding worker threads upon agent/isolate teardown.
+5. **Standardized ECMAScript Atomics & 64-Bit BigInt Concurrency**:
+   - Centralized `ECMAScriptToIndex` and type validation across all 13 standard `Atomics` operations.
+   - Full 64-bit BigInt atomic operations (`add`, `sub`, `and`, `or`, `xor`, `exchange`, `compareExchange`) preserving full precision beyond $2^{53}-1$ on `BigInt64Array` and `BigUint64Array`.
+   - Standard 64-bit futex synchronization via `Atomics.wait` and `Atomics.notify`.
+   - Managed `Atomics.waitAsync` with synchronous fast-paths ("not-equal", "timed-out") and asynchronous promise resolution, backed by clean agent teardown cancellation (`CancelAndJoinForAgent`).
 
-6. **Thread-Safe Host Registries**:
-   - WebAssembly module, instance, memory, and table host associations are synchronized with mutexes (`ThreadSafeWasmRegistry`) and support GC-driven dead instance pruning.
+6. **Thread-Safe Host Registries & GC Lifetime Pruning**:
+   - WebAssembly module, instance, memory, table, and global host associations are synchronized via `ThreadSafeWasmRegistry`.
+   - Integrated with generational GC cycles (`MajorGC` and `MinorGC`) via `WasmRegistryPruneDead` and `WasmRegistryRelocate` to immediately reclaim metadata of dead host objects.
 
 7. **Overflow-Free Bounds Checking**:
    - `JSDataView::CheckBounds` utilizes subtraction-based arithmetic (`offset <= byte_length_ && size <= byte_length_ - offset`) to guarantee safety against `size_t` integer overflows.
 
-8. **64-bit Integer TypedArray Support**:
-   - Complete `BigInt64Array` and `BigUint64Array` element reads and writes.
+8. **Genuine BigInt TypedArray & DataView JavaScript Compatibility**:
+   - Complete `BigInt64Array` and `BigUint64Array` element reads and writes returning genuine `BigInt` instances (`typeof === 'bigint'`).
+   - Full support for integers exceeding $2^{53}-1$, two's-complement negative 64-bit values, and unsigned 64-bit wraparound.
+   - Endianness-aware 64-bit integer accessors in `DataView` (`getBigInt64`, `setBigInt64`, `getBigUint64`, `setBigUint64`).
 
 9. **ECMA-262 TypedArray Value Conversions**:
    - Enforces two's complement modulo truncation wrapping (`ToUint8`, `ToInt8`, `ToUint16`, `ToInt32`, `ToUint32`) and numeric coercion rules on element assignment.

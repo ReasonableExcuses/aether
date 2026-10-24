@@ -90,6 +90,19 @@ public:
         std::erase_if(map_, [&](const auto& kv) { return !is_alive(kv.first); });
     }
 
+    void RelocateKeys(const std::function<JSObject*(JSObject*)>& resolve) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        std::unordered_map<JSObject*, std::shared_ptr<T>> updated;
+        updated.reserve(map_.size());
+        for (auto& [key, val] : map_) {
+            JSObject* new_key = resolve(key);
+            if (new_key) {
+                updated[new_key] = std::move(val);
+            }
+        }
+        map_ = std::move(updated);
+    }
+
     size_t size() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return map_.size();
@@ -105,6 +118,30 @@ static ThreadSafeWasmRegistry<WasmInstance> s_instance_registry;
 static ThreadSafeWasmRegistry<WasmMemoryInstance> s_memory_registry;
 static ThreadSafeWasmRegistry<WasmTableInstance> s_table_registry;
 static ThreadSafeWasmRegistry<WasmGlobalInstance> s_global_registry;
+
+void WasmRegistryPruneDead(const std::function<bool(JSObject*)>& is_alive) {
+    s_module_registry.PruneDead(is_alive);
+    s_instance_registry.PruneDead(is_alive);
+    s_memory_registry.PruneDead(is_alive);
+    s_table_registry.PruneDead(is_alive);
+    s_global_registry.PruneDead(is_alive);
+}
+
+void WasmRegistryRelocate(const std::function<JSObject*(JSObject*)>& resolve) {
+    s_module_registry.RelocateKeys(resolve);
+    s_instance_registry.RelocateKeys(resolve);
+    s_memory_registry.RelocateKeys(resolve);
+    s_table_registry.RelocateKeys(resolve);
+    s_global_registry.RelocateKeys(resolve);
+}
+
+size_t WasmRegistryTotalEntries() {
+    return s_module_registry.size() +
+           s_instance_registry.size() +
+           s_memory_registry.size() +
+           s_table_registry.size() +
+           s_global_registry.size();
+}
 
 namespace {
 
@@ -301,6 +338,35 @@ bool SkipInitExpr(const uint8_t*& p, const uint8_t* end, std::vector<uint8_t>& e
     return false;
 }
 
+enum class OpType : uint8_t {
+    I32,
+    I64,
+    F32,
+    F64,
+    FuncRef,
+    Unknown
+};
+
+inline OpType ValTypeToOpType(WasmValType t) {
+    switch (t) {
+        case WasmValType::I32: return OpType::I32;
+        case WasmValType::I64: return OpType::I64;
+        case WasmValType::F32: return OpType::F32;
+        case WasmValType::F64: return OpType::F64;
+        case WasmValType::FuncRef: return OpType::FuncRef;
+        default: return OpType::Unknown;
+    }
+}
+
+struct CtrlFrame {
+    WasmOpcode opcode;
+    std::vector<OpType> label_types;
+    std::vector<OpType> end_types;
+    size_t height{0};
+    bool unreachable{false};
+    bool has_else{false};
+};
+
 bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::string* error_msg) {
     const uint8_t* code = fd.code.data();
     size_t code_len = fd.code.size();
@@ -324,17 +390,101 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
         return false;
     }
     const auto& sig = mod.Types()[fd.type_index];
-    uint64_t total_locals = sig.params.size();
+
+    std::vector<OpType> locals;
+    locals.reserve(sig.params.size() + fd.locals.size());
+    for (auto p : sig.params) locals.push_back(ValTypeToOpType(p));
     for (const auto& loc : fd.locals) {
-        total_locals += loc.first;
+        OpType ot = ValTypeToOpType(loc.second);
+        for (uint32_t i = 0; i < loc.first; ++i) {
+            locals.push_back(ot);
+        }
     }
-    if (total_locals > 0xFFFFFF) {
+    if (locals.size() > 0xFFFFFF) {
         if (error_msg) *error_msg = "Too many locals in function";
         return false;
     }
 
+    auto get_global_type = [&](uint32_t gidx, WasmGlobalType& out) -> bool {
+        if (gidx < mod.NumImportedGlobals()) {
+            uint32_t cur = 0;
+            for (const auto& imp : mod.Imports()) {
+                if (imp.kind == WasmExternalKind::Global) {
+                    if (cur == gidx) {
+                        out = imp.global_desc;
+                        return true;
+                    }
+                    cur++;
+                }
+            }
+        } else {
+            uint32_t def_idx = gidx - mod.NumImportedGlobals();
+            if (def_idx < mod.Globals().size()) {
+                out = mod.Globals()[def_idx].type;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<OpType> val_stack;
+    std::vector<CtrlFrame> ctrl_stack;
+
+    auto push_val = [&](OpType t) {
+        val_stack.push_back(t);
+    };
+
+    auto push_types = [&](const std::vector<OpType>& types) {
+        for (auto t : types) val_stack.push_back(t);
+    };
+
+    auto pop_val = [&]() -> std::optional<OpType> {
+        if (ctrl_stack.empty()) return std::nullopt;
+        const auto& frame = ctrl_stack.back();
+        if (val_stack.size() == frame.height) {
+            if (frame.unreachable) {
+                return OpType::Unknown;
+            }
+            return std::nullopt; // underflow
+        }
+        OpType t = val_stack.back();
+        val_stack.pop_back();
+        return t;
+    };
+
+    auto pop_expected = [&](OpType expected) -> bool {
+        auto val = pop_val();
+        if (!val.has_value()) return false;
+        if (val.value() == OpType::Unknown || expected == OpType::Unknown) return true;
+        return val.value() == expected;
+    };
+
+    auto pop_types = [&](const std::vector<OpType>& types) -> bool {
+        for (auto it = types.rbegin(); it != types.rend(); ++it) {
+            if (!pop_expected(*it)) return false;
+        }
+        return true;
+    };
+
+    auto set_unreachable = [&]() {
+        if (ctrl_stack.empty()) return;
+        auto& frame = ctrl_stack.back();
+        frame.unreachable = true;
+        val_stack.resize(frame.height);
+    };
+
+    std::vector<OpType> fn_results;
+    for (auto r : sig.results) fn_results.push_back(ValTypeToOpType(r));
+    ctrl_stack.push_back(CtrlFrame{
+        WasmOpcode::Block,
+        fn_results,
+        fn_results,
+        0,
+        false,
+        false
+    });
+
     size_t pc = 0;
-    std::vector<WasmOpcode> control_stack;
 
     while (pc < code_len) {
         uint8_t raw_op = code[pc++];
@@ -342,9 +492,10 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
 
         switch (op) {
             case WasmOpcode::Unreachable:
+                set_unreachable();
+                break;
+
             case WasmOpcode::Nop:
-            case WasmOpcode::Drop:
-            case WasmOpcode::Select:
                 break;
 
             case WasmOpcode::Block:
@@ -355,35 +506,109 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 uint8_t btype = code[pc++];
-                if (btype != 0x40 && btype != 0x7F && btype != 0x7E && btype != 0x7D && btype != 0x7C) {
+                std::vector<OpType> end_types;
+                if (btype == 0x40) {
+                    // void
+                } else if (btype == 0x7F) {
+                    end_types.push_back(OpType::I32);
+                } else if (btype == 0x7E) {
+                    end_types.push_back(OpType::I64);
+                } else if (btype == 0x7D) {
+                    end_types.push_back(OpType::F32);
+                } else if (btype == 0x7C) {
+                    end_types.push_back(OpType::F64);
+                } else {
                     if (error_msg) *error_msg = "Invalid block return type: " + std::to_string(btype);
                     return false;
                 }
-                control_stack.push_back(op);
+
+                if (op == WasmOpcode::If) {
+                    if (!pop_expected(OpType::I32)) {
+                        if (error_msg) *error_msg = "if condition must be i32";
+                        return false;
+                    }
+                    ctrl_stack.push_back(CtrlFrame{ op, end_types, end_types, val_stack.size(), false, false });
+                } else if (op == WasmOpcode::Loop) {
+                    ctrl_stack.push_back(CtrlFrame{ op, {}, end_types, val_stack.size(), false, false });
+                } else {
+                    ctrl_stack.push_back(CtrlFrame{ op, end_types, end_types, val_stack.size(), false, false });
+                }
                 break;
             }
 
             case WasmOpcode::Else: {
-                if (control_stack.empty() || control_stack.back() != WasmOpcode::If) {
+                if (ctrl_stack.empty() || ctrl_stack.back().opcode != WasmOpcode::If || ctrl_stack.back().has_else) {
                     if (error_msg) *error_msg = "Else without matching If block";
                     return false;
                 }
+                auto& frame = ctrl_stack.back();
+                if (!pop_types(frame.end_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match block result at else";
+                    return false;
+                }
+                if (val_stack.size() != frame.height) {
+                    if (error_msg) *error_msg = "Leftover values on stack at else";
+                    return false;
+                }
+                frame.has_else = true;
+                frame.unreachable = false;
+                val_stack.resize(frame.height);
                 break;
             }
 
             case WasmOpcode::End: {
-                if (control_stack.empty()) {
+                if (ctrl_stack.empty()) {
+                    if (error_msg) *error_msg = "Unexpected End opcode";
+                    return false;
+                }
+                auto frame = ctrl_stack.back();
+                if (!pop_types(frame.end_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match block result at end";
+                    return false;
+                }
+                if (val_stack.size() != frame.height) {
+                    if (error_msg) *error_msg = "Leftover values on stack at end";
+                    return false;
+                }
+                if (frame.opcode == WasmOpcode::If && !frame.has_else) {
+                    if (!frame.end_types.empty()) {
+                        if (error_msg) *error_msg = "if without else cannot return a value";
+                        return false;
+                    }
+                }
+                ctrl_stack.pop_back();
+                if (ctrl_stack.empty()) {
                     if (pc != code_len) {
-                        if (error_msg) *error_msg = "Extraneous End opcode before function body end";
+                        if (error_msg) *error_msg = "Extraneous bytes after function body end";
                         return false;
                     }
                 } else {
-                    control_stack.pop_back();
+                    push_types(frame.end_types);
                 }
                 break;
             }
 
-            case WasmOpcode::Br:
+            case WasmOpcode::Br: {
+                uint32_t label_idx = 0;
+                const uint8_t* p = code + pc;
+                if (!DecodeU32(p, code + code_len, label_idx)) {
+                    if (error_msg) *error_msg = "Failed to decode branch target immediate";
+                    return false;
+                }
+                pc = p - code;
+                if (label_idx >= ctrl_stack.size()) {
+                    if (error_msg) *error_msg = "Branch depth exceeds control stack: " + std::to_string(label_idx);
+                    return false;
+                }
+                const auto& target = ctrl_stack[ctrl_stack.size() - 1 - label_idx];
+                if (!pop_types(target.label_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match branch target";
+                    return false;
+                }
+                set_unreachable();
+                break;
+            }
+
             case WasmOpcode::BrIf: {
                 uint32_t label_idx = 0;
                 const uint8_t* p = code + pc;
@@ -392,10 +617,20 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
-                if (label_idx > control_stack.size()) {
+                if (label_idx >= ctrl_stack.size()) {
                     if (error_msg) *error_msg = "Branch depth exceeds control stack: " + std::to_string(label_idx);
                     return false;
                 }
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "br_if condition must be i32";
+                    return false;
+                }
+                const auto& target = ctrl_stack[ctrl_stack.size() - 1 - label_idx];
+                if (!pop_types(target.label_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match branch target";
+                    return false;
+                }
+                push_types(target.label_types);
                 break;
             }
 
@@ -406,23 +641,58 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     if (error_msg) *error_msg = "Failed to decode br_table count";
                     return false;
                 }
+                std::vector<uint32_t> targets;
+                targets.reserve(count + 1);
                 for (uint32_t i = 0; i <= count; ++i) {
                     uint32_t target = 0;
                     if (!DecodeU32(p, code + code_len, target)) {
                         if (error_msg) *error_msg = "Failed to decode br_table entry";
                         return false;
                     }
-                    if (target > control_stack.size()) {
+                    if (target >= ctrl_stack.size()) {
                         if (error_msg) *error_msg = "br_table target depth exceeds control stack";
                         return false;
                     }
+                    targets.push_back(target);
                 }
                 pc = p - code;
+
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "br_table index must be i32";
+                    return false;
+                }
+                uint32_t def_target = targets.back();
+                const auto& def_frame = ctrl_stack[ctrl_stack.size() - 1 - def_target];
+                for (uint32_t t : targets) {
+                    const auto& f = ctrl_stack[ctrl_stack.size() - 1 - t];
+                    if (f.label_types.size() != def_frame.label_types.size()) {
+                        if (error_msg) *error_msg = "br_table label types mismatch";
+                        return false;
+                    }
+                    for (size_t i = 0; i < f.label_types.size(); ++i) {
+                        if (f.label_types[i] != def_frame.label_types[i]) {
+                            if (error_msg) *error_msg = "br_table label types mismatch";
+                            return false;
+                        }
+                    }
+                }
+                if (!pop_types(def_frame.label_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match br_table target";
+                    return false;
+                }
+                set_unreachable();
                 break;
             }
 
-            case WasmOpcode::Return:
+            case WasmOpcode::Return: {
+                const auto& outer = ctrl_stack.front();
+                if (!pop_types(outer.end_types)) {
+                    if (error_msg) *error_msg = "Stack types do not match function return signature";
+                    return false;
+                }
+                set_unreachable();
                 break;
+            }
 
             case WasmOpcode::Call: {
                 const uint8_t* p = code + pc;
@@ -435,6 +705,16 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                 if (func_idx >= total_funcs) {
                     if (error_msg) *error_msg = "Call function index out of range: " + std::to_string(func_idx);
                     return false;
+                }
+                const auto& callee_sig = mod.GetFunctionSignature(func_idx);
+                for (auto it = callee_sig.params.rbegin(); it != callee_sig.params.rend(); ++it) {
+                    if (!pop_expected(ValTypeToOpType(*it))) {
+                        if (error_msg) *error_msg = "Call parameter type mismatch";
+                        return false;
+                    }
+                }
+                for (auto r : callee_sig.results) {
+                    push_val(ValTypeToOpType(r));
                 }
                 break;
             }
@@ -451,14 +731,59 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
-                if (tidx >= mod.Types().size()) {
-                    if (error_msg) *error_msg = "call_indirect type index out of range";
-                    return false;
-                }
                 if (total_tables == 0) {
                     if (error_msg) *error_msg = "call_indirect requires a table";
                     return false;
                 }
+                if (tidx >= mod.Types().size()) {
+                    if (error_msg) *error_msg = "call_indirect type index out of range";
+                    return false;
+                }
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "call_indirect table index must be i32";
+                    return false;
+                }
+                const auto& callee_sig = mod.Types()[tidx];
+                for (auto it = callee_sig.params.rbegin(); it != callee_sig.params.rend(); ++it) {
+                    if (!pop_expected(ValTypeToOpType(*it))) {
+                        if (error_msg) *error_msg = "call_indirect parameter type mismatch";
+                        return false;
+                    }
+                }
+                for (auto r : callee_sig.results) {
+                    push_val(ValTypeToOpType(r));
+                }
+                break;
+            }
+
+            case WasmOpcode::Drop: {
+                if (!pop_val().has_value()) {
+                    if (error_msg) *error_msg = "Stack underflow on drop";
+                    return false;
+                }
+                break;
+            }
+
+            case WasmOpcode::Select: {
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "select condition must be i32";
+                    return false;
+                }
+                auto v2 = pop_val();
+                auto v1 = pop_val();
+                if (!v1.has_value() || !v2.has_value()) {
+                    if (error_msg) *error_msg = "Stack underflow on select";
+                    return false;
+                }
+                if (v1.value() != OpType::Unknown && v2.value() != OpType::Unknown && v1.value() != v2.value()) {
+                    if (error_msg) *error_msg = "select operand types do not match";
+                    return false;
+                }
+                if (v1.value() == OpType::FuncRef || v2.value() == OpType::FuncRef) {
+                    if (error_msg) *error_msg = "select requires numeric types in WebAssembly MVP";
+                    return false;
+                }
+                push_val(v1.value() != OpType::Unknown ? v1.value() : v2.value());
                 break;
             }
 
@@ -472,9 +797,23 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
-                if (local_idx >= total_locals) {
+                if (local_idx >= locals.size()) {
                     if (error_msg) *error_msg = "Local index out of range: " + std::to_string(local_idx);
                     return false;
+                }
+                if (op == WasmOpcode::LocalGet) {
+                    push_val(locals[local_idx]);
+                } else if (op == WasmOpcode::LocalSet) {
+                    if (!pop_expected(locals[local_idx])) {
+                        if (error_msg) *error_msg = "local.set type mismatch";
+                        return false;
+                    }
+                } else {
+                    if (!pop_expected(locals[local_idx])) {
+                        if (error_msg) *error_msg = "local.tee type mismatch";
+                        return false;
+                    }
+                    push_val(locals[local_idx]);
                 }
                 break;
             }
@@ -492,6 +831,23 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     if (error_msg) *error_msg = "Global index out of range: " + std::to_string(global_idx);
                     return false;
                 }
+                WasmGlobalType gt;
+                if (!get_global_type(global_idx, gt)) {
+                    if (error_msg) *error_msg = "Unable to retrieve global descriptor";
+                    return false;
+                }
+                if (op == WasmOpcode::GlobalGet) {
+                    push_val(ValTypeToOpType(gt.content_type));
+                } else {
+                    if (!gt.is_mutable) {
+                        if (error_msg) *error_msg = "global.set on immutable global";
+                        return false;
+                    }
+                    if (!pop_expected(ValTypeToOpType(gt.content_type))) {
+                        if (error_msg) *error_msg = "global.set type mismatch";
+                        return false;
+                    }
+                }
                 break;
             }
 
@@ -503,6 +859,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
+                push_val(OpType::I32);
                 break;
             }
 
@@ -514,6 +871,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
+                push_val(OpType::I64);
                 break;
             }
 
@@ -523,6 +881,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc += 4;
+                push_val(OpType::F32);
                 break;
             }
 
@@ -532,6 +891,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc += 8;
+                push_val(OpType::F64);
                 break;
             }
 
@@ -548,7 +908,45 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
             case WasmOpcode::I64Load16S:
             case WasmOpcode::I64Load16U:
             case WasmOpcode::I64Load32S:
-            case WasmOpcode::I64Load32U:
+            case WasmOpcode::I64Load32U: {
+                if (total_mems == 0) {
+                    if (error_msg) *error_msg = "Memory load used without declared memory";
+                    return false;
+                }
+                const uint8_t* p = code + pc;
+                uint32_t align = 0, offset = 0;
+                if (!DecodeU32(p, code + code_len, align) || !DecodeU32(p, code + code_len, offset)) {
+                    if (error_msg) *error_msg = "Failed to decode memory immediate";
+                    return false;
+                }
+                pc = p - code;
+
+                uint32_t max_align = 0;
+                OpType res_type = OpType::I32;
+                switch (op) {
+                    case WasmOpcode::I32Load: res_type = OpType::I32; max_align = 2; break;
+                    case WasmOpcode::I64Load: res_type = OpType::I64; max_align = 3; break;
+                    case WasmOpcode::F32Load: res_type = OpType::F32; max_align = 2; break;
+                    case WasmOpcode::F64Load: res_type = OpType::F64; max_align = 3; break;
+                    case WasmOpcode::I32Load8S: case WasmOpcode::I32Load8U: res_type = OpType::I32; max_align = 0; break;
+                    case WasmOpcode::I32Load16S: case WasmOpcode::I32Load16U: res_type = OpType::I32; max_align = 1; break;
+                    case WasmOpcode::I64Load8S: case WasmOpcode::I64Load8U: res_type = OpType::I64; max_align = 0; break;
+                    case WasmOpcode::I64Load16S: case WasmOpcode::I64Load16U: res_type = OpType::I64; max_align = 1; break;
+                    case WasmOpcode::I64Load32S: case WasmOpcode::I64Load32U: res_type = OpType::I64; max_align = 2; break;
+                    default: break;
+                }
+                if (align > max_align) {
+                    if (error_msg) *error_msg = "Memory alignment exceeds natural size";
+                    return false;
+                }
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "Memory address must be i32";
+                    return false;
+                }
+                push_val(res_type);
+                break;
+            }
+
             case WasmOpcode::I32Store:
             case WasmOpcode::I64Store:
             case WasmOpcode::F32Store:
@@ -559,7 +957,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
             case WasmOpcode::I64Store16:
             case WasmOpcode::I64Store32: {
                 if (total_mems == 0) {
-                    if (error_msg) *error_msg = "Memory instruction used without declared memory";
+                    if (error_msg) *error_msg = "Memory store used without declared memory";
                     return false;
                 }
                 const uint8_t* p = code + pc;
@@ -569,69 +967,288 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
                     return false;
                 }
                 pc = p - code;
+
+                uint32_t max_align = 0;
+                OpType val_type = OpType::I32;
+                switch (op) {
+                    case WasmOpcode::I32Store: val_type = OpType::I32; max_align = 2; break;
+                    case WasmOpcode::I64Store: val_type = OpType::I64; max_align = 3; break;
+                    case WasmOpcode::F32Store: val_type = OpType::F32; max_align = 2; break;
+                    case WasmOpcode::F64Store: val_type = OpType::F64; max_align = 3; break;
+                    case WasmOpcode::I32Store8: val_type = OpType::I32; max_align = 0; break;
+                    case WasmOpcode::I32Store16: val_type = OpType::I32; max_align = 1; break;
+                    case WasmOpcode::I64Store8: val_type = OpType::I64; max_align = 0; break;
+                    case WasmOpcode::I64Store16: val_type = OpType::I64; max_align = 1; break;
+                    case WasmOpcode::I64Store32: val_type = OpType::I64; max_align = 2; break;
+                    default: break;
+                }
+                if (align > max_align) {
+                    if (error_msg) *error_msg = "Memory alignment exceeds natural size";
+                    return false;
+                }
+                if (!pop_expected(val_type)) {
+                    if (error_msg) *error_msg = "Store value type mismatch";
+                    return false;
+                }
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "Memory address must be i32";
+                    return false;
+                }
                 break;
             }
 
-            case WasmOpcode::MemorySize:
-            case WasmOpcode::MemoryGrow: {
+            case WasmOpcode::MemorySize: {
                 if (total_mems == 0) {
-                    if (error_msg) *error_msg = "memory.size/grow requires memory";
+                    if (error_msg) *error_msg = "memory.size requires memory";
                     return false;
                 }
                 if (pc >= code_len || code[pc++] != 0x00) {
-                    if (error_msg) *error_msg = "memory.size/grow missing 0x00 reserved byte";
+                    if (error_msg) *error_msg = "memory.size missing 0x00 reserved byte";
                     return false;
                 }
+                push_val(OpType::I32);
                 break;
             }
 
-            case WasmOpcode::I32Eqz: case WasmOpcode::I32Eq: case WasmOpcode::I32Ne:
+            case WasmOpcode::MemoryGrow: {
+                if (total_mems == 0) {
+                    if (error_msg) *error_msg = "memory.grow requires memory";
+                    return false;
+                }
+                if (pc >= code_len || code[pc++] != 0x00) {
+                    if (error_msg) *error_msg = "memory.grow missing 0x00 reserved byte";
+                    return false;
+                }
+                if (!pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "memory.grow parameter must be i32";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
+            // Numeric Unary, Binary, Comparisons, Conversions
+            case WasmOpcode::I32Eqz: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on i32.eqz"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I32Eq: case WasmOpcode::I32Ne:
             case WasmOpcode::I32LtS: case WasmOpcode::I32LtU: case WasmOpcode::I32GtS: case WasmOpcode::I32GtU:
-            case WasmOpcode::I32LeS: case WasmOpcode::I32LeU: case WasmOpcode::I32GeS: case WasmOpcode::I32GeU:
-            case WasmOpcode::I64Eqz: case WasmOpcode::I64Eq: case WasmOpcode::I64Ne:
+            case WasmOpcode::I32LeS: case WasmOpcode::I32LeU: case WasmOpcode::I32GeS: case WasmOpcode::I32GeU: {
+                if (!pop_expected(OpType::I32) || !pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "type mismatch on i32 comparison";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I64Eqz: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on i64.eqz"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I64Eq: case WasmOpcode::I64Ne:
             case WasmOpcode::I64LtS: case WasmOpcode::I64LtU: case WasmOpcode::I64GtS: case WasmOpcode::I64GtU:
-            case WasmOpcode::I64LeS: case WasmOpcode::I64LeU: case WasmOpcode::I64GeS: case WasmOpcode::I64GeU:
+            case WasmOpcode::I64LeS: case WasmOpcode::I64LeU: case WasmOpcode::I64GeS: case WasmOpcode::I64GeU: {
+                if (!pop_expected(OpType::I64) || !pop_expected(OpType::I64)) {
+                    if (error_msg) *error_msg = "type mismatch on i64 comparison";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
             case WasmOpcode::F32Eq: case WasmOpcode::F32Ne: case WasmOpcode::F32Lt: case WasmOpcode::F32Gt:
-            case WasmOpcode::F32Le: case WasmOpcode::F32Ge:
+            case WasmOpcode::F32Le: case WasmOpcode::F32Ge: {
+                if (!pop_expected(OpType::F32) || !pop_expected(OpType::F32)) {
+                    if (error_msg) *error_msg = "type mismatch on f32 comparison";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
             case WasmOpcode::F64Eq: case WasmOpcode::F64Ne: case WasmOpcode::F64Lt: case WasmOpcode::F64Gt:
-            case WasmOpcode::F64Le: case WasmOpcode::F64Ge:
-            case WasmOpcode::I32Clz: case WasmOpcode::I32Ctz: case WasmOpcode::I32Popcnt:
+            case WasmOpcode::F64Le: case WasmOpcode::F64Ge: {
+                if (!pop_expected(OpType::F64) || !pop_expected(OpType::F64)) {
+                    if (error_msg) *error_msg = "type mismatch on f64 comparison";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I32Clz: case WasmOpcode::I32Ctz: case WasmOpcode::I32Popcnt: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on i32 unary"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
             case WasmOpcode::I32Add: case WasmOpcode::I32Sub: case WasmOpcode::I32Mul:
             case WasmOpcode::I32DivS: case WasmOpcode::I32DivU: case WasmOpcode::I32RemS: case WasmOpcode::I32RemU:
             case WasmOpcode::I32And: case WasmOpcode::I32Or: case WasmOpcode::I32Xor:
             case WasmOpcode::I32Shl: case WasmOpcode::I32ShrS: case WasmOpcode::I32ShrU:
-            case WasmOpcode::I32Rotl: case WasmOpcode::I32Rotr:
-            case WasmOpcode::I64Clz: case WasmOpcode::I64Ctz: case WasmOpcode::I64Popcnt:
+            case WasmOpcode::I32Rotl: case WasmOpcode::I32Rotr: {
+                if (!pop_expected(OpType::I32) || !pop_expected(OpType::I32)) {
+                    if (error_msg) *error_msg = "type mismatch on i32 binary";
+                    return false;
+                }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I64Clz: case WasmOpcode::I64Ctz: case WasmOpcode::I64Popcnt: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on i64 unary"; return false; }
+                push_val(OpType::I64);
+                break;
+            }
+
             case WasmOpcode::I64Add: case WasmOpcode::I64Sub: case WasmOpcode::I64Mul:
             case WasmOpcode::I64DivS: case WasmOpcode::I64DivU: case WasmOpcode::I64RemS: case WasmOpcode::I64RemU:
             case WasmOpcode::I64And: case WasmOpcode::I64Or: case WasmOpcode::I64Xor:
             case WasmOpcode::I64Shl: case WasmOpcode::I64ShrS: case WasmOpcode::I64ShrU:
-            case WasmOpcode::I64Rotl: case WasmOpcode::I64Rotr:
-            case WasmOpcode::F32Abs: case WasmOpcode::F32Neg: case WasmOpcode::F32Ceil: case WasmOpcode::F32Floor:
-            case WasmOpcode::F32Trunc: case WasmOpcode::F32Nearest: case WasmOpcode::F32Sqrt:
-            case WasmOpcode::F32Add: case WasmOpcode::F32Sub: case WasmOpcode::F32Mul: case WasmOpcode::F32Div:
-            case WasmOpcode::F32Min: case WasmOpcode::F32Max: case WasmOpcode::F32Copysign:
-            case WasmOpcode::F64Abs: case WasmOpcode::F64Neg: case WasmOpcode::F64Ceil: case WasmOpcode::F64Floor:
-            case WasmOpcode::F64Trunc: case WasmOpcode::F64Nearest: case WasmOpcode::F64Sqrt:
-            case WasmOpcode::F64Add: case WasmOpcode::F64Sub: case WasmOpcode::F64Mul: case WasmOpcode::F64Div:
-            case WasmOpcode::F64Min: case WasmOpcode::F64Max: case WasmOpcode::F64Copysign:
-            case WasmOpcode::I32WrapI64:
-            case WasmOpcode::I32TruncF32S: case WasmOpcode::I32TruncF32U:
-            case WasmOpcode::I32TruncF64S: case WasmOpcode::I32TruncF64U:
-            case WasmOpcode::I64ExtendI32S: case WasmOpcode::I64ExtendI32U:
-            case WasmOpcode::I64TruncF32S: case WasmOpcode::I64TruncF32U:
-            case WasmOpcode::I64TruncF64S: case WasmOpcode::I64TruncF64U:
-            case WasmOpcode::F32ConvertI32S: case WasmOpcode::F32ConvertI32U:
-            case WasmOpcode::F32ConvertI64S: case WasmOpcode::F32ConvertI64U:
-            case WasmOpcode::F32DemoteF64:
-            case WasmOpcode::F64ConvertI32S: case WasmOpcode::F64ConvertI32U:
-            case WasmOpcode::F64ConvertI64S: case WasmOpcode::F64ConvertI64U:
-            case WasmOpcode::F64PromoteF32:
-            case WasmOpcode::I32ReinterpretF32:
-            case WasmOpcode::I64ReinterpretF64:
-            case WasmOpcode::F32ReinterpretI32:
-            case WasmOpcode::F64ReinterpretI64:
+            case WasmOpcode::I64Rotl: case WasmOpcode::I64Rotr: {
+                if (!pop_expected(OpType::I64) || !pop_expected(OpType::I64)) {
+                    if (error_msg) *error_msg = "type mismatch on i64 binary";
+                    return false;
+                }
+                push_val(OpType::I64);
                 break;
+            }
+
+            case WasmOpcode::F32Abs: case WasmOpcode::F32Neg: case WasmOpcode::F32Ceil: case WasmOpcode::F32Floor:
+            case WasmOpcode::F32Trunc: case WasmOpcode::F32Nearest: case WasmOpcode::F32Sqrt: {
+                if (!pop_expected(OpType::F32)) { if (error_msg) *error_msg = "type mismatch on f32 unary"; return false; }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F32Add: case WasmOpcode::F32Sub: case WasmOpcode::F32Mul: case WasmOpcode::F32Div:
+            case WasmOpcode::F32Min: case WasmOpcode::F32Max: case WasmOpcode::F32Copysign: {
+                if (!pop_expected(OpType::F32) || !pop_expected(OpType::F32)) {
+                    if (error_msg) *error_msg = "type mismatch on f32 binary";
+                    return false;
+                }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F64Abs: case WasmOpcode::F64Neg: case WasmOpcode::F64Ceil: case WasmOpcode::F64Floor:
+            case WasmOpcode::F64Trunc: case WasmOpcode::F64Nearest: case WasmOpcode::F64Sqrt: {
+                if (!pop_expected(OpType::F64)) { if (error_msg) *error_msg = "type mismatch on f64 unary"; return false; }
+                push_val(OpType::F64);
+                break;
+            }
+
+            case WasmOpcode::F64Add: case WasmOpcode::F64Sub: case WasmOpcode::F64Mul: case WasmOpcode::F64Div:
+            case WasmOpcode::F64Min: case WasmOpcode::F64Max: case WasmOpcode::F64Copysign: {
+                if (!pop_expected(OpType::F64) || !pop_expected(OpType::F64)) {
+                    if (error_msg) *error_msg = "type mismatch on f64 binary";
+                    return false;
+                }
+                push_val(OpType::F64);
+                break;
+            }
+
+            case WasmOpcode::I32WrapI64: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on i32.wrap_i64"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I32TruncF32S: case WasmOpcode::I32TruncF32U: {
+                if (!pop_expected(OpType::F32)) { if (error_msg) *error_msg = "type mismatch on i32.trunc_f32"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I32TruncF64S: case WasmOpcode::I32TruncF64U: {
+                if (!pop_expected(OpType::F64)) { if (error_msg) *error_msg = "type mismatch on i32.trunc_f64"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I64ExtendI32S: case WasmOpcode::I64ExtendI32U: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on i64.extend_i32"; return false; }
+                push_val(OpType::I64);
+                break;
+            }
+
+            case WasmOpcode::I64TruncF32S: case WasmOpcode::I64TruncF32U: {
+                if (!pop_expected(OpType::F32)) { if (error_msg) *error_msg = "type mismatch on i64.trunc_f32"; return false; }
+                push_val(OpType::I64);
+                break;
+            }
+
+            case WasmOpcode::I64TruncF64S: case WasmOpcode::I64TruncF64U: {
+                if (!pop_expected(OpType::F64)) { if (error_msg) *error_msg = "type mismatch on i64.trunc_f64"; return false; }
+                push_val(OpType::I64);
+                break;
+            }
+
+            case WasmOpcode::F32ConvertI32S: case WasmOpcode::F32ConvertI32U: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on f32.convert_i32"; return false; }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F32ConvertI64S: case WasmOpcode::F32ConvertI64U: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on f32.convert_i64"; return false; }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F32DemoteF64: {
+                if (!pop_expected(OpType::F64)) { if (error_msg) *error_msg = "type mismatch on f32.demote_f64"; return false; }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F64ConvertI32S: case WasmOpcode::F64ConvertI32U: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on f64.convert_i32"; return false; }
+                push_val(OpType::F64);
+                break;
+            }
+
+            case WasmOpcode::F64ConvertI64S: case WasmOpcode::F64ConvertI64U: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on f64.convert_i64"; return false; }
+                push_val(OpType::F64);
+                break;
+            }
+
+            case WasmOpcode::F64PromoteF32: {
+                if (!pop_expected(OpType::F32)) { if (error_msg) *error_msg = "type mismatch on f64.promote_f32"; return false; }
+                push_val(OpType::F64);
+                break;
+            }
+
+            case WasmOpcode::I32ReinterpretF32: {
+                if (!pop_expected(OpType::F32)) { if (error_msg) *error_msg = "type mismatch on i32.reinterpret_f32"; return false; }
+                push_val(OpType::I32);
+                break;
+            }
+
+            case WasmOpcode::I64ReinterpretF64: {
+                if (!pop_expected(OpType::F64)) { if (error_msg) *error_msg = "type mismatch on i64.reinterpret_f64"; return false; }
+                push_val(OpType::I64);
+                break;
+            }
+
+            case WasmOpcode::F32ReinterpretI32: {
+                if (!pop_expected(OpType::I32)) { if (error_msg) *error_msg = "type mismatch on f32.reinterpret_i32"; return false; }
+                push_val(OpType::F32);
+                break;
+            }
+
+            case WasmOpcode::F64ReinterpretI64: {
+                if (!pop_expected(OpType::I64)) { if (error_msg) *error_msg = "type mismatch on f64.reinterpret_i64"; return false; }
+                push_val(OpType::F64);
+                break;
+            }
 
             default:
                 if (error_msg) *error_msg = "Unknown or unsupported Wasm opcode: 0x" + std::to_string(static_cast<uint32_t>(raw_op));
@@ -639,7 +1256,7 @@ bool ValidateFunctionBody(const WasmModule& mod, const WasmFuncDesc& fd, std::st
         }
     }
 
-    if (!control_stack.empty()) {
+    if (!ctrl_stack.empty()) {
         if (error_msg) *error_msg = "Unterminated block/loop/if control constructs";
         return false;
     }
@@ -659,7 +1276,7 @@ TaggedValue WasmVal::ToJS(Realm& realm) const {
         case WasmValType::I32:
             return TaggedValue::FromSmi(i32);
         case WasmValType::I64:
-            return TaggedValue::FromDouble(static_cast<double>(i64));
+            return TaggedValue::FromHeapObject(JSBigInt::Create(i64));
         case WasmValType::F32:
             return TaggedValue::FromDouble(static_cast<double>(f32));
         case WasmValType::F64:
@@ -672,17 +1289,45 @@ TaggedValue WasmVal::ToJS(Realm& realm) const {
 }
 
 WasmVal WasmVal::FromJS(TaggedValue val, WasmValType expected_type) {
+    if (expected_type == WasmValType::I64) {
+        int64_t v = 0;
+        if (val.IsHeapObject()) {
+            HeapObject* ho = val.AsHeapObject();
+            if (ho->GetType() == HeapObjectType::JSBigInt) {
+                v = static_cast<JSBigInt*>(ho)->ToInt64();
+            } else if (ho->GetType() == HeapObjectType::String) {
+                std::string s = static_cast<JSString*>(ho)->Value();
+                try {
+                    v = std::stoll(s);
+                } catch (...) {
+                    v = 0;
+                }
+            } else if (val.IsNumber()) {
+                v = static_cast<int64_t>(val.AsNumber());
+            } else {
+                v = static_cast<int64_t>(val.ToDouble());
+            }
+        } else if (val.IsSmi()) {
+            v = static_cast<int64_t>(val.AsSmi());
+        } else if (val.IsDouble()) {
+            v = static_cast<int64_t>(val.AsDouble());
+        } else if (val.IsBoolean()) {
+            v = val.ToBoolean() ? 1LL : 0LL;
+        }
+        return WasmVal::MakeI64(v);
+    }
+
     double num = 0.0;
     if (val.IsNumber()) {
         num = val.AsNumber();
     } else if (val.IsBoolean()) {
         num = val.ToBoolean() ? 1.0 : 0.0;
+    } else if (val.IsHeapObject() && val.AsHeapObject()->GetType() == HeapObjectType::JSBigInt) {
+        num = static_cast<double>(static_cast<JSBigInt*>(val.AsHeapObject())->ToInt64());
     }
     switch (expected_type) {
         case WasmValType::I32:
             return WasmVal::MakeI32(static_cast<int32_t>(num));
-        case WasmValType::I64:
-            return WasmVal::MakeI64(static_cast<int64_t>(num));
         case WasmValType::F32:
             return WasmVal::MakeF32(static_cast<float>(num));
         case WasmValType::F64:

@@ -350,15 +350,67 @@ public:
             case TypedArrayKind::BigInt64: {
                 int64_t v;
                 std::memcpy(&v, ptr + index * 8, sizeof(v));
-                return TaggedValue::FromDouble(static_cast<double>(v));
+                return TaggedValue::FromHeapObject(JSBigInt::Create(v));
             }
             case TypedArrayKind::BigUint64: {
                 uint64_t v;
                 std::memcpy(&v, ptr + index * 8, sizeof(v));
-                return TaggedValue::FromDouble(static_cast<double>(v));
+                return TaggedValue::FromHeapObject(JSBigInt::Create(v));
             }
         }
         return TaggedValue::Undefined();
+    }
+
+    static int64_t TypedArrayToBigInt64(TaggedValue value) {
+        if (value.IsHeapObject()) {
+            HeapObject* h = value.AsHeapObject();
+            if (h->IsBigInt()) {
+                return static_cast<JSBigInt*>(h)->ToInt64();
+            }
+            if (h->IsString()) {
+                JSBigInt bi(static_cast<JSString*>(h)->View());
+                return bi.ToInt64();
+            }
+        }
+        if (value.IsBoolean()) {
+            return value.AsBoolean() ? 1LL : 0LL;
+        }
+        if (value.IsSmi()) {
+            return static_cast<int64_t>(value.AsSmi());
+        }
+        if (value.IsDouble()) {
+            double d = value.AsDouble();
+            if (!std::isnan(d) && !std::isinf(d)) {
+                return static_cast<int64_t>(std::trunc(d));
+            }
+        }
+        return 0;
+    }
+
+    static uint64_t TypedArrayToBigUint64(TaggedValue value) {
+        if (value.IsHeapObject()) {
+            HeapObject* h = value.AsHeapObject();
+            if (h->IsBigInt()) {
+                return static_cast<JSBigInt*>(h)->ToUint64();
+            }
+            if (h->IsString()) {
+                JSBigInt bi(static_cast<JSString*>(h)->View());
+                return bi.ToUint64();
+            }
+        }
+        if (value.IsBoolean()) {
+            return value.AsBoolean() ? 1ULL : 0ULL;
+        }
+        if (value.IsSmi()) {
+            return static_cast<uint64_t>(static_cast<int64_t>(value.AsSmi()));
+        }
+        if (value.IsDouble()) {
+            double d = value.AsDouble();
+            if (!std::isnan(d) && !std::isinf(d)) {
+                return static_cast<uint64_t>(static_cast<int64_t>(std::trunc(d)));
+            }
+        }
+        return 0;
     }
 
     // ECMAScript ToNumber conversion for typed array assignment
@@ -470,18 +522,12 @@ public:
                 break;
             }
             case TypedArrayKind::BigInt64: {
-                int64_t v = 0;
-                if (!std::isnan(num) && !std::isinf(num)) {
-                    v = static_cast<int64_t>(std::trunc(num));
-                }
+                int64_t v = TypedArrayToBigInt64(value);
                 std::memcpy(ptr + index * 8, &v, sizeof(v));
                 break;
             }
             case TypedArrayKind::BigUint64: {
-                uint64_t v = 0;
-                if (!std::isnan(num) && !std::isinf(num) && num >= 0.0) {
-                    v = static_cast<uint64_t>(std::trunc(num));
-                }
+                uint64_t v = TypedArrayToBigUint64(value);
                 std::memcpy(ptr + index * 8, &v, sizeof(v));
                 break;
             }
@@ -670,6 +716,25 @@ public:
         uint64_t raw;
         std::memcpy(&raw, &value, sizeof(raw));
         Write64(Data() + byte_offset, raw, little_endian);
+    }
+
+    int64_t GetBigInt64(size_t byte_offset, bool little_endian = false) const {
+        if (!CheckBounds(byte_offset, 8)) return 0;
+        uint64_t raw = Read64(Data() + byte_offset, little_endian);
+        return static_cast<int64_t>(raw);
+    }
+    void SetBigInt64(size_t byte_offset, int64_t value, bool little_endian = false) {
+        if (!CheckBounds(byte_offset, 8)) return;
+        Write64(Data() + byte_offset, static_cast<uint64_t>(value), little_endian);
+    }
+
+    uint64_t GetBigUint64(size_t byte_offset, bool little_endian = false) const {
+        if (!CheckBounds(byte_offset, 8)) return 0;
+        return Read64(Data() + byte_offset, little_endian);
+    }
+    void SetBigUint64(size_t byte_offset, uint64_t value, bool little_endian = false) {
+        if (!CheckBounds(byte_offset, 8)) return;
+        Write64(Data() + byte_offset, value, little_endian);
     }
 
 private:

@@ -191,7 +191,41 @@ public:
     explicit TypeFeedbackVector(size_t slot_count = 64)
         : slots_(slot_count) {}
 
+    TypeFeedbackVector(const TypeFeedbackVector& other) {
+        std::lock_guard<std::mutex> lock(other.mutex_);
+        slots_ = other.slots_;
+    }
+
+    TypeFeedbackVector& operator=(const TypeFeedbackVector& other) {
+        if (this != &other) {
+            std::scoped_lock lock(mutex_, other.mutex_);
+            slots_ = other.slots_;
+        }
+        return *this;
+    }
+
+    TypeFeedbackVector(TypeFeedbackVector&& other) noexcept {
+        std::lock_guard<std::mutex> lock(other.mutex_);
+        slots_ = std::move(other.slots_);
+    }
+
+    TypeFeedbackVector& operator=(TypeFeedbackVector&& other) noexcept {
+        if (this != &other) {
+            std::scoped_lock lock(mutex_, other.mutex_);
+            slots_ = std::move(other.slots_);
+        }
+        return *this;
+    }
+
+    std::unique_ptr<TypeFeedbackVector> Snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto snap = std::make_unique<TypeFeedbackVector>(slots_.size());
+        snap->slots_ = slots_;
+        return snap;
+    }
+
     FeedbackSlot& GetSlot(size_t idx) {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (idx >= slots_.size()) {
             slots_.resize(idx + 1);
         }
@@ -199,20 +233,25 @@ public:
     }
 
     const FeedbackSlot& GetSlot(size_t idx) const {
+        std::lock_guard<std::mutex> lock(mutex_);
         assert(idx < slots_.size());
         return slots_[idx];
     }
 
-    size_t Size() const noexcept { return slots_.size(); }
+    size_t Size() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return slots_.size();
+    }
 
 private:
+    mutable std::mutex mutex_;
     std::vector<FeedbackSlot> slots_;
 };
 
 /**
  * @brief Represents a compiled bytecode routine along with constant pool and metadata.
  */
-class BytecodeArray {
+class BytecodeArray : public std::enable_shared_from_this<BytecodeArray> {
 public:
     BytecodeArray(uint32_t register_count = 0, uint32_t parameter_count = 0)
         : register_count_(register_count), parameter_count_(parameter_count) {}
@@ -222,6 +261,7 @@ public:
           constants_(std::move(other.constants_)),
           register_count_(other.register_count_),
           parameter_count_(other.parameter_count_),
+          length_(other.length_),
           is_strict_(other.is_strict_),
           invocation_count_(other.invocation_count_.load(std::memory_order_relaxed)),
           is_compiling_tier2_(other.is_compiling_tier2_.load(std::memory_order_relaxed)),
@@ -239,6 +279,7 @@ public:
             constants_ = std::move(other.constants_);
             register_count_ = other.register_count_;
             parameter_count_ = other.parameter_count_;
+            length_ = other.length_;
             is_strict_ = other.is_strict_;
             invocation_count_.store(other.invocation_count_.load(std::memory_order_relaxed));
             is_compiling_tier2_.store(other.is_compiling_tier2_.load(std::memory_order_relaxed));
@@ -250,6 +291,32 @@ public:
             tier2_code_ = std::move(other.tier2_code_);
         }
         return *this;
+    }
+
+    std::unique_ptr<BytecodeArray> Clone() const {
+        auto copy = std::make_unique<BytecodeArray>(register_count_, parameter_count_);
+        copy->bytes_ = bytes_;
+        copy->constants_ = constants_;
+        copy->length_ = length_;
+        copy->is_strict_ = is_strict_;
+        copy->register_scope_ = register_scope_;
+        copy->context_slots_ = context_slots_;
+        copy->invocation_count_.store(invocation_count_.load(std::memory_order_relaxed));
+        copy->is_compiling_tier2_.store(is_compiling_tier2_.load(std::memory_order_relaxed));
+        auto snap = feedback_.Snapshot();
+        if (snap) copy->feedback_ = *snap;
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        copy->tier1_code_ = tier1_code_;
+        copy->tier2_code_ = tier2_code_;
+        return copy;
+    }
+
+    std::shared_ptr<const BytecodeArray> GetShared() const {
+        try {
+            return shared_from_this();
+        } catch (const std::bad_weak_ptr&) {
+            return std::shared_ptr<const BytecodeArray>(Clone().release());
+        }
     }
 
     BytecodeArray(const BytecodeArray&) = delete;

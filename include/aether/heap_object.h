@@ -1419,6 +1419,21 @@ public:
         Normalize();
     }
 
+    explicit JSBigInt(uint64_t val, Shape* shape = nullptr)
+        : HeapObject(HeapObjectType::JSBigInt, shape), is_negative_(false) {
+        if (val > 0) {
+            detail::ReserveStorage(limbs_, limbs_storage_, (val >> 32) ? 2 : 1);
+            limbs_.push_back(static_cast<uint32_t>(val & 0xFFFFFFFFULL));
+            if (val >> 32) {
+                limbs_.push_back(static_cast<uint32_t>(val >> 32));
+            }
+        }
+        Normalize();
+    }
+
+    explicit JSBigInt(int val, Shape* shape = nullptr)
+        : JSBigInt(static_cast<int64_t>(val), shape) {}
+
     explicit JSBigInt(std::string_view s, Shape* shape = nullptr)
         : HeapObject(HeapObjectType::JSBigInt, shape) {
         FromString(s);
@@ -1444,17 +1459,20 @@ public:
     AETHER_ALWAYS_INLINE const std::vector<uint32_t>& Limbs() const noexcept { return limbs_; }
 
     int64_t Value() const noexcept {
+        return ToInt64();
+    }
+
+    uint64_t ToUint64() const noexcept {
         if (limbs_.empty()) return 0;
         uint64_t mag = limbs_[0];
         if (limbs_.size() > 1) {
             mag |= (static_cast<uint64_t>(limbs_[1]) << 32);
         }
-        if (is_negative_) {
-            if (mag > static_cast<uint64_t>(INT64_MAX)) return INT64_MIN;
-            return -static_cast<int64_t>(mag);
-        }
-        if (mag > static_cast<uint64_t>(INT64_MAX)) return INT64_MAX;
-        return static_cast<int64_t>(mag);
+        return is_negative_ ? (~mag + 1ULL) : mag;
+    }
+
+    int64_t ToInt64() const noexcept {
+        return static_cast<int64_t>(ToUint64());
     }
 
     bool Equals(const JSBigInt& other) const noexcept {
@@ -1905,10 +1923,13 @@ public:
         return new (dst) JSBigInt(std::move(*this));
     }
 
+    static JSBigInt* Create(int64_t value);
+    static JSBigInt* Create(uint64_t value);
+    static JSBigInt* Create(int value) { return Create(static_cast<int64_t>(value)); }
+
 private:
     // Implemented in heap_object.cpp with heap.h's allocation facade visible.
     // Materialize an owned value before managed allocation can move operands.
-    static JSBigInt* Create(int64_t value);
     static JSBigInt* Create(bool negative, const std::vector<uint32_t>& limbs);
     static JSBigInt* Create(bool negative, std::vector<uint32_t>&& limbs);
     static JSBigInt* Create(bool negative, std::vector<uint32_t>&& limbs, MemoryCharge&& charge);

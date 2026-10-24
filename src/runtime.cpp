@@ -3345,6 +3345,60 @@ static TaggedValue DataView_setFloat64(TaggedValue this_val, const std::vector<T
     return TaggedValue::Undefined();
 }
 
+static TaggedValue DataView_getBigInt64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
+        CheckDataViewBounds(nullptr, 0, 8);
+        return TaggedValue::Undefined();
+    }
+    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromHeapObject(JSBigInt::Create(dv->GetBigInt64(offset, le)));
+}
+static TaggedValue DataView_setBigInt64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
+        CheckDataViewBounds(nullptr, 0, 8);
+        return TaggedValue::Undefined();
+    }
+    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    int64_t val = JSTypedArray::TypedArrayToBigInt64(args[1]);
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetBigInt64(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue DataView_getBigUint64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
+        CheckDataViewBounds(nullptr, 0, 8);
+        return TaggedValue::Undefined();
+    }
+    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    bool le = args.size() > 1 && args[1].ToBoolean();
+    return TaggedValue::FromHeapObject(JSBigInt::Create(dv->GetBigUint64(offset, le)));
+}
+static TaggedValue DataView_setBigUint64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
+        CheckDataViewBounds(nullptr, 0, 8);
+        return TaggedValue::Undefined();
+    }
+    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    uint64_t val = JSTypedArray::TypedArrayToBigUint64(args[1]);
+    bool le = args.size() > 2 && args[2].ToBoolean();
+    dv->SetBigUint64(offset, val, le);
+    return TaggedValue::Undefined();
+}
+
 static TaggedValue Array_values(TaggedValue this_val, const std::vector<TaggedValue>&) {
     auto* obj = (this_val.IsHeapObject() && this_val.AsHeapObject()->IsJSObject())
                 ? static_cast<JSObject*>(this_val.AsHeapObject()) : nullptr;
@@ -4940,6 +4994,10 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     data_view_prototype_->SetNamedProperty("setFloat32", TaggedValue::FromHeapObject(make_native("setFloat32", &DataView_setFloat32)), next_shape_id_);
     data_view_prototype_->SetNamedProperty("getFloat64", TaggedValue::FromHeapObject(make_native("getFloat64", &DataView_getFloat64)), next_shape_id_);
     data_view_prototype_->SetNamedProperty("setFloat64", TaggedValue::FromHeapObject(make_native("setFloat64", &DataView_setFloat64)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getBigInt64", TaggedValue::FromHeapObject(make_native("getBigInt64", &DataView_getBigInt64)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setBigInt64", TaggedValue::FromHeapObject(make_native("setBigInt64", &DataView_setBigInt64)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("getBigUint64", TaggedValue::FromHeapObject(make_native("getBigUint64", &DataView_getBigUint64)), next_shape_id_);
+    data_view_prototype_->SetNamedProperty("setBigUint64", TaggedValue::FromHeapObject(make_native("setBigUint64", &DataView_setBigUint64)), next_shape_id_);
 
     auto* data_view_ctor = make_native("DataView", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArrayBuffer()) {
@@ -5097,6 +5155,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     make_typed_array_ctor(TypedArrayKind::Uint32, "Uint32Array");
     make_typed_array_ctor(TypedArrayKind::Float32, "Float32Array");
     make_typed_array_ctor(TypedArrayKind::Float64, "Float64Array");
+    make_typed_array_ctor(TypedArrayKind::BigInt64, "BigInt64Array");
+    make_typed_array_ctor(TypedArrayKind::BigUint64, "BigUint64Array");
 
     // $262 host object
     auto* host262 = make_old_obj();

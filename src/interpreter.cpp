@@ -707,7 +707,8 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
         if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
             if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
                 if (bytecode.TryBeginTier2Compilation()) {
-                    BackgroundCompiler::Current()->Enqueue(bytecode, &feedback_);
+                    auto fb_snap = feedback_.Snapshot();
+                    BackgroundCompiler::Current()->Enqueue(bytecode, fb_snap.get());
                 }
             } else {
                 auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
@@ -727,7 +728,8 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
     if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
         if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
             if (bytecode.TryBeginTier2Compilation()) {
-                BackgroundCompiler::Current()->Enqueue(bytecode, &feedback_);
+                    auto fb_snap = feedback_.Snapshot();
+                    BackgroundCompiler::Current()->Enqueue(bytecode, fb_snap.get());
             }
         } else {
             auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);

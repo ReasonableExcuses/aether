@@ -1,6 +1,7 @@
 #include "aether/heap.h"
 #include "aether/concurrent_marker.h"
 #include "aether/advanced_intrinsics.h"
+#include "aether/wasm.h"
 #include <deque>
 #include <cstring>
 #include <stdexcept>
@@ -230,6 +231,10 @@ void IsolateHeap::MinorGC() {
             }
         }
         ProcessWeak(live, resolve_weak);
+        WasmRegistryRelocate([&](JSObject* obj) -> JSObject* {
+            return static_cast<JSObject*>(resolve(obj));
+        });
+        WasmRegistryPruneDead([&](JSObject* obj) { return alive.contains(obj); });
     } catch (...) {
         std::terminate();
     }
@@ -277,6 +282,7 @@ void IsolateHeap::MajorGC() {
     ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
         return alive.contains(obj) ? obj : nullptr;
     });
+    WasmRegistryPruneDead([&](JSObject* obj) { return alive.contains(obj); });
     for (auto it = young_.begin(); it != young_.end(); ) {
         if (alive.contains(it->first)) { ++it; continue; }
         HeapObject* obj = it->first;
