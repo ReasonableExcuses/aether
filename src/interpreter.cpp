@@ -2202,6 +2202,296 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 break;
             }
+            case Opcode::AddSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    int64_t sum = static_cast<int64_t>(acc_.AsSmi()) + imm;
+                    if (AETHER_LIKELY(sum <= INT32_MAX && sum >= INT32_MIN)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(sum));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(sum));
+                    }
+                } else {
+                    TaggedValue lval = acc_;
+                    if (lval.IsHeapObject() && (lval.AsHeapObject()->IsJSObject() || lval.AsHeapObject()->IsProxy())) {
+                        lval = ToPrimitive(lval, "default");
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                    }
+                    if (lval.IsHeapObject() && lval.AsHeapObject()->IsString()) {
+                        TaggedValue s1_val = ToStringOp(lval);
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        std::string s1 = static_cast<JSString*>(s1_val.AsHeapObject())->Value();
+                        std::string s2 = std::to_string(imm);
+                        if (AETHER_UNLIKELY(s1.size() + s2.size() > kMaxStringLength)) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                AllocateRuntime<JSError>("RangeError", "String length exceeds maximum allowed length")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s1 + s2));
+                    } else {
+                        TaggedValue lnum = ToNumeric(lval);
+                        if (has_pending_exception_) {
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        if (lnum.IsBigInt()) {
+                            SetPendingException(TaggedValue::FromHeapObject(
+                                AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                            if (frame.HasExceptionHandler()) {
+                                auto h = frame.PopExceptionHandler();
+                                pc = h.target_pc;
+                                frame.SetEnvironment(h.env);
+                                acc_ = pending_exception_;
+                                has_pending_exception_ = false;
+                            } else {
+                                return pending_exception_;
+                            }
+                            break;
+                        }
+                        acc_ = TaggedValue::FromDouble(lnum.ToDouble() + static_cast<double>(imm));
+                    }
+                }
+                break;
+            }
+            case Opcode::SubSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    int64_t diff = static_cast<int64_t>(acc_.AsSmi()) - imm;
+                    if (AETHER_LIKELY(diff <= INT32_MAX && diff >= INT32_MIN)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(diff));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(diff));
+                    }
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromDouble(lnum.ToDouble() - static_cast<double>(imm));
+                }
+                break;
+            }
+            case Opcode::MulSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    int64_t prod = static_cast<int64_t>(acc_.AsSmi()) * imm;
+                    if (prod == 0 && (acc_.AsSmi() < 0 || imm < 0)) {
+                        acc_ = TaggedValue::FromDouble(-0.0);
+                    } else if (prod <= INT32_MAX && prod >= INT32_MIN) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(prod));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(prod));
+                    }
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromDouble(lnum.ToDouble() * static_cast<double>(imm));
+                }
+                break;
+            }
+            case Opcode::DivSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+                if (AETHER_LIKELY(acc_.IsSmi() && imm != 0)) {
+                    int64_t n = acc_.AsSmi();
+                    int64_t d = imm;
+                    int64_t q = n / d;
+                    if (n % d == 0 && q >= INT32_MIN && q <= INT32_MAX && !(n == 0 && d < 0)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(q));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(n) / static_cast<double>(d));
+                    }
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromDouble(lnum.ToDouble() / static_cast<double>(imm));
+                }
+                break;
+            }
+            case Opcode::ModSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                uint16_t slot_id = pc[0] | (pc[1] << 8);
+                pc += 2;
+                (void)slot_id;
+                if (AETHER_LIKELY(acc_.IsSmi() && imm != 0)) {
+                    int32_t n = acc_.AsSmi();
+                    int32_t d = imm;
+                    if (n == INT32_MIN && d == -1) {
+                        acc_ = TaggedValue::FromDouble(-0.0);
+                    } else {
+                        int32_t rem = n % d;
+                        acc_ = (rem == 0 && n < 0) ? TaggedValue::FromDouble(-0.0) : TaggedValue::FromSmi(rem);
+                    }
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromDouble(std::fmod(lnum.ToDouble(), static_cast<double>(imm)));
+                }
+                break;
+            }
+            case Opcode::BitwiseAndSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                acc_ = TaggedValue::FromSmi(ToInt32(acc_) & imm);
+                break;
+            }
+            case Opcode::BitwiseOrSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                acc_ = TaggedValue::FromSmi(ToInt32(acc_) | imm);
+                break;
+            }
+            case Opcode::BitwiseXorSmi: {
+                int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                acc_ = TaggedValue::FromSmi(ToInt32(acc_) ^ imm);
+                break;
+            }
+            case Opcode::ShiftLeftSmi: {
+                uint8_t imm = *pc++;
+                acc_ = TaggedValue::FromSmi(ToInt32(acc_) << (imm & 0x1F));
+                break;
+            }
+            case Opcode::ShiftRightSmi: {
+                uint8_t imm = *pc++;
+                acc_ = TaggedValue::FromSmi(ToInt32(acc_) >> (imm & 0x1F));
+                break;
+            }
+            case Opcode::ShiftRightUnsignedSmi: {
+                uint8_t imm = *pc++;
+                uint32_t res = ToUint32(acc_) >> (imm & 0x1F);
+                if (res <= static_cast<uint32_t>(INT32_MAX)) {
+                    acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
+                } else {
+                    acc_ = TaggedValue::FromDouble(static_cast<double>(res));
+                }
+                break;
+            }
             case Opcode::TestEqual: {
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
@@ -2225,6 +2515,31 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 uint8_t reg = *pc++;
                 TaggedValue rhs = frame.GetRegister(reg);
                 acc_ = TaggedValue::FromBoolean(IsStrictlyEqual(acc_, rhs));
+                break;
+            }
+            case Opcode::TestNotEqual: {
+                uint8_t reg = *pc++;
+                TaggedValue rhs = frame.GetRegister(reg);
+                bool eq = IsLooselyEqual(acc_, rhs);
+                if (has_pending_exception_) {
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = pending_exception_;
+                        has_pending_exception_ = false;
+                    } else {
+                        return pending_exception_;
+                    }
+                    break;
+                }
+                acc_ = TaggedValue::FromBoolean(!eq);
+                break;
+            }
+            case Opcode::TestStrictNotEqual: {
+                uint8_t reg = *pc++;
+                TaggedValue rhs = frame.GetRegister(reg);
+                acc_ = TaggedValue::FromBoolean(!IsStrictlyEqual(acc_, rhs));
                 break;
             }
             case Opcode::TestLessThan: {
@@ -2422,7 +2737,49 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                              HasProperty(acc_, set_key) ||
                              HasProperty(acc_, hash_key);
                 acc_ = TaggedValue::FromBoolean(found);
-                printf("DEBUG TestPrivateIn: raw_name=%s, priv_key=%s, found=%d\n", raw_name.c_str(), priv_key.c_str(), (int)found);
+
+                break;
+            }
+            case Opcode::TestNull: {
+                acc_ = TaggedValue::FromBoolean(acc_.IsNull());
+                break;
+            }
+            case Opcode::TestUndefined: {
+                acc_ = TaggedValue::FromBoolean(acc_.IsUndefined());
+                break;
+            }
+            case Opcode::TestTypeOf: {
+                uint16_t type_const = pc[0] | (pc[1] << 8);
+                pc += 2;
+                TaggedValue expected_val = bytecode.Constants()[type_const];
+                std::string expected = (expected_val.IsHeapObject() && expected_val.AsHeapObject()->IsString()) ?
+                                       static_cast<JSString*>(expected_val.AsHeapObject())->Value() : "";
+                std::string actual = "";
+                if (acc_.IsSmi() || acc_.IsDouble()) {
+                    actual = "number";
+                } else if (acc_.IsBoolean()) {
+                    actual = "boolean";
+                } else if (acc_.IsUndefined()) {
+                    actual = "undefined";
+                } else if (acc_.IsNull()) {
+                    actual = "object";
+                } else if (acc_.IsSymbol()) {
+                    actual = "symbol";
+                } else if (acc_.IsHeapObject()) {
+                    auto* h = acc_.AsHeapObject();
+                    if (h->IsString()) {
+                        actual = "string";
+                    } else if (h->IsBigInt()) {
+                        actual = "bigint";
+                    } else if (h->IsFunction() || h->IsNativeFunction() || (h->IsProxy() && static_cast<JSProxy*>(h)->IsCallable())) {
+                        actual = "function";
+                    } else {
+                        actual = "object";
+                    }
+                } else {
+                    actual = "undefined";
+                }
+                acc_ = TaggedValue::FromBoolean(actual == expected);
                 break;
             }
             case Opcode::Jump: {
@@ -2459,6 +2816,38 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
                 if (acc_.IsNull() || acc_.IsUndefined()) {
+                    pc += offset;
+                }
+                break;
+            }
+            case Opcode::JumpIfUndefined: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (acc_.IsUndefined()) {
+                    pc += offset;
+                }
+                break;
+            }
+            case Opcode::JumpIfNotUndefined: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (!acc_.IsUndefined()) {
+                    pc += offset;
+                }
+                break;
+            }
+            case Opcode::JumpIfNull: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (acc_.IsNull()) {
+                    pc += offset;
+                }
+                break;
+            }
+            case Opcode::JumpIfNotNull: {
+                int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
+                pc += 4;
+                if (!acc_.IsNull()) {
                     pc += offset;
                 }
                 break;
@@ -3522,6 +3911,72 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 acc_ = TaggedValue::FromHeapObject(arr);
                 break;
             }
+            case Opcode::CreateEmptyArrayLiteral: {
+                auto* arr = AllocateRuntime<JSArray>(GetRootShape(), 0);
+                if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                    arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+                }
+                acc_ = TaggedValue::FromHeapObject(arr);
+                break;
+            }
+            case Opcode::CreateRegExpLiteral: {
+                uint16_t pat_idx = pc[0] | (pc[1] << 8); pc += 2;
+                uint16_t flags_idx = pc[0] | (pc[1] << 8); pc += 2;
+                TaggedValue pat_val = bytecode.Constants()[pat_idx];
+                TaggedValue flags_val = bytecode.Constants()[flags_idx];
+                std::string pat = (pat_val.IsHeapObject() && pat_val.AsHeapObject()->IsString()) ?
+                                  static_cast<JSString*>(pat_val.AsHeapObject())->Value() : "";
+                std::string flags = (flags_val.IsHeapObject() && flags_val.AsHeapObject()->IsString()) ?
+                                    static_cast<JSString*>(flags_val.AsHeapObject())->Value() : "";
+                auto* re = AllocateRuntime<JSRegExp>(pat, flags, Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+                if (Realm::Current() && Realm::Current()->GetRegExpPrototype()) {
+                    re->SetPrototype(Realm::Current()->GetRegExpPrototype());
+                }
+                acc_ = TaggedValue::FromHeapObject(re);
+                break;
+            }
+            case Opcode::ForInEnumerate: {
+                uint8_t obj_reg = *pc++;
+                TaggedValue target = frame.GetRegister(obj_reg);
+                auto* arr = AllocateRuntime<JSArray>(GetRootShape(), 0);
+                if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                    arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+                }
+                if (target.IsHeapObject() && target.AsHeapObject()->IsJSObject()) {
+                    JSObject* obj = static_cast<JSObject*>(target.AsHeapObject());
+                    std::vector<std::string> keys = obj->GetOwnPropertyNames();
+                    for (const auto& k : keys) {
+                        arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(k)));
+                    }
+                }
+                acc_ = TaggedValue::FromHeapObject(arr);
+                break;
+            }
+            case Opcode::ForInNext: {
+                uint8_t obj_reg = *pc++;
+                uint8_t enum_reg = *pc++;
+                uint8_t idx_reg = *pc++;
+                TaggedValue target = frame.GetRegister(obj_reg);
+                TaggedValue enum_val = frame.GetRegister(enum_reg);
+                TaggedValue idx_val = frame.GetRegister(idx_reg);
+                acc_ = TaggedValue::Undefined();
+                if (enum_val.IsHeapObject() && enum_val.AsHeapObject()->IsArray() && idx_val.IsSmi()) {
+                    auto* arr = static_cast<JSArray*>(enum_val.AsHeapObject());
+                    int32_t idx = idx_val.AsSmi();
+                    if (idx >= 0 && static_cast<size_t>(idx) < arr->Length()) {
+                        TaggedValue key_val = arr->Elements()[idx];
+                        if (target.IsHeapObject() && target.AsHeapObject()->IsJSObject()) {
+                            std::string key_str = key_val.ToString();
+                            if (HasProperty(target, key_str)) {
+                                acc_ = key_val;
+                            }
+                        } else {
+                            acc_ = key_val;
+                        }
+                    }
+                }
+                break;
+            }
             case Opcode::ArrayPush: {
                 uint8_t arr_reg = *pc++;
                 uint8_t val_reg = *pc++;
@@ -4381,6 +4836,30 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (cur_env) {
                     cur_env->Set(depth, slot, acc_);
                 }
+                break;
+            }
+            case Opcode::LdaCurrentContextSlot: {
+                uint16_t slot = pc[0] | (pc[1] << 8);
+                pc += 2;
+                LexicalEnvironment* cur_env = frame.GetEnvironment();
+                acc_ = cur_env ? cur_env->Get(0, slot) : TaggedValue::Undefined();
+                break;
+            }
+            case Opcode::StaCurrentContextSlot: {
+                uint16_t slot = pc[0] | (pc[1] << 8);
+                pc += 2;
+                LexicalEnvironment* cur_env = frame.GetEnvironment();
+                if (cur_env) {
+                    cur_env->Set(0, slot, acc_);
+                }
+                break;
+            }
+            case Opcode::LdaImmutableContextSlot: {
+                uint8_t depth = *pc++;
+                uint16_t slot = pc[0] | (pc[1] << 8);
+                pc += 2;
+                LexicalEnvironment* cur_env = frame.GetEnvironment();
+                acc_ = cur_env ? cur_env->Get(depth, slot) : TaggedValue::Undefined();
                 break;
             }
             case Opcode::Construct: {

@@ -130,3 +130,6 @@ target_link_libraries(test_hardening_execution PRIVATE aether_core)
 
 add_executable(test_hardening_async tests/test_hardening_async.cpp)
 target_link_libraries(test_hardening_async PRIVATE aether_core)
+
+add_executable(test_genuine_bytecodes_jit tests/test_genuine_bytecodes_jit.cpp)
+target_link_libraries(test_genuine_bytecodes_jit PRIVATE aether_core)

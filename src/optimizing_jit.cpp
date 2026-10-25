@@ -33,9 +33,17 @@ bool IsInt32Value(Node* node, std::unordered_set<Node*>& visiting) {
         case NodeOp::Int32And:
         case NodeOp::Int32Or:
         case NodeOp::Int32Xor:
+        case NodeOp::Int32ShiftLeft:
+        case NodeOp::Int32ShiftRight:
+        case NodeOp::Int32ShiftRightLogical:
             result = node->Inputs().size() >= 2 &&
                      IsInt32Value(node->Input(0), visiting) &&
                      IsInt32Value(node->Input(1), visiting);
+            break;
+        case NodeOp::Int32Not:
+        case NodeOp::Int32Neg:
+            result = !node->Inputs().empty() &&
+                     IsInt32Value(node->Input(0), visiting);
             break;
         case NodeOp::Phi:
             result = node->Inputs().size() >= 2;
@@ -100,6 +108,10 @@ bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
                 pc += 2;
                 break;
 
+            case Opcode::Negate:
+            case Opcode::BitwiseNot:
+                break;
+
             case Opcode::Add:
             case Opcode::Sub:
             case Opcode::Mul:
@@ -110,15 +122,43 @@ bool OptimizingJIT::CanCompile(const BytecodeArray& bytecode) {
                 pc += 3;
                 break;
 
+            case Opcode::AddSmi:
+            case Opcode::SubSmi:
+            case Opcode::MulSmi:
+            case Opcode::DivSmi:
+            case Opcode::ModSmi:
+                if (pc + 6 > code.size()) return false;
+                pc += 6;
+                break;
+
+            case Opcode::BitwiseAndSmi:
+            case Opcode::BitwiseOrSmi:
+            case Opcode::BitwiseXorSmi:
+                if (pc + 4 > code.size()) return false;
+                pc += 4;
+                break;
+
+            case Opcode::ShiftLeftSmi:
+            case Opcode::ShiftRightSmi:
+            case Opcode::ShiftRightUnsignedSmi:
+                if (pc + 1 > code.size()) return false;
+                pc += 1;
+                break;
+
             case Opcode::BitwiseAnd:
             case Opcode::BitwiseOr:
             case Opcode::BitwiseXor:
+            case Opcode::ShiftLeft:
+            case Opcode::ShiftRight:
+            case Opcode::ShiftRightUnsigned:
             case Opcode::TestLessThan:
             case Opcode::TestLessThanOrEqual:
             case Opcode::TestGreaterThan:
             case Opcode::TestGreaterThanOrEqual:
             case Opcode::TestEqual:
             case Opcode::TestStrictEqual:
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual:
                 // [Op, reg: u8]
                 if (pc + 1 > code.size()) return false;
                 pc += 1;
@@ -397,6 +437,49 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
                 masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
                 masm.XorRegReg32(X86Reg::RAX, X86Reg::RCX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
+                break;
+            }
+
+            case NodeOp::Int32ShiftLeft: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.ShlRegCl(X86Reg::RAX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
+                break;
+            }
+
+            case NodeOp::Int32ShiftRight: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.SarRegCl(X86Reg::RAX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
+                break;
+            }
+
+            case NodeOp::Int32ShiftRightLogical: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetNodeOffset(node->Input(1)->Id()));
+                masm.ShrRegCl(X86Reg::RAX);
+                masm.CmpRegImm32(X86Reg::RAX, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
+                break;
+            }
+
+            case NodeOp::Int32Not: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.NotReg32(X86Reg::RAX);
+                masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
+                break;
+            }
+
+            case NodeOp::Int32Neg: {
+                masm.MovMemToReg(X86Reg::RAX, X86Reg::RBP, GetNodeOffset(node->Input(0)->Id()));
+                masm.CmpRegImm32(X86Reg::RAX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.NegReg32(X86Reg::RAX);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
                 masm.MovRegToMem(X86Reg::RBP, GetNodeOffset(node->Id()), X86Reg::RAX);
                 break;
             }

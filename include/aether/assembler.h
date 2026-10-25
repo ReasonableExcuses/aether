@@ -98,6 +98,18 @@ public:
     void AndRegReg32(X86Reg dst, X86Reg src);
     void OrRegReg32(X86Reg dst, X86Reg src);
     void XorRegReg32(X86Reg dst, X86Reg src);
+    void NegReg32(X86Reg dst);
+    void NotReg32(X86Reg dst);
+    void ShlRegImm8(X86Reg dst, uint8_t imm);
+    void SarRegImm8(X86Reg dst, uint8_t imm);
+    void ShlRegCl(X86Reg dst);
+    void SarRegCl(X86Reg dst);
+    void ShrRegCl(X86Reg dst);
+    void AddRegImm32(X86Reg dst, int32_t imm);
+    void SubRegImm32(X86Reg dst, int32_t imm);
+    void AndRegImm32(X86Reg dst, uint32_t imm);
+    void OrRegImm32(X86Reg dst, uint32_t imm);
+    void XorRegImm32(X86Reg dst, uint32_t imm);
     void MovRegImm32(X86Reg dst, uint32_t imm);
     void Cdq();
     void IdivReg32(X86Reg src);

@@ -19,6 +19,10 @@ bool BaselineJIT::CanCompile(const BytecodeArray& bytecode) {
             case Opcode::LdaFalse:
             case Opcode::LdaEmpty:
             case Opcode::LogicalNot:
+            case Opcode::Negate:
+            case Opcode::BitwiseNot:
+            case Opcode::TestNull:
+            case Opcode::TestUndefined:
             case Opcode::ToNumber:
             case Opcode::ToNumeric:
             case Opcode::Inc:
@@ -46,20 +50,48 @@ bool BaselineJIT::CanCompile(const BytecodeArray& bytecode) {
             case Opcode::Mod:
                 pc += 3;
                 break;
+            case Opcode::AddSmi:
+            case Opcode::SubSmi:
+            case Opcode::MulSmi:
+            case Opcode::DivSmi:
+            case Opcode::ModSmi:
+                pc += 6;
+                break;
+            case Opcode::BitwiseAndSmi:
+            case Opcode::BitwiseOrSmi:
+            case Opcode::BitwiseXorSmi:
+                pc += 4;
+                break;
+            case Opcode::ShiftLeftSmi:
+            case Opcode::ShiftRightSmi:
+            case Opcode::ShiftRightUnsignedSmi:
+                pc += 1;
+                break;
             case Opcode::BitwiseAnd:
             case Opcode::BitwiseOr:
             case Opcode::BitwiseXor:
+            case Opcode::ShiftLeft:
+            case Opcode::ShiftRight:
+            case Opcode::ShiftRightUnsigned:
             case Opcode::TestLessThan:
             case Opcode::TestLessThanOrEqual:
             case Opcode::TestGreaterThan:
             case Opcode::TestGreaterThanOrEqual:
             case Opcode::TestEqual:
             case Opcode::TestStrictEqual:
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual:
                 pc += 1;
                 break;
             case Opcode::Jump:
             case Opcode::JumpIfTrue:
             case Opcode::JumpIfFalse:
+            case Opcode::JumpIfNotNullish:
+            case Opcode::JumpIfNullish:
+            case Opcode::JumpIfUndefined:
+            case Opcode::JumpIfNotUndefined:
+            case Opcode::JumpIfNull:
+            case Opcode::JumpIfNotNull:
                 pc += 4;
                 break;
             default:
@@ -305,6 +337,207 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
                 break;
             }
+            case Opcode::ShiftLeft: {
+                uint8_t reg = code[pc++];
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.ShlRegCl(X86Reg::RDX);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ShiftRight: {
+                uint8_t reg = code[pc++];
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.SarRegCl(X86Reg::RDX);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ShiftRightUnsigned: {
+                uint8_t reg = code[pc++];
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.ShrRegCl(X86Reg::RDX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::AddSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.AddRegImm32(X86Reg::RDX, imm);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::SubSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.SubRegImm32(X86Reg::RDX, imm);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::MulSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.MovRegImm32(X86Reg::R8, imm);
+                masm.ImulRegReg32(X86Reg::RDX, X86Reg::R8);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                JITLabel not_zero_prod_smi;
+                masm.Jcc(Condition::NotEqual, not_zero_prod_smi);
+                masm.MovRegReg32(X86Reg::R8, X86Reg::RAX);
+                masm.OrRegImm32(X86Reg::R8, imm);
+                masm.CmpRegImm32(X86Reg::R8, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.Bind(not_zero_prod_smi);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::DivSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                if (imm == 0) {
+                    masm.Jmp(deopt_bailout_label);
+                    break;
+                }
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
+                masm.CmpRegImm32(X86Reg::RAX, 0);
+                JITLabel not_zero_div_smi;
+                masm.Jcc(Condition::NotEqual, not_zero_div_smi);
+                if (imm < 0) {
+                    masm.Jmp(deopt_bailout_label);
+                }
+                masm.Bind(not_zero_div_smi);
+                masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                JITLabel not_min_smi;
+                masm.Jcc(Condition::NotEqual, not_min_smi);
+                if (imm == -1) {
+                    masm.Jmp(deopt_bailout_label);
+                }
+                masm.Bind(not_min_smi);
+                masm.Cdq();
+                masm.MovRegImm32(X86Reg::RCX, imm);
+                masm.IdivReg32(X86Reg::RCX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::NotEqual, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RAX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ModSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                if (imm == 0) {
+                    masm.Jmp(deopt_bailout_label);
+                    break;
+                }
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RAX, X86Reg::RAX);
+                if (imm == -1) {
+                    masm.CmpRegImm32(X86Reg::RAX, static_cast<int32_t>(0x80000000));
+                    masm.Jcc(Condition::Equal, deopt_bailout_label);
+                }
+                masm.Cdq();
+                masm.MovRegImm32(X86Reg::RCX, imm);
+                masm.IdivReg32(X86Reg::RCX);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::BitwiseAndSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.AndRegImm32(X86Reg::RAX, imm);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::BitwiseOrSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.OrRegImm32(X86Reg::RAX, imm);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::BitwiseXorSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.XorRegImm32(X86Reg::RAX, imm);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ShiftLeftSmi: {
+                uint8_t imm = code[pc++];
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.ShlRegImm8(X86Reg::RDX, static_cast<uint8_t>(imm & 0x1F));
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ShiftRightSmi: {
+                uint8_t imm = code[pc++];
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.SarRegImm8(X86Reg::RDX, static_cast<uint8_t>(imm & 0x1F));
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ShiftRightUnsignedSmi: {
+                uint8_t imm = code[pc++];
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.ShrRegImm8(X86Reg::RDX, static_cast<uint8_t>(imm & 0x1F));
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Less, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
             case Opcode::TestLessThan: {
                 uint8_t reg = code[pc++];
                 masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
@@ -394,6 +627,49 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.Bind(done);
                 break;
             }
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual: {
+                uint8_t reg = code[pc++];
+                masm.MovMemToReg(X86Reg::RCX, X86Reg::RBP, GetRegisterOffset(reg));
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.TestSmiAndBranchIfNot(X86Reg::RCX, deopt_bailout_label);
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                JITLabel is_true;
+                JITLabel done;
+                masm.Jcc(Condition::NotEqual, is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::False().RawBits());
+                masm.Jmp(done);
+                masm.Bind(is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::True().RawBits());
+                masm.Bind(done);
+                break;
+            }
+            case Opcode::TestNull: {
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Null().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                JITLabel is_true;
+                JITLabel done;
+                masm.Jcc(Condition::Equal, is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::False().RawBits());
+                masm.Jmp(done);
+                masm.Bind(is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::True().RawBits());
+                masm.Bind(done);
+                break;
+            }
+            case Opcode::TestUndefined: {
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Undefined().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                JITLabel is_true;
+                JITLabel done;
+                masm.Jcc(Condition::Equal, is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::False().RawBits());
+                masm.Jmp(done);
+                masm.Bind(is_true);
+                masm.MovRegImm64(X86Reg::RAX, TaggedValue::True().RawBits());
+                masm.Bind(done);
+                break;
+            }
             case Opcode::Jump: {
                 int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;
@@ -439,6 +715,66 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.Jcc(Condition::Equal, labels[target_pc]);
                 break;
             }
+            case Opcode::JumpIfNotNullish: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Null().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Equal, labels[pc]);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Undefined().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::NotEqual, labels[target_pc]);
+                break;
+            }
+            case Opcode::JumpIfNullish: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Null().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Equal, labels[target_pc]);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Undefined().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Equal, labels[target_pc]);
+                break;
+            }
+            case Opcode::JumpIfUndefined: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Undefined().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Equal, labels[target_pc]);
+                break;
+            }
+            case Opcode::JumpIfNotUndefined: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Undefined().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::NotEqual, labels[target_pc]);
+                break;
+            }
+            case Opcode::JumpIfNull: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Null().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::Equal, labels[target_pc]);
+                break;
+            }
+            case Opcode::JumpIfNotNull: {
+                int32_t offset = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                size_t target_pc = pc + offset;
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::Null().RawBits());
+                masm.CmpRegReg(X86Reg::RAX, X86Reg::RCX);
+                masm.Jcc(Condition::NotEqual, labels[target_pc]);
+                break;
+            }
             case Opcode::LogicalNot: {
                 masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
                 masm.SubRspImm32(40);
@@ -458,6 +794,28 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 masm.Bind(done);
                 break;
             }
+            case Opcode::Negate: {
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.CmpRegImm32(X86Reg::RDX, 0);
+                masm.Jcc(Condition::Equal, deopt_bailout_label);
+                masm.NegReg32(X86Reg::RDX);
+                masm.Jcc(Condition::Overflow, deopt_bailout_label);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::BitwiseNot: {
+                masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
+                masm.Movsxd(X86Reg::RDX, X86Reg::RAX);
+                masm.NotReg32(X86Reg::RDX);
+                masm.MovRegReg32(X86Reg::RAX, X86Reg::RDX);
+                masm.MovRegImm64(X86Reg::RCX, TaggedValue::kTagSmi);
+                masm.OrRegReg(X86Reg::RAX, X86Reg::RCX);
+                break;
+            }
+            case Opcode::ToNumber:
             case Opcode::ToNumeric: {
                 masm.TestSmiAndBranchIfNot(X86Reg::RAX, deopt_bailout_label);
                 break;

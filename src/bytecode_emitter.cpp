@@ -689,6 +689,11 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         return;
     }
     if (res.kind == VarResolution::ContextSlot) {
+        if (res.depth == 0) {
+            bytecode_->EmitOpcode(Opcode::LdaCurrentContextSlot);
+            bytecode_->EmitU16(res.slot);
+            return;
+        }
         bytecode_->EmitOpcode(Opcode::LdaContextSlot);
         bytecode_->EmitU8(res.depth);
         bytecode_->EmitU16(res.slot);
@@ -872,6 +877,11 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         return;
     }
     if (res.kind == VarResolution::ContextSlot) {
+        if (res.depth == 0) {
+            bytecode_->EmitOpcode(Opcode::StaCurrentContextSlot);
+            bytecode_->EmitU16(res.slot);
+            return;
+        }
         bytecode_->EmitOpcode(Opcode::StaContextSlot);
         bytecode_->EmitU8(res.depth);
         bytecode_->EmitU16(res.slot);
@@ -1517,6 +1527,10 @@ void BytecodeEmitter::VisitArrayLiteral(ArrayLiteralExpr* node) {
     }
 
     if (!has_spread) {
+        if (node->Elements().empty()) {
+            bytecode_->EmitOpcode(Opcode::CreateEmptyArrayLiteral);
+            return;
+        }
         uint8_t count = static_cast<uint8_t>(node->Elements().size());
         uint8_t args_start = AllocateRegisterRange(count);
 
@@ -1946,6 +1960,93 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
         }
     }
 
+    // Check for Smi immediate optimization on RHS
+    if (auto* lit = dynamic_cast<LiteralExpr*>(node->Rhs())) {
+        if (lit->Value().IsSmi()) {
+            int32_t smi_val = lit->Value().AsSmi();
+            switch (node->Op()) {
+                case BinaryOp::Add: {
+                    node->Lhs()->Accept(this);
+                    uint16_t slot = next_feedback_slot_++;
+                    bytecode_->EmitOpcode(Opcode::AddSmi);
+                    bytecode_->EmitI32(smi_val);
+                    bytecode_->EmitU16(slot);
+                    return;
+                }
+                case BinaryOp::Sub: {
+                    node->Lhs()->Accept(this);
+                    uint16_t slot = next_feedback_slot_++;
+                    bytecode_->EmitOpcode(Opcode::SubSmi);
+                    bytecode_->EmitI32(smi_val);
+                    bytecode_->EmitU16(slot);
+                    return;
+                }
+                case BinaryOp::Mul: {
+                    node->Lhs()->Accept(this);
+                    uint16_t slot = next_feedback_slot_++;
+                    bytecode_->EmitOpcode(Opcode::MulSmi);
+                    bytecode_->EmitI32(smi_val);
+                    bytecode_->EmitU16(slot);
+                    return;
+                }
+                case BinaryOp::Div: {
+                    node->Lhs()->Accept(this);
+                    uint16_t slot = next_feedback_slot_++;
+                    bytecode_->EmitOpcode(Opcode::DivSmi);
+                    bytecode_->EmitI32(smi_val);
+                    bytecode_->EmitU16(slot);
+                    return;
+                }
+                case BinaryOp::Mod: {
+                    node->Lhs()->Accept(this);
+                    uint16_t slot = next_feedback_slot_++;
+                    bytecode_->EmitOpcode(Opcode::ModSmi);
+                    bytecode_->EmitI32(smi_val);
+                    bytecode_->EmitU16(slot);
+                    return;
+                }
+                case BinaryOp::BitwiseAnd: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::BitwiseAndSmi);
+                    bytecode_->EmitI32(smi_val);
+                    return;
+                }
+                case BinaryOp::BitwiseOr: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::BitwiseOrSmi);
+                    bytecode_->EmitI32(smi_val);
+                    return;
+                }
+                case BinaryOp::BitwiseXor: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::BitwiseXorSmi);
+                    bytecode_->EmitI32(smi_val);
+                    return;
+                }
+                case BinaryOp::ShiftLeft: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::ShiftLeftSmi);
+                    bytecode_->EmitU8(static_cast<uint8_t>(smi_val & 0x1F));
+                    return;
+                }
+                case BinaryOp::ShiftRight: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::ShiftRightSmi);
+                    bytecode_->EmitU8(static_cast<uint8_t>(smi_val & 0x1F));
+                    return;
+                }
+                case BinaryOp::ShiftRightUnsigned: {
+                    node->Lhs()->Accept(this);
+                    bytecode_->EmitOpcode(Opcode::ShiftRightUnsignedSmi);
+                    bytecode_->EmitU8(static_cast<uint8_t>(smi_val & 0x1F));
+                    return;
+                }
+                default:
+                    break;
+            }
+        }
+    }
+
     // 1. Evaluate LHS
     node->Lhs()->Accept(this);
     uint8_t lhs_reg = AllocateRegister();
@@ -2028,6 +2129,14 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             bytecode_->EmitU8(rhs_reg);
             break;
         case BinaryOp::NotEqual:
+            bytecode_->EmitOpcode(Opcode::TestNotEqual);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+        case BinaryOp::StrictNotEqual:
+            bytecode_->EmitOpcode(Opcode::TestStrictNotEqual);
+            bytecode_->EmitU8(rhs_reg);
+            break;
+#if 0
             bytecode_->EmitOpcode(Opcode::TestEqual);
             bytecode_->EmitU8(rhs_reg);
             bytecode_->EmitOpcode(Opcode::LogicalNot);
@@ -2037,6 +2146,7 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
             bytecode_->EmitU8(rhs_reg);
             bytecode_->EmitOpcode(Opcode::LogicalNot);
             break;
+#endif
         case BinaryOp::LessThan:
             bytecode_->EmitOpcode(Opcode::TestLessThan);
             bytecode_->EmitU8(rhs_reg);
@@ -2368,6 +2478,22 @@ void BytecodeEmitter::VisitFunctionDecl(FunctionDeclStmt* node) {
 }
 
 void BytecodeEmitter::VisitNew(NewExpr* node) {
+    if (auto* id = dynamic_cast<IdentifierExpr*>(node->Callee())) {
+        if (id->Name() == "RegExp" && node->Args().size() >= 1 && node->Args().size() <= 2) {
+            auto* p_lit = dynamic_cast<LiteralExpr*>(node->Args()[0].get());
+            LiteralExpr* f_lit = node->Args().size() == 2 ? dynamic_cast<LiteralExpr*>(node->Args()[1].get()) : nullptr;
+            if (p_lit && p_lit->Value().IsHeapObject() && p_lit->Value().AsHeapObject()->IsString() &&
+                (!f_lit || (f_lit->Value().IsHeapObject() && f_lit->Value().AsHeapObject()->IsString()))) {
+                uint16_t pat_idx = bytecode_->AddConstant(p_lit->Value());
+                TaggedValue flags_val = f_lit ? f_lit->Value() : TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+                uint16_t flags_idx = bytecode_->AddConstant(flags_val);
+                bytecode_->EmitOpcode(Opcode::CreateRegExpLiteral);
+                bytecode_->EmitU16(pat_idx);
+                bytecode_->EmitU16(flags_idx);
+                return;
+            }
+        }
+    }
     // 1. Evaluate callee constructor
     node->Callee()->Accept(this);
     uint8_t ctor_reg = AllocateRegister();

@@ -207,6 +207,85 @@ void MacroAssembler::XorRegReg32(X86Reg dst, X86Reg src) {
     EmitModRM(0b11, src, dst);
 }
 
+void MacroAssembler::NegReg32(X86Reg dst) {
+    EmitRex(false, static_cast<X86Reg>(3), dst);
+    Emit8(0xF7); // neg r/m32
+    EmitModRM(0b11, static_cast<X86Reg>(3), dst);
+}
+
+void MacroAssembler::NotReg32(X86Reg dst) {
+    EmitRex(false, static_cast<X86Reg>(2), dst);
+    Emit8(0xF7); // not r/m32
+    EmitModRM(0b11, static_cast<X86Reg>(2), dst);
+}
+
+void MacroAssembler::ShlRegImm8(X86Reg dst, uint8_t imm) {
+    EmitRex(false, static_cast<X86Reg>(4), dst);
+    Emit8(0xC1); // shl r/m32, imm8
+    EmitModRM(0b11, static_cast<X86Reg>(4), dst);
+    Emit8(imm);
+}
+
+void MacroAssembler::SarRegImm8(X86Reg dst, uint8_t imm) {
+    EmitRex(false, static_cast<X86Reg>(7), dst);
+    Emit8(0xC1); // sar r/m32, imm8
+    EmitModRM(0b11, static_cast<X86Reg>(7), dst);
+    Emit8(imm);
+}
+
+void MacroAssembler::ShlRegCl(X86Reg dst) {
+    EmitRex(false, static_cast<X86Reg>(4), dst);
+    Emit8(0xD3); // shl r/m32, cl
+    EmitModRM(0b11, static_cast<X86Reg>(4), dst);
+}
+
+void MacroAssembler::SarRegCl(X86Reg dst) {
+    EmitRex(false, static_cast<X86Reg>(7), dst);
+    Emit8(0xD3); // sar r/m32, cl
+    EmitModRM(0b11, static_cast<X86Reg>(7), dst);
+}
+
+void MacroAssembler::ShrRegCl(X86Reg dst) {
+    EmitRex(false, static_cast<X86Reg>(5), dst);
+    Emit8(0xD3); // shr r/m32, cl
+    EmitModRM(0b11, static_cast<X86Reg>(5), dst);
+}
+
+void MacroAssembler::AddRegImm32(X86Reg dst, int32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(0), dst);
+    Emit8(0x81); // add r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(0), dst);
+    Emit32(static_cast<uint32_t>(imm));
+}
+
+void MacroAssembler::SubRegImm32(X86Reg dst, int32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(5), dst);
+    Emit8(0x81); // sub r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(5), dst);
+    Emit32(static_cast<uint32_t>(imm));
+}
+
+void MacroAssembler::AndRegImm32(X86Reg dst, uint32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(4), dst);
+    Emit8(0x81); // and r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(4), dst);
+    Emit32(imm);
+}
+
+void MacroAssembler::OrRegImm32(X86Reg dst, uint32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(1), dst);
+    Emit8(0x81); // or r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(1), dst);
+    Emit32(imm);
+}
+
+void MacroAssembler::XorRegImm32(X86Reg dst, uint32_t imm) {
+    EmitRex(false, static_cast<X86Reg>(6), dst);
+    Emit8(0x81); // xor r/m32, imm32
+    EmitModRM(0b11, static_cast<X86Reg>(6), dst);
+    Emit32(imm);
+}
+
 void MacroAssembler::MovRegImm32(X86Reg dst, uint32_t imm) {
     uint8_t r = static_cast<uint8_t>(dst);
     if (r >= 8) {

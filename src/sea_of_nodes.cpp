@@ -35,6 +35,11 @@ const char* NodeOpToString(NodeOp op) {
         case NodeOp::Int32And: return "Int32And";
         case NodeOp::Int32Or: return "Int32Or";
         case NodeOp::Int32Xor: return "Int32Xor";
+        case NodeOp::Int32ShiftLeft: return "Int32ShiftLeft";
+        case NodeOp::Int32ShiftRight: return "Int32ShiftRight";
+        case NodeOp::Int32ShiftRightLogical: return "Int32ShiftRightLogical";
+        case NodeOp::Int32Not: return "Int32Not";
+        case NodeOp::Int32Neg: return "Int32Neg";
         case NodeOp::Int32CmpLess: return "Int32CmpLess";
         case NodeOp::Int32CmpLessEqual: return "Int32CmpLessEqual";
         case NodeOp::Int32CmpGreater: return "Int32CmpGreater";
@@ -268,18 +273,40 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
             case Opcode::Mul:
             case Opcode::Div:
             case Opcode::Mod: scan_pc += 3; break;
+            case Opcode::AddSmi:
+            case Opcode::SubSmi:
+            case Opcode::MulSmi:
+            case Opcode::DivSmi:
+            case Opcode::ModSmi: scan_pc += 6; break;
+            case Opcode::BitwiseAndSmi:
+            case Opcode::BitwiseOrSmi:
+            case Opcode::BitwiseXorSmi: scan_pc += 4; break;
+            case Opcode::ShiftLeftSmi:
+            case Opcode::ShiftRightSmi:
+            case Opcode::ShiftRightUnsignedSmi: scan_pc += 1; break;
             case Opcode::BitwiseAnd:
             case Opcode::BitwiseOr:
             case Opcode::BitwiseXor:
+            case Opcode::ShiftLeft:
+            case Opcode::ShiftRight:
+            case Opcode::ShiftRightUnsigned:
             case Opcode::TestLessThan:
             case Opcode::TestLessThanOrEqual:
             case Opcode::TestGreaterThan:
             case Opcode::TestGreaterThanOrEqual:
             case Opcode::TestEqual:
-            case Opcode::TestStrictEqual: scan_pc += 1; break;
+            case Opcode::TestStrictEqual:
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual: scan_pc += 1; break;
             case Opcode::Jump:
             case Opcode::JumpIfTrue:
-            case Opcode::JumpIfFalse: {
+            case Opcode::JumpIfFalse:
+            case Opcode::JumpIfNotNullish:
+            case Opcode::JumpIfNullish:
+            case Opcode::JumpIfUndefined:
+            case Opcode::JumpIfNotUndefined:
+            case Opcode::JumpIfNull:
+            case Opcode::JumpIfNotNull: {
                 int32_t offset = code[scan_pc] | (code[scan_pc + 1] << 8) | (code[scan_pc + 2] << 16) | (code[scan_pc + 3] << 24);
                 scan_pc += 4;
                 if (scan_op == Opcode::Jump && offset < 0) {
@@ -497,6 +524,132 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
                 acc_ = graph_->GVN(xor_node);
                 break;
             }
+            case Opcode::ShiftLeft: {
+                uint8_t reg = code[pc++];
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftLeft);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(registers_[reg]);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::ShiftRight: {
+                uint8_t reg = code[pc++];
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftRight);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(registers_[reg]);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::ShiftRightUnsigned: {
+                uint8_t reg = code[pc++];
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftRightLogical);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(registers_[reg]);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::AddSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* add_node = graph_->NewNode(NodeOp::Int32Add);
+                add_node->AddInput(acc_);
+                add_node->AddInput(const_node);
+                acc_ = graph_->GVN(add_node);
+                break;
+            }
+            case Opcode::SubSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* sub_node = graph_->NewNode(NodeOp::Int32Sub);
+                sub_node->AddInput(acc_);
+                sub_node->AddInput(const_node);
+                acc_ = graph_->GVN(sub_node);
+                break;
+            }
+            case Opcode::MulSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* mul_node = graph_->NewNode(NodeOp::Int32Mul);
+                mul_node->AddInput(acc_);
+                mul_node->AddInput(const_node);
+                acc_ = graph_->GVN(mul_node);
+                break;
+            }
+            case Opcode::BitwiseAndSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* and_node = graph_->NewNode(NodeOp::Int32And);
+                and_node->AddInput(acc_);
+                and_node->AddInput(const_node);
+                acc_ = graph_->GVN(and_node);
+                break;
+            }
+            case Opcode::BitwiseOrSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* or_node = graph_->NewNode(NodeOp::Int32Or);
+                or_node->AddInput(acc_);
+                or_node->AddInput(const_node);
+                acc_ = graph_->GVN(or_node);
+                break;
+            }
+            case Opcode::BitwiseXorSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* xor_node = graph_->NewNode(NodeOp::Int32Xor);
+                xor_node->AddInput(acc_);
+                xor_node->AddInput(const_node);
+                acc_ = graph_->GVN(xor_node);
+                break;
+            }
+            case Opcode::ShiftLeftSmi: {
+                uint8_t imm = code[pc++];
+                Node* const_node = graph_->NewConstantInt32(imm & 0x1F);
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftLeft);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(const_node);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::ShiftRightSmi: {
+                uint8_t imm = code[pc++];
+                Node* const_node = graph_->NewConstantInt32(imm & 0x1F);
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftRight);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(const_node);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::ShiftRightUnsignedSmi: {
+                uint8_t imm = code[pc++];
+                Node* const_node = graph_->NewConstantInt32(imm & 0x1F);
+                Node* shift_node = graph_->NewNode(NodeOp::Int32ShiftRightLogical);
+                shift_node->AddInput(acc_);
+                shift_node->AddInput(const_node);
+                acc_ = graph_->GVN(shift_node);
+                break;
+            }
+            case Opcode::Negate: {
+                Node* neg_node = graph_->NewNode(NodeOp::Int32Neg);
+                neg_node->AddInput(acc_);
+                acc_ = graph_->GVN(neg_node);
+                break;
+            }
+            case Opcode::BitwiseNot: {
+                Node* not_node = graph_->NewNode(NodeOp::Int32Not);
+                not_node->AddInput(acc_);
+                acc_ = graph_->GVN(not_node);
+                break;
+            }
             case Opcode::TestLessThan: {
                 uint8_t reg = code[pc++];
                 Node* cmp = graph_->NewNode(NodeOp::Int32CmpLess);
@@ -533,6 +686,15 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
             case Opcode::TestStrictEqual: {
                 uint8_t reg = code[pc++];
                 Node* cmp = graph_->NewNode(NodeOp::Int32CmpEqual);
+                cmp->AddInput(acc_);
+                cmp->AddInput(registers_[reg]);
+                acc_ = graph_->GVN(cmp);
+                break;
+            }
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual: {
+                uint8_t reg = code[pc++];
+                Node* cmp = graph_->NewNode(NodeOp::Int32CmpNotEqual);
                 cmp->AddInput(acc_);
                 cmp->AddInput(registers_[reg]);
                 acc_ = graph_->GVN(cmp);

@@ -52,6 +52,8 @@ enum class Opcode : uint8_t {
     // Comparisons (acc = (acc <op> Reg[reg]))
     TestEqual,              // [Op, reg: u8]           acc = (acc == Reg[reg])
     TestStrictEqual,        // [Op, reg: u8]           acc = (acc === Reg[reg])
+    TestNotEqual,           // [Op, reg: u8]           acc = (acc != Reg[reg])
+    TestStrictNotEqual,     // [Op, reg: u8]           acc = (acc !== Reg[reg])
     TestLessThan,           // [Op, reg: u8]           acc = (acc < Reg[reg])
     TestGreaterThan,        // [Op, reg: u8]           acc = (acc > Reg[reg])
     TestLessThanOrEqual,    // [Op, reg: u8]           acc = (acc <= Reg[reg])
@@ -60,13 +62,33 @@ enum class Opcode : uint8_t {
     TestIn,                 // [Op, reg: u8]           acc = (Reg[reg] in acc)
     TestInWith,             // [Op, reg: u8]           acc = HasBindingWith(acc, Reg[reg])
     TestPrivateIn,          // [Op, name_idx: u16]     acc = (#name in acc)
+    TestNull,               // [Op]                    acc = (acc === null)
+    TestUndefined,          // [Op]                    acc = (acc === undefined)
+    TestTypeOf,             // [Op, type_const: u16]   acc = (typeof acc === const[type_const])
+
+    // Smi-Immediate Binary Arithmetic & Bitwise (acc = acc <op> imm)
+    AddSmi,                 // [Op, imm: i32, slot: u16]   acc = acc + imm
+    SubSmi,                 // [Op, imm: i32, slot: u16]   acc = acc - imm
+    MulSmi,                 // [Op, imm: i32, slot: u16]   acc = acc * imm
+    DivSmi,                 // [Op, imm: i32, slot: u16]   acc = acc / imm
+    ModSmi,                 // [Op, imm: i32, slot: u16]   acc = acc % imm
+    BitwiseAndSmi,          // [Op, imm: i32]              acc = acc & imm
+    BitwiseOrSmi,           // [Op, imm: i32]              acc = acc | imm
+    BitwiseXorSmi,          // [Op, imm: i32]              acc = acc ^ imm
+    ShiftLeftSmi,           // [Op, imm: u8]               acc = acc << imm
+    ShiftRightSmi,          // [Op, imm: u8]               acc = acc >> imm
+    ShiftRightUnsignedSmi,  // [Op, imm: u8]               acc = acc >>> imm
 
     // Control Flow
-    Jump,               // [Op, offset: i32]           pc += offset
-    JumpIfTrue,         // [Op, offset: i32]           if (ToBoolean(acc)) pc += offset
-    JumpIfFalse,        // [Op, offset: i32]           if (!ToBoolean(acc)) pc += offset
-    JumpIfNotNullish,   // [Op, offset: i32]           if (!acc.IsNull() && !acc.IsUndefined()) pc += offset
-    JumpIfNullish,      // [Op, offset: i32]           if (acc.IsNull() || acc.IsUndefined()) pc += offset
+    Jump,                   // [Op, offset: i32]           pc += offset
+    JumpIfTrue,             // [Op, offset: i32]           if (ToBoolean(acc)) pc += offset
+    JumpIfFalse,            // [Op, offset: i32]           if (!ToBoolean(acc)) pc += offset
+    JumpIfNotNullish,       // [Op, offset: i32]           if (!acc.IsNull() && !acc.IsUndefined()) pc += offset
+    JumpIfNullish,          // [Op, offset: i32]           if (acc.IsNull() || acc.IsUndefined()) pc += offset
+    JumpIfUndefined,        // [Op, offset: i32]           if (acc.IsUndefined()) pc += offset
+    JumpIfNotUndefined,     // [Op, offset: i32]           if (!acc.IsUndefined()) pc += offset
+    JumpIfNull,             // [Op, offset: i32]           if (acc.IsNull()) pc += offset
+    JumpIfNotNull,          // [Op, offset: i32]           if (!acc.IsNull()) pc += offset
 
     // Object & Property Access (Inline Cache enabled)
     LdaNamed,           // [Op, obj: u8, name_idx: u16, slot: u16]  acc = obj.name
@@ -117,12 +139,21 @@ enum class Opcode : uint8_t {
     ObjectSpread,           // [Op, target_reg: u8, src_reg: u8] Object.assign(target, src)
     CreateRestArray,        // [Op, dest_reg: u8, start_idx: u16] dest = args.slice(start_idx)
     CreateArguments,        // [Op, dest_reg: u8] dest = arguments object
+    CreateEmptyArrayLiteral,// [Op]                    acc = new JSArray()
+    CreateRegExpLiteral,    // [Op, pattern_idx: u16, flags_idx: u16] acc = new RegExp(...)
 
     // Closures & Lexical Scopes
     CreateClosure,          // [Op, const_idx: u16]    acc = new JSFunction(const[idx], env)
     CreateFunctionContext,  // [Op, slot_count: u16]   env = new LexicalEnvironment(env, slot_count)
     LdaContextSlot,         // [Op, depth: u8, slot: u16] acc = env.Get(depth, slot)
     StaContextSlot,         // [Op, depth: u8, slot: u16] env.Set(depth, slot, acc)
+    LdaCurrentContextSlot,  // [Op, slot: u16]         acc = env.Get(0, slot)
+    StaCurrentContextSlot,  // [Op, slot: u16]         env.Set(0, slot, acc)
+    LdaImmutableContextSlot,// [Op, depth: u8, slot: u16] acc = env.Get(depth, slot)
+
+    // Iteration & Property Enumeration
+    ForInEnumerate,         // [Op, obj_reg: u8]       acc = EnumerateKeys(Reg[obj_reg])
+    ForInNext,              // [Op, obj_reg: u8, enum_reg: u8, idx_reg: u8] acc = enum[idx]
 
     // Exception Handling
     PushExceptionHandler,   // [Op, offset: i32]       push catch handler

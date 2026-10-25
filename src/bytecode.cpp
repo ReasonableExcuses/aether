@@ -31,6 +31,8 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::ShiftRightUnsigned: return "ShiftRightUnsigned";
         case Opcode::TestEqual:          return "TestEqual";
         case Opcode::TestStrictEqual:    return "TestStrictEqual";
+        case Opcode::TestNotEqual:       return "TestNotEqual";
+        case Opcode::TestStrictNotEqual: return "TestStrictNotEqual";
         case Opcode::TestLessThan:       return "TestLessThan";
         case Opcode::TestGreaterThan:    return "TestGreaterThan";
         case Opcode::TestLessThanOrEqual: return "TestLessThanOrEqual";
@@ -39,13 +41,33 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::TestIn:             return "TestIn";
         case Opcode::TestInWith:         return "TestInWith";
         case Opcode::TestPrivateIn:      return "TestPrivateIn";
+        case Opcode::TestNull:           return "TestNull";
+        case Opcode::TestUndefined:      return "TestUndefined";
+        case Opcode::TestTypeOf:         return "TestTypeOf";
+        case Opcode::AddSmi:             return "AddSmi";
+        case Opcode::SubSmi:             return "SubSmi";
+        case Opcode::MulSmi:             return "MulSmi";
+        case Opcode::DivSmi:             return "DivSmi";
+        case Opcode::ModSmi:             return "ModSmi";
+        case Opcode::BitwiseAndSmi:      return "BitwiseAndSmi";
+        case Opcode::BitwiseOrSmi:       return "BitwiseOrSmi";
+        case Opcode::BitwiseXorSmi:      return "BitwiseXorSmi";
+        case Opcode::ShiftLeftSmi:       return "ShiftLeftSmi";
+        case Opcode::ShiftRightSmi:      return "ShiftRightSmi";
+        case Opcode::ShiftRightUnsignedSmi: return "ShiftRightUnsignedSmi";
         case Opcode::Jump:               return "Jump";
         case Opcode::JumpIfTrue:         return "JumpIfTrue";
         case Opcode::JumpIfFalse:        return "JumpIfFalse";
         case Opcode::JumpIfNotNullish:   return "JumpIfNotNullish";
         case Opcode::JumpIfNullish:      return "JumpIfNullish";
+        case Opcode::JumpIfUndefined:    return "JumpIfUndefined";
+        case Opcode::JumpIfNotUndefined: return "JumpIfNotUndefined";
+        case Opcode::JumpIfNull:         return "JumpIfNull";
+        case Opcode::JumpIfNotNull:      return "JumpIfNotNull";
         case Opcode::LdaNamed:           return "LdaNamed";
         case Opcode::StaNamed:           return "StaNamed";
+        case Opcode::LdaPrivate:         return "LdaPrivate";
+        case Opcode::StaPrivate:         return "StaPrivate";
         case Opcode::LdaKeyed:           return "LdaKeyed";
         case Opcode::StaKeyed:           return "StaKeyed";
         case Opcode::DeleteNamed:        return "DeleteNamed";
@@ -86,10 +108,17 @@ const char* OpcodeToString(Opcode op) {
         case Opcode::ObjectSpread:       return "ObjectSpread";
         case Opcode::CreateRestArray:    return "CreateRestArray";
         case Opcode::CreateArguments:    return "CreateArguments";
+        case Opcode::CreateEmptyArrayLiteral: return "CreateEmptyArrayLiteral";
+        case Opcode::CreateRegExpLiteral: return "CreateRegExpLiteral";
         case Opcode::CreateClosure:      return "CreateClosure";
         case Opcode::CreateFunctionContext: return "CreateFunctionContext";
         case Opcode::LdaContextSlot:     return "LdaContextSlot";
         case Opcode::StaContextSlot:     return "StaContextSlot";
+        case Opcode::LdaCurrentContextSlot: return "LdaCurrentContextSlot";
+        case Opcode::StaCurrentContextSlot: return "StaCurrentContextSlot";
+        case Opcode::LdaImmutableContextSlot: return "LdaImmutableContextSlot";
+        case Opcode::ForInEnumerate:     return "ForInEnumerate";
+        case Opcode::ForInNext:          return "ForInNext";
         case Opcode::PushExceptionHandler: return "PushExceptionHandler";
         case Opcode::PopExceptionHandler:  return "PopExceptionHandler";
         case Opcode::Throw:              return "Throw";
@@ -181,35 +210,99 @@ std::string BytecodeArray::Disassemble() const {
             case Opcode::Mul:
             case Opcode::Div:
             case Opcode::Mod:
+            case Opcode::Exp:
             case Opcode::BitwiseAnd:
             case Opcode::BitwiseOr:
             case Opcode::BitwiseXor:
             case Opcode::ShiftLeft:
             case Opcode::ShiftRight:
+            case Opcode::ShiftRightUnsigned:
             case Opcode::TestEqual:
             case Opcode::TestStrictEqual:
+            case Opcode::TestNotEqual:
+            case Opcode::TestStrictNotEqual:
             case Opcode::TestLessThan:
             case Opcode::TestGreaterThan:
             case Opcode::TestLessThanOrEqual:
             case Opcode::TestGreaterThanOrEqual:
-            case Opcode::TestInstanceOf: {
+            case Opcode::TestInstanceOf:
+            case Opcode::TestIn:
+            case Opcode::TestInWith: {
                 uint8_t reg = bytes_[pc++];
                 ss << "r" << static_cast<int>(reg);
-                if (op == Opcode::Add || op == Opcode::Sub || op == Opcode::Mul || op == Opcode::Div || op == Opcode::Mod) {
+                if (op == Opcode::Add || op == Opcode::Sub || op == Opcode::Mul || op == Opcode::Div || op == Opcode::Mod || op == Opcode::Exp) {
                     uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
                     pc += 2;
                     ss << " [feedback_slot: " << slot << "]";
                 }
                 break;
             }
+            case Opcode::TestTypeOf: {
+                uint16_t type_const = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "const[" << type_const << "]";
+                break;
+            }
+            case Opcode::AddSmi:
+            case Opcode::SubSmi:
+            case Opcode::MulSmi:
+            case Opcode::DivSmi:
+            case Opcode::ModSmi: {
+                int32_t imm = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
+                pc += 4;
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << imm << " [feedback_slot: " << slot << "]";
+                break;
+            }
+            case Opcode::BitwiseAndSmi:
+            case Opcode::BitwiseOrSmi:
+            case Opcode::BitwiseXorSmi: {
+                int32_t imm = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
+                pc += 4;
+                ss << imm;
+                break;
+            }
+            case Opcode::ShiftLeftSmi:
+            case Opcode::ShiftRightSmi:
+            case Opcode::ShiftRightUnsignedSmi: {
+                uint8_t imm = bytes_[pc++];
+                ss << static_cast<int>(imm);
+                break;
+            }
             case Opcode::Jump:
             case Opcode::JumpIfTrue:
             case Opcode::JumpIfFalse:
             case Opcode::JumpIfNotNullish:
-            case Opcode::JumpIfNullish: {
+            case Opcode::JumpIfNullish:
+            case Opcode::JumpIfUndefined:
+            case Opcode::JumpIfNotUndefined:
+            case Opcode::JumpIfNull:
+            case Opcode::JumpIfNotNull: {
                 int32_t offset = bytes_[pc] | (bytes_[pc + 1] << 8) | (bytes_[pc + 2] << 16) | (bytes_[pc + 3] << 24);
                 pc += 4;
                 ss << "offset: " << offset << " -> [0x" << std::hex << (pc + offset) << std::dec << "]";
+                break;
+            }
+            case Opcode::LdaPrivate:
+            case Opcode::StaPrivate: {
+                uint8_t obj = bytes_[pc++];
+                uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "r" << static_cast<int>(obj) << ".#" << constants_[name_idx].ToString();
+                break;
+            }
+            case Opcode::DeleteNamed: {
+                uint8_t obj = bytes_[pc++];
+                uint16_t name_idx = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "r" << static_cast<int>(obj) << "." << constants_[name_idx].ToString();
+                break;
+            }
+            case Opcode::DeleteKeyed: {
+                uint8_t obj = bytes_[pc++];
+                uint8_t key = bytes_[pc++];
+                ss << "r" << static_cast<int>(obj) << "[r" << static_cast<int>(key) << "]";
                 break;
             }
             case Opcode::LdaNamed:
@@ -365,11 +458,39 @@ std::string BytecodeArray::Disassemble() const {
                 break;
             }
             case Opcode::LdaContextSlot:
-            case Opcode::StaContextSlot: {
+            case Opcode::StaContextSlot:
+            case Opcode::LdaImmutableContextSlot: {
                 uint8_t depth = bytes_[pc++];
                 uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
                 pc += 2;
                 ss << "depth: " << static_cast<int>(depth) << ", slot: " << slot;
+                break;
+            }
+            case Opcode::LdaCurrentContextSlot:
+            case Opcode::StaCurrentContextSlot: {
+                uint16_t slot = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "slot: " << slot;
+                break;
+            }
+            case Opcode::ForInEnumerate: {
+                uint8_t obj = bytes_[pc++];
+                ss << "obj: r" << static_cast<int>(obj);
+                break;
+            }
+            case Opcode::ForInNext: {
+                uint8_t obj = bytes_[pc++];
+                uint8_t enum_reg = bytes_[pc++];
+                uint8_t idx_reg = bytes_[pc++];
+                ss << "obj: r" << static_cast<int>(obj) << ", enum: r" << static_cast<int>(enum_reg) << ", idx: r" << static_cast<int>(idx_reg);
+                break;
+            }
+            case Opcode::CreateRegExpLiteral: {
+                uint16_t pat = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                uint16_t flags = bytes_[pc] | (bytes_[pc + 1] << 8);
+                pc += 2;
+                ss << "pattern: const[" << pat << "], flags: const[" << flags << "]";
                 break;
             }
             case Opcode::PushExceptionHandler: {
@@ -382,6 +503,9 @@ std::string BytecodeArray::Disassemble() const {
             case Opcode::Throw:
             case Opcode::LdaThis:
             case Opcode::CreateObject:
+            case Opcode::CreateEmptyArrayLiteral:
+            case Opcode::TestNull:
+            case Opcode::TestUndefined:
             case Opcode::LogicalNot:
             case Opcode::Negate:
             case Opcode::BitwiseNot:

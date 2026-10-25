@@ -55,6 +55,11 @@ enum class NodeOp : uint16_t {
     Int32And,
     Int32Or,
     Int32Xor,
+    Int32ShiftLeft,
+    Int32ShiftRight,
+    Int32ShiftRightLogical,
+    Int32Not,
+    Int32Neg,
 
     // Unboxed Comparisons
     Int32CmpLess,
