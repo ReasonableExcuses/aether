@@ -320,6 +320,28 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
             for (const auto& child : prog->Statements()) {
                 self(self, child.get());
             }
+        } else if (auto* for_s = dynamic_cast<ForStmt*>(s)) {
+            self(self, for_s->Init());
+            self(self, for_s->Body());
+        } else if (auto* while_s = dynamic_cast<WhileStmt*>(s)) {
+            self(self, while_s->Body());
+        } else if (auto* do_while_s = dynamic_cast<DoWhileStmt*>(s)) {
+            self(self, do_while_s->Body());
+        } else if (auto* if_s = dynamic_cast<IfStmt*>(s)) {
+            self(self, if_s->ThenBranch());
+            self(self, if_s->ElseBranch());
+        } else if (auto* sw_s = dynamic_cast<SwitchStmt*>(s)) {
+            for (const auto& c : sw_s->Cases()) {
+                for (const auto& child : c.statements) {
+                    self(self, child.get());
+                }
+            }
+        } else if (auto* try_s = dynamic_cast<TryCatchStmt*>(s)) {
+            self(self, try_s->TryBlock());
+            self(self, try_s->CatchBlock());
+            self(self, try_s->FinallyBlock());
+        } else if (auto* with_s = dynamic_cast<WithStmt*>(s)) {
+            self(self, with_s->Body());
         }
     };
 
@@ -2265,7 +2287,14 @@ void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
 
 void BytecodeEmitter::VisitBlock(BlockStmt* node) {
     for (const auto& stmt : node->Statements()) {
-        stmt->Accept(this);
+        if (dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+            stmt->Accept(this);
+        }
+    }
+    for (const auto& stmt : node->Statements()) {
+        if (!dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+            stmt->Accept(this);
+        }
     }
 }
 
@@ -2945,13 +2974,29 @@ void BytecodeEmitter::VisitReturn(ReturnStmt* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(ret_reg);
 
-        for (auto it = try_stack_.rbegin(); it != try_stack_.rend(); ++it) {
-            if (it->has_handler) {
+        auto saved_stack = try_stack_;
+        bool finally_returned = false;
+
+        while (!try_stack_.empty()) {
+            TryContext top = try_stack_.back();
+            try_stack_.pop_back();
+
+            if (top.has_handler) {
                 bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
             }
-            if (it->finally_block) {
-                it->finally_block->Accept(this);
+            if (top.finally_block) {
+                top.finally_block->Accept(this);
+                if (!bytecode_->Code().empty() && bytecode_->Code().back() == static_cast<uint8_t>(Opcode::Return)) {
+                    finally_returned = true;
+                    break;
+                }
             }
+        }
+        try_stack_ = std::move(saved_stack);
+
+        if (finally_returned) {
+            FreeRegister(ret_reg);
+            return;
         }
 
         bytecode_->EmitOpcode(Opcode::Ldar);
@@ -2963,7 +3008,14 @@ void BytecodeEmitter::VisitReturn(ReturnStmt* node) {
 
 void BytecodeEmitter::VisitProgram(Program* node) {
     for (const auto& stmt : node->Statements()) {
-        stmt->Accept(this);
+        if (dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+            stmt->Accept(this);
+        }
+    }
+    for (const auto& stmt : node->Statements()) {
+        if (!dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
+            stmt->Accept(this);
+        }
     }
 }
 
