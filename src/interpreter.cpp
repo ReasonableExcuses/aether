@@ -1107,6 +1107,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
     HandleScope frame_roots(heap);
     SnapshotState(frame_roots, &frame);
     for (auto value : bytecode.Constants()) frame_roots.CreateHandle(value);
+    InstructionRootsGuard roots_guard(instruction_roots_, frame_roots);
 
     struct EnvGuard {
         Interpreter& interp;
@@ -1220,12 +1221,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
     while (pc < code_end) {
         try {
-        HandleScope instruction_roots(heap);
-        SnapshotState(instruction_roots, &frame);
-        InstructionRootsGuard roots_guard(instruction_roots_, instruction_roots);
-        // Includes allocation instructions and backward jumps. Runtime allocation
-        // never collects; only this fully published boundary may reclaim objects.
-        if (heap.GCAllowed() && heap.HeapPressure() >= kGCPressureThresholdPct) heap.CollectAtSafepoint();
+        if (AETHER_UNLIKELY(heap.GCAllowed() && heap.HeapPressure() >= kGCPressureThresholdPct)) {
+            SnapshotState(frame_roots, &frame);
+            heap.CollectAtSafepoint();
+        }
         Opcode op = static_cast<Opcode>(*pc++);
 
         switch (op) {
@@ -3276,7 +3275,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 if (HasProperty(obj, getter_key)) {
                     TaggedValue getter = GetProperty(obj, getter_key);
-                    instruction_roots.CreateHandle(getter);
+                    frame_roots.CreateHandle(getter);
                     if (getter.IsHeapObject() && getter.AsHeapObject()->IsFunction()) {
                         auto* fn = static_cast<JSFunction*>(getter.AsHeapObject());
                         acc_ = Execute(*fn->GetBytecode(), {}, obj, fn->GetEnvironment());
@@ -3311,7 +3310,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 JSObject* js_obj = static_cast<JSObject*>(obj.AsHeapObject());
                 if (HasProperty(obj, setter_key)) {
                     TaggedValue setter = GetProperty(obj, setter_key);
-                    instruction_roots.CreateHandle(setter);
+                    frame_roots.CreateHandle(setter);
                     if (setter.IsHeapObject() && setter.AsHeapObject()->IsFunction()) {
                         auto* fn = static_cast<JSFunction*>(setter.AsHeapObject());
                         Execute(*fn->GetBytecode(), {acc_}, obj, fn->GetEnvironment());
@@ -4259,7 +4258,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     }
 
                     TaggedValue iterator = CallFunction(iter_fn, src_val, {});
-                    instruction_roots.CreateHandle(iterator);
+                    frame_roots.CreateHandle(iterator);
                     if (has_pending_exception_) {
                         if (frame.HasExceptionHandler()) {
                             auto h = frame.PopExceptionHandler();
@@ -4355,7 +4354,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* target_obj = static_cast<JSObject*>(target_val.AsHeapObject());
                     auto* src_obj = static_cast<JSObject*>(src_val.AsHeapObject());
                     TaggedValue keys_val = GetOwnKeys(src_val);
-                    instruction_roots.CreateHandle(keys_val);
+                    frame_roots.CreateHandle(keys_val);
                     if (keys_val.IsHeapObject() && keys_val.AsHeapObject()->IsArray()) {
                         auto* k_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
                         for (size_t i = 0; i < k_arr->Length(); ++i) {
