@@ -82,6 +82,7 @@ public:
     }
 
     std::deque<TaggedValue>& Slots() noexcept { return slots_; }
+    void Clear() noexcept { slots_.clear(); }
     HandleScope* PrevScope() const noexcept { return prev_scope_; }
 
 private:

@@ -1095,6 +1095,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     num_fmt_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(num_fmt_proto));
     num_fmt_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(num_fmt_proto), next_sid);
+    num_fmt_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("NumberFormat", TaggedValue::FromHeapObject(num_fmt_ctor), next_sid);
 
     // 4. Intl.DateTimeFormat
@@ -1225,6 +1226,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     dt_fmt_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(dt_fmt_proto));
     dt_fmt_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(dt_fmt_proto), next_sid);
+    dt_fmt_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("DateTimeFormat", TaggedValue::FromHeapObject(dt_fmt_ctor), next_sid);
 
     // 5. Intl.Collator
@@ -1303,6 +1305,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     collator_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(collator_proto));
     collator_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(collator_proto), next_sid);
+    collator_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("Collator", TaggedValue::FromHeapObject(collator_ctor), next_sid);
 
     // 6. Intl.PluralRules
@@ -1360,6 +1363,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     plural_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(plural_proto));
     plural_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(plural_proto), next_sid);
+    plural_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("PluralRules", TaggedValue::FromHeapObject(plural_ctor), next_sid);
 
     // 7. Intl.ListFormat
@@ -1427,6 +1431,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     list_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(list_proto));
     list_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(list_proto), next_sid);
+    list_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("ListFormat", TaggedValue::FromHeapObject(list_ctor), next_sid);
 
     // 8. Intl.RelativeTimeFormat
@@ -1490,6 +1495,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     rel_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(rel_proto));
     rel_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(rel_proto), next_sid);
+    rel_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("RelativeTimeFormat", TaggedValue::FromHeapObject(rel_ctor), next_sid);
 
     // 9. Intl.Segmenter
@@ -1588,6 +1594,7 @@ void InitializeIntl(Realm& realm) {
         })), next_sid);
     seg_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(seg_proto));
     seg_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(seg_proto), next_sid);
+    seg_ctor->SetIsConstructor(true);
     intl_obj->SetNamedProperty("Segmenter", TaggedValue::FromHeapObject(seg_ctor), next_sid);
 
     // Register Intl on Global Object
@@ -2092,6 +2099,7 @@ void InitializeDate(Realm& realm) {
     date_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(date_proto));
     date_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(date_proto), next_sid);
     date_ctor->SetNamedProperty("length", TaggedValue::FromSmi(7), next_sid);
+    date_ctor->SetIsConstructor(true);
     date_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(date_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Date", TaggedValue::FromHeapObject(date_ctor), next_sid);
 }
@@ -2263,6 +2271,7 @@ void InitializeNumber(Realm& realm) {
     number_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
     number_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(number_proto));
     number_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(number_proto), next_sid);
+    number_ctor->SetIsConstructor(true);
     number_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(number_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Number", TaggedValue::FromHeapObject(number_ctor), next_sid);
 
@@ -2348,6 +2357,7 @@ void InitializeNumber(Realm& realm) {
     string_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
     if (realm.GetStringPrototype()) {
         string_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(realm.GetStringPrototype()), next_sid);
+        string_ctor->SetIsConstructor(true);
         realm.GetStringPrototype()->SetNamedProperty("constructor", TaggedValue::FromHeapObject(string_ctor), next_sid);
     }
     realm.GetGlobalObject()->SetNamedProperty("String", TaggedValue::FromHeapObject(string_ctor), next_sid);
@@ -2420,6 +2430,7 @@ void InitializeBoolean(Realm& realm) {
     boolean_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
     boolean_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(boolean_proto));
     boolean_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(boolean_proto), next_sid);
+    boolean_ctor->SetIsConstructor(true);
     boolean_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
     realm.GetGlobalObject()->SetNamedProperty("Boolean", TaggedValue::FromHeapObject(boolean_ctor), next_sid);
 }

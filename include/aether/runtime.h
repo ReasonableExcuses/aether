@@ -69,6 +69,8 @@ public:
     const std::string& Name() const noexcept { return name_; }
     uint32_t Length() const noexcept { return length_; }
     void SetLength(uint32_t len) noexcept { length_ = len; }
+    bool IsConstructor() const noexcept { return is_constructor_; }
+    void SetIsConstructor(bool c) noexcept { is_constructor_ = c; }
     const CallbackType& Callback() const noexcept { return callback_; }
     const MethodCallbackType& MethodCallback() const noexcept { return method_callback_; }
     bool IsMethodCallback() const noexcept { return static_cast<bool>(method_callback_); }
@@ -110,6 +112,7 @@ public:
 private:
     std::string name_;
     uint32_t length_{0};
+    bool is_constructor_{false};
     CallbackType callback_{nullptr};
     MethodCallbackType method_callback_{nullptr};
     std::vector<TaggedValue> captured_roots_;

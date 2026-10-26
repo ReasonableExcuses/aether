@@ -47,9 +47,15 @@ public:
         is_module_ = is_module;
         if (is_module_) {
             strict_mode_ = true;
+            lexer_.SetStrictMode(true);
         }
     }
     bool IsModule() const { return is_module_; }
+    void SetStrictMode(bool s) {
+        strict_mode_ = s;
+        lexer_.SetStrictMode(s);
+    }
+    bool StrictMode() const { return strict_mode_; }
 
 private:
     friend struct FunctionContextGuard;
@@ -91,6 +97,7 @@ private:
     std::unique_ptr<Stmt> ParseImportDecl();
     std::unique_ptr<Stmt> ParseExportDecl();
     bool MatchContextualKeyword(std::string_view kw);
+    void ValidateSubstatement(const Stmt* stmt, bool is_if = false);
 
     // Expression parsers
     std::unique_ptr<Expr> ParsePrefix(Precedence precedence = Precedence::Assignment);

@@ -160,6 +160,9 @@ public:
     Token NextToken();
     Token PeekToken();
 
+    void SetStrictMode(bool s) noexcept { strict_mode_ = s; }
+    bool StrictMode() const noexcept { return strict_mode_; }
+
 private:
     char Peek() const noexcept;
     char PeekNext() const noexcept;
@@ -182,6 +185,7 @@ private:
     uint32_t column_{1};
     std::optional<Token> peeked_token_;
     TokenKind last_token_kind_{TokenKind::Invalid};
+    bool strict_mode_{false};
 };
 
 } // namespace aether

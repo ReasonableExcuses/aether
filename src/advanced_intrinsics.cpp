@@ -579,6 +579,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(wm);
     });
 
+    weak_map_ctor->SetIsConstructor(true);
     weak_map_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_map_proto));
     weak_map_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_map_proto), next_sid);
     weak_map_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_map_ctor), next_sid);
@@ -660,6 +661,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(ws);
     });
 
+    weak_set_ctor->SetIsConstructor(true);
     weak_set_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_set_proto));
     weak_set_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_set_proto), next_sid);
     weak_set_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_set_ctor), next_sid);
@@ -738,6 +740,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(sab);
     });
 
+    sab_ctor->SetIsConstructor(true);
     sab_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(sab_proto));
     sab_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(sab_proto), next_sid);
     sab_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(sab_ctor), next_sid);
@@ -1183,6 +1186,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(wr);
     });
 
+    weak_ref_ctor->SetIsConstructor(true);
     weak_ref_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(weak_ref_proto));
     weak_ref_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(weak_ref_proto), next_sid);
     weak_ref_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(weak_ref_ctor), next_sid);
@@ -1275,6 +1279,7 @@ void InitializeAdvancedIntrinsics(Realm& realm) {
         return TaggedValue::FromHeapObject(fr);
     });
 
+    fr_ctor->SetIsConstructor(true);
     fr_ctor->AddCapturedRoot(TaggedValue::FromHeapObject(fr_proto));
     fr_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(fr_proto), next_sid);
     fr_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(fr_ctor), next_sid);

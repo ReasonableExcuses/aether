@@ -743,10 +743,11 @@ Token Lexer::ScanString(char quote) {
     while (!IsAtEnd() && Peek() != quote) {
         char c = Advance();
         if (c == '\\') {
-            if (IsAtEnd()) break;
+            if (IsAtEnd()) {
+                throw std::runtime_error("SyntaxError: Unterminated string literal");
+            }
             char esc = Advance();
             switch (esc) {
-                case '0': result.push_back('\0'); break;
                 case 'b': result.push_back('\b'); break;
                 case 'f': result.push_back('\f'); break;
                 case 'v': result.push_back('\v'); break;
@@ -765,9 +766,44 @@ Token Lexer::ScanString(char quote) {
                 case '\\': result.push_back('\\'); break;
                 case '\'': result.push_back('\''); break;
                 case '"': result.push_back('"'); break;
+                case '0':
+                    if (!IsAtEnd() && Peek() >= '0' && Peek() <= '9') {
+                        if (strict_mode_) {
+                            throw std::runtime_error("SyntaxError: Octal escape sequences are not allowed in strict mode");
+                        }
+                        uint32_t oct = 0;
+                        while (!IsAtEnd() && Peek() >= '0' && Peek() <= '7') {
+                            oct = (oct << 3) | (Advance() - '0');
+                        }
+                        result.push_back(static_cast<char>(oct & 0xFF));
+                    } else {
+                        result.push_back('\0');
+                    }
+                    break;
+                case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                    if (strict_mode_) {
+                        throw std::runtime_error("SyntaxError: Octal escape sequences are not allowed in strict mode");
+                    }
+                    uint32_t oct = esc - '0';
+                    for (int i = 0; i < 2 && !IsAtEnd() && Peek() >= '0' && Peek() <= '7'; ++i) {
+                        oct = (oct << 3) | (Advance() - '0');
+                    }
+                    result.push_back(static_cast<char>(oct & 0xFF));
+                    break;
+                }
+                case '8': case '9': {
+                    if (strict_mode_) {
+                        throw std::runtime_error("SyntaxError: Non-octal decimal escape sequences are not allowed in strict mode");
+                    }
+                    result.push_back(esc);
+                    break;
+                }
                 case 'x': {
                     uint32_t cp = 0;
-                    for (int i = 0; i < 2 && !IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek())); ++i) {
+                    for (int i = 0; i < 2; ++i) {
+                        if (IsAtEnd() || !std::isxdigit(static_cast<unsigned char>(Peek()))) {
+                            throw std::runtime_error("SyntaxError: Invalid hexadecimal escape sequence");
+                        }
                         char hc = Advance();
                         cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
                     }
@@ -778,17 +814,29 @@ Token Lexer::ScanString(char quote) {
                     if (!IsAtEnd() && Peek() == '{') {
                         Advance(); // '{'
                         uint32_t cp = 0;
+                        bool has_digits = false;
                         while (!IsAtEnd() && Peek() != '}') {
                             char hc = Advance();
-                            if (std::isxdigit(static_cast<unsigned char>(hc))) {
-                                cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+                            if (!std::isxdigit(static_cast<unsigned char>(hc))) {
+                                throw std::runtime_error("SyntaxError: Invalid Unicode escape sequence");
                             }
+                            cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
+                            if (cp > 0x10FFFF) {
+                                throw std::runtime_error("SyntaxError: Unicode escape sequence out of range");
+                            }
+                            has_digits = true;
                         }
-                        if (!IsAtEnd() && Peek() == '}') Advance();
+                        if (IsAtEnd() || !has_digits) {
+                            throw std::runtime_error("SyntaxError: Invalid Unicode escape sequence");
+                        }
+                        Advance(); // '}'
                         AppendUtf8(result, cp);
                     } else {
                         uint32_t cp = 0;
-                        for (int i = 0; i < 4 && !IsAtEnd() && std::isxdigit(static_cast<unsigned char>(Peek())); ++i) {
+                        for (int i = 0; i < 4; ++i) {
+                            if (IsAtEnd() || !std::isxdigit(static_cast<unsigned char>(Peek()))) {
+                                throw std::runtime_error("SyntaxError: Invalid Unicode escape sequence");
+                            }
                             char hc = Advance();
                             cp = (cp << 4) | (std::isdigit(static_cast<unsigned char>(hc)) ? (hc - '0') : (std::tolower(static_cast<unsigned char>(hc)) - 'a' + 10));
                         }
@@ -796,16 +844,32 @@ Token Lexer::ScanString(char quote) {
                     }
                     break;
                 }
-                default: result.push_back(esc); break;
+                default: {
+                    // Check for UTF-8 line separators U+2028 (â¨) or U+2029 (â©)
+                    if (static_cast<unsigned char>(esc) == 0xE2 && cursor_ + 1 < source_.size() &&
+                        static_cast<unsigned char>(source_[cursor_]) == 0x80 &&
+                        (static_cast<unsigned char>(source_[cursor_ + 1]) == 0xA8 || static_cast<unsigned char>(source_[cursor_ + 1]) == 0xA9)) {
+                        cursor_ += 2;
+                        line_++;
+                        column_ = 1;
+                    } else {
+                        result.push_back(esc);
+                    }
+                    break;
+                }
             }
         } else {
+            if (c == '\r' || c == '\n') {
+                throw std::runtime_error("SyntaxError: Unterminated string literal");
+            }
             result.push_back(c);
         }
     }
 
-    if (!IsAtEnd() && Peek() == quote) {
-        Advance(); // Consume closing quote
+    if (IsAtEnd() || Peek() != quote) {
+        throw std::runtime_error("SyntaxError: Unterminated string literal");
     }
+    Advance(); // Consume closing quote
 
     return Token{TokenKind::String, result, 0.0, false, 0, false, loc};
 }

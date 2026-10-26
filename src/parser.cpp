@@ -342,6 +342,7 @@ std::unique_ptr<Program> Parser::ParseProgram() {
         if (in_directive_prologue && first.kind == TokenKind::String) {
             if (first.text == "use strict") {
                 strict_mode_ = true;
+                lexer_.SetStrictMode(true);
             }
         } else {
             in_directive_prologue = false;
@@ -691,15 +692,40 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
     return fn_decl;
 }
 
+void Parser::ValidateSubstatement(const Stmt* stmt, bool is_if) {
+    if (!stmt) return;
+    if (auto* var_decl = dynamic_cast<const VarDeclStmt*>(stmt)) {
+        if (var_decl->GetKind() == VarDeclStmt::Kind::Let || var_decl->GetKind() == VarDeclStmt::Kind::Const) {
+            throw std::runtime_error("SyntaxError: Lexical declaration cannot appear in a single-statement context");
+        }
+    }
+    if (dynamic_cast<const ClassDeclStmt*>(stmt)) {
+        throw std::runtime_error("SyntaxError: Class declaration cannot appear in a single-statement context");
+    }
+    if (auto* fn_decl = dynamic_cast<const FunctionDeclStmt*>(stmt)) {
+        if (fn_decl->IsGenerator()) {
+            throw std::runtime_error("SyntaxError: Generator function declaration cannot appear in a single-statement context");
+        }
+        if (fn_decl->IsAsync()) {
+            throw std::runtime_error("SyntaxError: Async function declaration cannot appear in a single-statement context");
+        }
+        if (strict_mode_ || !is_if) {
+            throw std::runtime_error("SyntaxError: In strict mode code, functions can only be declared at top level or inside a block");
+        }
+    }
+}
+
 std::unique_ptr<Stmt> Parser::ParseIf() {
     Consume(TokenKind::OpenParen, "Expected '(' after 'if'");
     auto cond = ParseExpression();
     Consume(TokenKind::CloseParen, "Expected ')' after if condition");
 
     auto then_branch = ParseStatement();
+    ValidateSubstatement(then_branch.get(), /*is_if=*/true);
     std::unique_ptr<Stmt> else_branch = nullptr;
     if (Match(TokenKind::Else)) {
         else_branch = ParseStatement();
+        ValidateSubstatement(else_branch.get(), /*is_if=*/true);
     }
     return std::make_unique<IfStmt>(std::move(cond), std::move(then_branch), std::move(else_branch));
 }
@@ -710,11 +736,13 @@ std::unique_ptr<Stmt> Parser::ParseWhile() {
     Consume(TokenKind::CloseParen, "Expected ')' after while condition");
 
     auto body = ParseStatement();
+    ValidateSubstatement(body.get(), /*is_if=*/false);
     return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
 }
 
 std::unique_ptr<Stmt> Parser::ParseDoWhile() {
     auto body = ParseStatement();
+    ValidateSubstatement(body.get(), /*is_if=*/false);
     Consume(TokenKind::While, "Expected 'while' after do-while body");
     Consume(TokenKind::OpenParen, "Expected '(' after 'while'");
     auto cond = ParseExpression();
@@ -834,6 +862,7 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
         }
         Consume(TokenKind::CloseParen, "Expected ')' after for header");
         auto body = ParseStatement();
+        ValidateSubstatement(body.get(), /*is_if=*/false);
 
         static uint32_t s_for_of_id = 0;
         std::string target_var = "$target_" + std::to_string(++s_for_of_id);
@@ -985,6 +1014,7 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
     Consume(TokenKind::CloseParen, "Expected ')' after for loop update");
 
     auto body = ParseStatement();
+    ValidateSubstatement(body.get(), /*is_if=*/false);
     return std::make_unique<ForStmt>(std::move(init), std::move(cond), std::move(update), std::move(body));
 }
 
@@ -1134,6 +1164,7 @@ Parser::ParsedClassBody Parser::ParseClassElements(std::string_view super_name) 
             params.push_back(p.text);
             param_defaults.push_back(std::move(def));
             while (Match(TokenKind::Comma)) {
+                if (Check(TokenKind::CloseParen)) break;
                 Token np = Consume(TokenKind::Identifier, "Expected parameter name after ','");
                 std::unique_ptr<Expr> next_def = nullptr;
                 if (Match(TokenKind::Equal)) {
@@ -1192,6 +1223,7 @@ std::unique_ptr<Stmt> Parser::ParseWith() {
     auto expr = ParseExpression();
     Consume(TokenKind::CloseParen, "Expected ')' after with expression");
     auto body = ParseStatement();
+    ValidateSubstatement(body.get(), /*is_if=*/false);
     return std::make_unique<WithStmt>(std::move(expr), std::move(body));
 }
 
@@ -2343,6 +2375,34 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
 
             if (!Check(TokenKind::CloseBrace)) {
                 do {
+                    if (Match(TokenKind::Star)) {
+                        std::unique_ptr<Expr> computed_key = nullptr;
+                        std::string name = "";
+                        if (Match(TokenKind::OpenBracket)) {
+                            computed_key = ParseExpression();
+                            Consume(TokenKind::CloseBracket, "Expected ']' after computed generator method key");
+                        } else {
+                            Token name_tok = Advance();
+                            name = name_tok.text;
+                        }
+                        Consume(TokenKind::OpenParen, "Expected '(' after generator method name");
+                        std::vector<std::string> params;
+                        std::string rest_param;
+                        parse_method_params(params, rest_param);
+                        bool prev_gen = in_generator_;
+                        in_generator_ = true;
+                        auto body = ParseBlock();
+                        in_generator_ = prev_gen;
+                        auto fn_expr = std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+                        fn_expr->SetGenerator(true);
+                        if (!rest_param.empty()) fn_expr->SetRest(rest_param);
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = std::move(name),
+                            .computed_key = std::move(computed_key),
+                            .value = std::move(fn_expr)
+                        });
+                        continue;
+                    }
                     if (Match(TokenKind::DotDotDot)) {
                         auto spread_expr = ParseExpression();
                         props.push_back(ObjectLiteralExpr::Property{
@@ -2379,6 +2439,40 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                         continue;
                     }
                     Token key_tok = Advance();
+                    if (key_tok.text == "async" && !Check(TokenKind::Colon) && !Check(TokenKind::Comma) &&
+                        !Check(TokenKind::CloseBrace) && !Check(TokenKind::OpenParen)) {
+                        bool is_async_gen = Match(TokenKind::Star);
+                        std::unique_ptr<Expr> computed_key = nullptr;
+                        std::string name = "";
+                        if (Match(TokenKind::OpenBracket)) {
+                            computed_key = ParseExpression();
+                            Consume(TokenKind::CloseBracket, "Expected ']' after computed method key");
+                        } else {
+                            Token name_tok = Advance();
+                            name = name_tok.text;
+                        }
+                        Consume(TokenKind::OpenParen, "Expected '(' after method name");
+                        std::vector<std::string> params;
+                        std::string rest_param;
+                        parse_method_params(params, rest_param);
+                        bool prev_async = in_async_;
+                        bool prev_gen = in_generator_;
+                        in_async_ = true;
+                        if (is_async_gen) in_generator_ = true;
+                        auto body = ParseBlock();
+                        in_async_ = prev_async;
+                        in_generator_ = prev_gen;
+                        auto fn_expr = std::make_unique<FunctionExpr>(name, std::move(params), std::move(body));
+                        fn_expr->SetAsync(true);
+                        if (is_async_gen) fn_expr->SetGenerator(true);
+                        if (!rest_param.empty()) fn_expr->SetRest(rest_param);
+                        props.push_back(ObjectLiteralExpr::Property{
+                            .key = std::move(name),
+                            .computed_key = std::move(computed_key),
+                            .value = std::move(fn_expr)
+                        });
+                        continue;
+                    }
                     bool is_accessor = (key_tok.text == "get" || key_tok.text == "set") &&
                                        !Check(TokenKind::Colon) && !Check(TokenKind::Comma) &&
                                        !Check(TokenKind::CloseBrace) && !Check(TokenKind::OpenParen);
@@ -2439,7 +2533,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                         });
                         continue;
                     }
-                    if (key_tok.kind == TokenKind::Identifier) {
+                    if (key_tok.kind == TokenKind::Identifier || (!strict_mode_ && !in_generator_ && key_tok.kind == TokenKind::Yield)) {
                         props.push_back(ObjectLiteralExpr::Property{
                             .key = key_tok.text,
                             .computed_key = nullptr,
@@ -2597,6 +2691,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                 if (!Check(TokenKind::CloseParen)) {
                     args.push_back(ParseExpression());
                     while (Match(TokenKind::Comma)) {
+                        if (Check(TokenKind::CloseParen)) break;
                         args.push_back(ParseExpression());
                     }
                 }
@@ -2693,6 +2788,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                         Token p = Consume(TokenKind::Identifier, "Expected parameter name");
                         params.push_back(p.text);
                         while (Match(TokenKind::Comma)) {
+                            if (Check(TokenKind::CloseParen)) break;
                             if (Match(TokenKind::DotDotDot)) {
                                 Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
                                 rest_param = r.text;
@@ -2776,6 +2872,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                         Token p = Consume(TokenKind::Identifier, "Expected parameter name");
                         params.push_back(p.text);
                         while (Match(TokenKind::Comma)) {
+                            if (Check(TokenKind::CloseParen)) break;
                             if (Match(TokenKind::DotDotDot)) {
                                 Token r = Consume(TokenKind::Identifier, "Expected rest parameter name");
                                 rest_param = r.text;
@@ -3023,6 +3120,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
             if (!Check(TokenKind::CloseParen)) {
                 args.push_back(ParseExpression());
                 while (Match(TokenKind::Comma)) {
+                    if (Check(TokenKind::CloseParen)) break;
                     args.push_back(ParseExpression());
                 }
             }
@@ -3070,6 +3168,7 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
         if (!Check(TokenKind::CloseParen)) {
             args.push_back(ParseExpression());
             while (Match(TokenKind::Comma)) {
+                if (Check(TokenKind::CloseParen)) break;
                 args.push_back(ParseExpression());
             }
         }

@@ -656,13 +656,27 @@ TaggedValue GetOwnKeys(TaggedValue obj) {
 }
 
 TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& args, TaggedValue new_target) {
-    if (!ctor.IsHeapObject()) return TaggedValue::Undefined();
+    if (!ctor.IsHeapObject()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Value is not a constructor")));
+        }
+        return TaggedValue::Undefined();
+    }
     HeapObject* ho = ctor.AsHeapObject();
     if (ho->IsProxy()) {
         return ProxyConstruct(static_cast<JSProxy*>(ho), args, new_target);
     }
     TaggedValue target = new_target.IsEmpty() ? ctor : new_target;
     if (ho->IsNativeFunction()) {
+        auto* nfn = static_cast<JSNativeFunction*>(ho);
+        if (!nfn->IsConstructor()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Function is not a constructor")));
+            }
+            return TaggedValue::Undefined();
+        }
         return CallFunction(ctor, TaggedValue::Undefined(), args, target);
     }
     if (ho->IsFunction()) {
@@ -696,6 +710,10 @@ TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& ar
             return ret;
         }
         return inst_val;
+    }
+    if (Interpreter::Current()) {
+        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+            AllocateRuntime<JSError>("TypeError", "Value is not a constructor")));
     }
     return TaggedValue::Undefined();
 }
@@ -3747,8 +3765,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return obj;
     };
 
-    auto make_native = [this, &heap](std::string_view name, auto cb) -> JSNativeFunction* {
-        JSNativeFunction* fn = heap.AllocateOld<JSNativeFunction>(name, cb);
+    auto make_native = [this, &heap](std::string_view name, auto cb, uint32_t length = 0) -> JSNativeFunction* {
+        JSNativeFunction* fn = heap.AllocateOld<JSNativeFunction>(name, cb, nullptr, length);
         if (function_prototype_) {
             fn->SetPrototype(function_prototype_);
         }
@@ -3965,41 +3983,48 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         math_object_->SetOwnPropertyAttributes(math_const, PropertyAttributes::None);
     }
 
-    math_object_->SetNamedProperty("abs", TaggedValue::FromHeapObject(make_native("abs", &Math_abs)), next_shape_id_);
-    math_object_->SetNamedProperty("floor", TaggedValue::FromHeapObject(make_native("floor", &Math_floor)), next_shape_id_);
-    math_object_->SetNamedProperty("ceil", TaggedValue::FromHeapObject(make_native("ceil", &Math_ceil)), next_shape_id_);
-    math_object_->SetNamedProperty("round", TaggedValue::FromHeapObject(make_native("round", &Math_round)), next_shape_id_);
-    math_object_->SetNamedProperty("sqrt", TaggedValue::FromHeapObject(make_native("sqrt", &Math_sqrt)), next_shape_id_);
-    math_object_->SetNamedProperty("max", TaggedValue::FromHeapObject(make_native("max", &Math_max)), next_shape_id_);
-    math_object_->SetNamedProperty("min", TaggedValue::FromHeapObject(make_native("min", &Math_min)), next_shape_id_);
-    math_object_->SetNamedProperty("pow", TaggedValue::FromHeapObject(make_native("pow", &Math_pow)), next_shape_id_);
-    math_object_->SetNamedProperty("exp", TaggedValue::FromHeapObject(make_native("exp", &Math_exp)), next_shape_id_);
-    math_object_->SetNamedProperty("expm1", TaggedValue::FromHeapObject(make_native("expm1", &Math_expm1)), next_shape_id_);
-    math_object_->SetNamedProperty("log", TaggedValue::FromHeapObject(make_native("log", &Math_log)), next_shape_id_);
-    math_object_->SetNamedProperty("log10", TaggedValue::FromHeapObject(make_native("log10", &Math_log10)), next_shape_id_);
-    math_object_->SetNamedProperty("log2", TaggedValue::FromHeapObject(make_native("log2", &Math_log2)), next_shape_id_);
-    math_object_->SetNamedProperty("log1p", TaggedValue::FromHeapObject(make_native("log1p", &Math_log1p)), next_shape_id_);
-    math_object_->SetNamedProperty("sin", TaggedValue::FromHeapObject(make_native("sin", &Math_sin)), next_shape_id_);
-    math_object_->SetNamedProperty("cos", TaggedValue::FromHeapObject(make_native("cos", &Math_cos)), next_shape_id_);
-    math_object_->SetNamedProperty("tan", TaggedValue::FromHeapObject(make_native("tan", &Math_tan)), next_shape_id_);
-    math_object_->SetNamedProperty("asin", TaggedValue::FromHeapObject(make_native("asin", &Math_asin)), next_shape_id_);
-    math_object_->SetNamedProperty("acos", TaggedValue::FromHeapObject(make_native("acos", &Math_acos)), next_shape_id_);
-    math_object_->SetNamedProperty("atan", TaggedValue::FromHeapObject(make_native("atan", &Math_atan)), next_shape_id_);
-    math_object_->SetNamedProperty("atan2", TaggedValue::FromHeapObject(make_native("atan2", &Math_atan2)), next_shape_id_);
-    math_object_->SetNamedProperty("sinh", TaggedValue::FromHeapObject(make_native("sinh", &Math_sinh)), next_shape_id_);
-    math_object_->SetNamedProperty("cosh", TaggedValue::FromHeapObject(make_native("cosh", &Math_cosh)), next_shape_id_);
-    math_object_->SetNamedProperty("tanh", TaggedValue::FromHeapObject(make_native("tanh", &Math_tanh)), next_shape_id_);
-    math_object_->SetNamedProperty("asinh", TaggedValue::FromHeapObject(make_native("asinh", &Math_asinh)), next_shape_id_);
-    math_object_->SetNamedProperty("acosh", TaggedValue::FromHeapObject(make_native("acosh", &Math_acosh)), next_shape_id_);
-    math_object_->SetNamedProperty("atanh", TaggedValue::FromHeapObject(make_native("atanh", &Math_atanh)), next_shape_id_);
-    math_object_->SetNamedProperty("cbrt", TaggedValue::FromHeapObject(make_native("cbrt", &Math_cbrt)), next_shape_id_);
-    math_object_->SetNamedProperty("hypot", TaggedValue::FromHeapObject(make_native("hypot", &Math_hypot)), next_shape_id_);
-    math_object_->SetNamedProperty("trunc", TaggedValue::FromHeapObject(make_native("trunc", &Math_trunc)), next_shape_id_);
-    math_object_->SetNamedProperty("sign", TaggedValue::FromHeapObject(make_native("sign", &Math_sign)), next_shape_id_);
-    math_object_->SetNamedProperty("clz32", TaggedValue::FromHeapObject(make_native("clz32", &Math_clz32)), next_shape_id_);
-    math_object_->SetNamedProperty("imul", TaggedValue::FromHeapObject(make_native("imul", &Math_imul)), next_shape_id_);
-    math_object_->SetNamedProperty("fround", TaggedValue::FromHeapObject(make_native("fround", &Math_fround)), next_shape_id_);
-    math_object_->SetNamedProperty("random", TaggedValue::FromHeapObject(make_native("random", &Math_random)), next_shape_id_);
+    auto register_math_fn = [this, &make_native](const char* name, auto cb, uint32_t arity) {
+        math_object_->SetNamedProperty(name, TaggedValue::FromHeapObject(make_native(name, cb, arity)), next_shape_id_);
+        math_object_->SetOwnPropertyAttributes(name, PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    };
+    register_math_fn("abs", &Math_abs, 1);
+    register_math_fn("floor", &Math_floor, 1);
+    register_math_fn("ceil", &Math_ceil, 1);
+    register_math_fn("round", &Math_round, 1);
+    register_math_fn("sqrt", &Math_sqrt, 1);
+    register_math_fn("max", &Math_max, 2);
+    register_math_fn("min", &Math_min, 2);
+    register_math_fn("pow", &Math_pow, 2);
+    register_math_fn("exp", &Math_exp, 1);
+    register_math_fn("expm1", &Math_expm1, 1);
+    register_math_fn("log", &Math_log, 1);
+    register_math_fn("log10", &Math_log10, 1);
+    register_math_fn("log2", &Math_log2, 1);
+    register_math_fn("log1p", &Math_log1p, 1);
+    register_math_fn("sin", &Math_sin, 1);
+    register_math_fn("cos", &Math_cos, 1);
+    register_math_fn("tan", &Math_tan, 1);
+    register_math_fn("asin", &Math_asin, 1);
+    register_math_fn("acos", &Math_acos, 1);
+    register_math_fn("atan", &Math_atan, 1);
+    register_math_fn("atan2", &Math_atan2, 2);
+    register_math_fn("sinh", &Math_sinh, 1);
+    register_math_fn("cosh", &Math_cosh, 1);
+    register_math_fn("tanh", &Math_tanh, 1);
+    register_math_fn("asinh", &Math_asinh, 1);
+    register_math_fn("acosh", &Math_acosh, 1);
+    register_math_fn("atanh", &Math_atanh, 1);
+    register_math_fn("cbrt", &Math_cbrt, 1);
+    register_math_fn("hypot", &Math_hypot, 2);
+    register_math_fn("trunc", &Math_trunc, 1);
+    register_math_fn("sign", &Math_sign, 1);
+    register_math_fn("clz32", &Math_clz32, 1);
+    register_math_fn("imul", &Math_imul, 2);
+    register_math_fn("fround", &Math_fround, 1);
+    register_math_fn("random", &Math_random, 0);
+
+    math_object_->SetNamedProperty("@@toStringTag", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Math")), next_shape_id_);
+    math_object_->SetOwnPropertyAttributes("@@toStringTag", PropertyAttributes::Configurable);
 
     // Register Console functions
     console_object_->SetNamedProperty("log", TaggedValue::FromHeapObject(make_native("log", &Console_log)), next_shape_id_);
@@ -4042,11 +4067,16 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         }
         return TaggedValue::FromHeapObject(arr);
     });
-    array_ctor->SetNamedProperty("isArray", TaggedValue::FromHeapObject(make_native("isArray", &Array_isArray)), next_shape_id_);
+    array_ctor->SetIsConstructor(true);
+    array_ctor->SetNamedProperty("isArray", TaggedValue::FromHeapObject(make_native("isArray", &Array_isArray, 1)), next_shape_id_);
+    array_ctor->SetOwnPropertyAttributes("isArray", PropertyAttributes::Writable | PropertyAttributes::Configurable);
     array_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(array_prototype_), next_shape_id_);
     array_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     array_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(array_ctor), next_shape_id_);
     array_prototype_->SetNamedProperty("length", TaggedValue::FromSmi(0), next_shape_id_);
+    for (const char* arr_meth : {"push", "pop", "shift", "unshift", "slice", "splice", "sort", "join", "toString", "toLocaleString", "indexOf", "includes", "reverse", "concat", "map", "filter", "forEach", "reduce", "values", "keys", "entries", "constructor"}) {
+        array_prototype_->SetOwnPropertyAttributes(arr_meth, PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    }
 
     // String Prototype Methods
     string_prototype_->SetNamedProperty("length", TaggedValue::FromSmi(0), next_shape_id_);
@@ -4068,8 +4098,12 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     string_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(str_iter), next_shape_id_);
 
     // JSON Methods
-    json_object_->SetNamedProperty("parse", TaggedValue::FromHeapObject(make_native("parse", &JSON_parse)), next_shape_id_);
-    json_object_->SetNamedProperty("stringify", TaggedValue::FromHeapObject(make_native("stringify", &JSON_stringify)), next_shape_id_);
+    json_object_->SetNamedProperty("parse", TaggedValue::FromHeapObject(make_native("parse", &JSON_parse, 2)), next_shape_id_);
+    json_object_->SetOwnPropertyAttributes("parse", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    json_object_->SetNamedProperty("stringify", TaggedValue::FromHeapObject(make_native("stringify", &JSON_stringify, 3)), next_shape_id_);
+    json_object_->SetOwnPropertyAttributes("stringify", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    json_object_->SetNamedProperty("@@toStringTag", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("JSON")), next_shape_id_);
+    json_object_->SetOwnPropertyAttributes("@@toStringTag", PropertyAttributes::Configurable);
 
     // Map Prototype & Constructor
     map_prototype_->SetNamedProperty("set", TaggedValue::FromHeapObject(make_native("set", &Map_set)), next_shape_id_);
@@ -4085,6 +4119,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     map_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(map_values), next_shape_id_);
     map_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(map_entries), next_shape_id_);
     auto* map_ctor = make_native("Map", &Map_ctor);
+    map_ctor->SetIsConstructor(true);
     map_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(map_prototype_), next_shape_id_);
     map_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(map_ctor), next_shape_id_);
 
@@ -4101,6 +4136,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     set_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(set_entries), next_shape_id_);
     set_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(set_values), next_shape_id_);
     auto* set_ctor = make_native("Set", &Set_ctor);
+    set_ctor->SetIsConstructor(true);
     set_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(set_prototype_), next_shape_id_);
     set_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(set_ctor), next_shape_id_);
 
@@ -4109,7 +4145,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     promise_prototype_->SetNamedProperty("catch", TaggedValue::FromHeapObject(make_native("catch", &Promise_catch)), next_shape_id_);
     promise_prototype_->SetNamedProperty("finally", TaggedValue::FromHeapObject(make_native("finally", &Promise_finally)), next_shape_id_);
     auto* promise_ctor = make_native("Promise", &Promise_ctor);
-    promise_ctor->SetNamedProperty("resolve", TaggedValue::FromHeapObject(make_native("resolve", &Promise_resolve)), next_shape_id_);
+    promise_ctor->SetIsConstructor(true);
+    promise_ctor->SetNamedProperty("resolve", TaggedValue::FromHeapObject(make_native("resolve", &Promise_resolve, 1)), next_shape_id_);
     promise_ctor->SetNamedProperty("reject", TaggedValue::FromHeapObject(make_native("reject", &Promise_reject)), next_shape_id_);
     promise_ctor->SetNamedProperty("all", TaggedValue::FromHeapObject(make_native("all", &Promise_all)), next_shape_id_);
     promise_ctor->SetNamedProperty("race", TaggedValue::FromHeapObject(make_native("race", &Promise_race)), next_shape_id_);
@@ -4122,6 +4159,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     regexp_prototype_->SetNamedProperty("test", TaggedValue::FromHeapObject(make_native("test", &RegExp_test)), next_shape_id_);
     regexp_prototype_->SetNamedProperty("exec", TaggedValue::FromHeapObject(make_native("exec", &RegExp_exec)), next_shape_id_);
     auto* regexp_ctor = make_native("RegExp", &RegExp_ctor);
+    regexp_ctor->SetIsConstructor(true);
     regexp_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(regexp_prototype_), next_shape_id_);
     regexp_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(regexp_ctor), next_shape_id_);
 
@@ -4208,15 +4246,82 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         }
         return TaggedValue::FromHeapObject(obj);
     });
-    object_prototype_->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Object_toString)), next_shape_id_);
-    object_prototype_->SetNamedProperty("hasOwnProperty", TaggedValue::FromHeapObject(make_native("hasOwnProperty", &Object_hasOwnProperty)), next_shape_id_);
-    object_prototype_->SetNamedProperty("propertyIsEnumerable", TaggedValue::FromHeapObject(make_native("propertyIsEnumerable", &Object_propertyIsEnumerable)), next_shape_id_);
+    object_ctor->SetIsConstructor(true);
+    object_prototype_->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Object_toString, 0)), next_shape_id_);
+    object_prototype_->SetNamedProperty("hasOwnProperty", TaggedValue::FromHeapObject(make_native("hasOwnProperty", &Object_hasOwnProperty, 1)), next_shape_id_);
+    object_prototype_->SetNamedProperty("propertyIsEnumerable", TaggedValue::FromHeapObject(make_native("propertyIsEnumerable", &Object_propertyIsEnumerable, 1)), next_shape_id_);
     object_prototype_->SetNamedProperty("valueOf", TaggedValue::FromHeapObject(make_native("valueOf", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
         return this_val;
-    })), next_shape_id_);
+    }, 0)), next_shape_id_);
+    auto to_object = [](TaggedValue val) -> JSObject* {
+        if (!val.IsHeapObject()) {
+            if (val.IsSmi() || val.IsDouble()) {
+                if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+                    TaggedValue num_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("Number");
+                    if (num_ctor.IsHeapObject() && num_ctor.AsHeapObject()->IsFunction()) {
+                        TaggedValue obj = ConstructObject(num_ctor, {val});
+                        if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+                    }
+                }
+            } else if (val.IsBoolean()) {
+                if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+                    TaggedValue bool_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("Boolean");
+                    if (bool_ctor.IsHeapObject() && bool_ctor.AsHeapObject()->IsFunction()) {
+                        TaggedValue obj = ConstructObject(bool_ctor, {val});
+                        if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+                    }
+                }
+            }
+            return nullptr;
+        }
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->IsJSObject()) return static_cast<JSObject*>(ho);
+        if (ho->IsString()) {
+            if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+                TaggedValue str_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("String");
+                if (str_ctor.IsHeapObject() && str_ctor.AsHeapObject()->IsFunction()) {
+                    TaggedValue obj = ConstructObject(str_ctor, {val});
+                    if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    object_prototype_->SetNamedProperty("isPrototypeOf", TaggedValue::FromHeapObject(make_native("isPrototypeOf", [to_object](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsJSObject()) return TaggedValue::False();
+        if (this_val.IsNull() || this_val.IsUndefined()) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.prototype.isPrototypeOf called on null or undefined")));
+            return TaggedValue::False();
+        }
+        JSObject* target_obj = to_object(this_val);
+        if (!target_obj) return TaggedValue::False();
+        JSObject* proto = static_cast<JSObject*>(args[0].AsHeapObject())->GetPrototype();
+        while (proto) {
+            if (proto == target_obj) return TaggedValue::True();
+            proto = proto->GetPrototype();
+        }
+        return TaggedValue::False();
+    }, 1)), next_shape_id_);
+    object_prototype_->SetNamedProperty("toLocaleString", TaggedValue::FromHeapObject(make_native("toLocaleString", [to_object](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (this_val.IsNull() || this_val.IsUndefined()) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.prototype.toLocaleString called on null or undefined")));
+            return TaggedValue::Undefined();
+        }
+        JSObject* o = to_object(this_val);
+        if (!o) return TaggedValue::Undefined();
+        TaggedValue to_string_fn = o->GetNamedProperty("toString");
+        if (to_string_fn.IsHeapObject() && to_string_fn.AsHeapObject()->IsFunction()) {
+            return CallFunction(to_string_fn, TaggedValue::FromHeapObject(o), {});
+        }
+        return Object_toString(TaggedValue::FromHeapObject(o), {});
+    }, 0)), next_shape_id_);
     object_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     object_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(object_prototype_), next_shape_id_);
     object_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
+    for (const char* op_prop : {"toString", "toLocaleString", "valueOf", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "constructor"}) {
+        object_prototype_->SetOwnPropertyAttributes(op_prop, PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    }
     object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(make_native("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
         if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
@@ -4547,12 +4652,17 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     });
     function_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(function_prototype_), next_shape_id_);
     function_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
+    function_ctor->SetIsConstructor(true);
     function_ctor->SetNamedProperty("name", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Function")), next_shape_id_);
     function_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(function_ctor), next_shape_id_);
     global_object_->SetNamedProperty("Function", TaggedValue::FromHeapObject(function_ctor), next_shape_id_);
 
     // Proxy Constructor & revocable
     auto* proxy_ctor = make_native("Proxy", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (Interpreter::Current() && Interpreter::Current()->GetNewTarget().IsUndefined()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Constructor Proxy requires 'new'")));
+            return TaggedValue::Undefined();
+        }
         if (args.size() < 2 || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject() ||
             !args[1].IsHeapObject() || !args[1].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) {
@@ -4563,7 +4673,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
         auto* proxy = AllocateRuntime<JSProxy>(args[0], args[1], root);
         return TaggedValue::FromHeapObject(proxy);
-    });
+    }, 2);
+    proxy_ctor->SetIsConstructor(true);
 
     proxy_ctor->SetNamedProperty("revocable", TaggedValue::FromHeapObject(make_native("revocable", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.size() < 2 || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject() ||
@@ -4644,8 +4755,24 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     })), next_shape_id_);
 
     reflect_obj->SetNamedProperty("construct", TaggedValue::FromHeapObject(make_native("construct", [](const std::vector<TaggedValue>& args) -> TaggedValue {
-        if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsProxy())) {
+        auto is_ctor = [](TaggedValue v) -> bool {
+            if (!v.IsHeapObject()) return false;
+            HeapObject* ho = v.AsHeapObject();
+            if (ho->IsProxy()) return true;
+            if (ho->IsNativeFunction()) return static_cast<JSNativeFunction*>(ho)->IsConstructor();
+            if (ho->IsFunction()) {
+                auto* fn = static_cast<JSFunction*>(ho);
+                return !fn->IsArrow() && !fn->IsAsync() && !fn->IsGenerator();
+            }
+            return false;
+        };
+        if (args.empty() || !is_ctor(args[0])) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.construct target is not a constructor")));
+            return TaggedValue::Undefined();
+        }
+        TaggedValue new_target = args.size() > 2 ? args[2] : args[0];
+        if (!is_ctor(new_target)) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Reflect.construct newTarget is not a constructor")));
             return TaggedValue::Undefined();
         }
         std::vector<TaggedValue> ctor_args;
@@ -4654,9 +4781,10 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             ctor_args.reserve(arr->Length());
             for (size_t i = 0; i < arr->Length(); ++i) ctor_args.push_back(arr->GetElement(i));
         }
-        TaggedValue new_target = args.size() > 2 ? args[2] : args[0];
         return ConstructObject(args[0], ctor_args, new_target);
-    })), next_shape_id_);
+    }, 2)), next_shape_id_);
+    reflect_obj->SetNamedProperty("@@toStringTag", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Reflect")), next_shape_id_);
+    reflect_obj->SetOwnPropertyAttributes("@@toStringTag", PropertyAttributes::Configurable);
 
     reflect_obj->SetNamedProperty("getPrototypeOf", TaggedValue::FromHeapObject(make_native("getPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
@@ -4900,6 +5028,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             ctor->SetPrototype(function_prototype_);
         }
         ctor->SetNamedProperty("name", TaggedValue::FromHeapObject(make_old_str(name_str)), next_shape_id_);
+        ctor->SetIsConstructor(true);
+        ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
         ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
         proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor), next_shape_id_);
         return ctor;
@@ -4973,7 +5103,9 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         }
         return TaggedValue::FromHeapObject(ab);
     });
-    array_buffer_ctor->SetNamedProperty("isView", TaggedValue::FromHeapObject(make_native("isView", &ArrayBuffer_isView)), next_shape_id_);
+    array_buffer_ctor->SetIsConstructor(true);
+    array_buffer_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
+    array_buffer_ctor->SetNamedProperty("isView", TaggedValue::FromHeapObject(make_native("isView", &ArrayBuffer_isView, 1)), next_shape_id_);
     array_buffer_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(array_buffer_prototype_), next_shape_id_);
     global_object_->SetNamedProperty("ArrayBuffer", TaggedValue::FromHeapObject(array_buffer_ctor), next_shape_id_);
 
@@ -5020,6 +5152,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         }
         return TaggedValue::FromHeapObject(dv);
     });
+    data_view_ctor->SetIsConstructor(true);
+    data_view_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     data_view_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(data_view_prototype_), next_shape_id_);
     global_object_->SetNamedProperty("DataView", TaggedValue::FromHeapObject(data_view_ctor), next_shape_id_);
 
@@ -5140,6 +5274,8 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return TaggedValue::FromHeapObject(ta);
         });
 
+        ctor->SetIsConstructor(true);
+        ctor->SetNamedProperty("length", TaggedValue::FromSmi(3), next_shape_id_);
         ctor->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
         ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
         global_object_->SetNamedProperty(name, TaggedValue::FromHeapObject(ctor), next_shape_id_);

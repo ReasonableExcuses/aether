@@ -1107,7 +1107,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
     HandleScope frame_roots(heap);
     SnapshotState(frame_roots, &frame);
     for (auto value : bytecode.Constants()) frame_roots.CreateHandle(value);
-    InstructionRootsGuard roots_guard(instruction_roots_, frame_roots);
+    HandleScope op_roots(heap);
+    InstructionRootsGuard roots_guard(instruction_roots_, op_roots);
 
     struct EnvGuard {
         Interpreter& interp;
@@ -1221,8 +1222,10 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
     while (pc < code_end) {
         try {
+        if (!op_roots.Slots().empty()) op_roots.Clear();
         if (AETHER_UNLIKELY(heap.GCAllowed() && heap.HeapPressure() >= kGCPressureThresholdPct)) {
-            SnapshotState(frame_roots, &frame);
+            HandleScope safepoint_roots(heap);
+            SnapshotState(safepoint_roots, &frame);
             heap.CollectAtSafepoint();
         }
         Opcode op = static_cast<Opcode>(*pc++);
@@ -2416,6 +2419,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         }
                         break;
                     }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
                     acc_ = TaggedValue::FromDouble(lnum.ToDouble() / static_cast<double>(imm));
                 }
                 break;
@@ -2438,6 +2455,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 } else {
                     TaggedValue lnum = ToNumeric(acc_);
                     if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
                         if (frame.HasExceptionHandler()) {
                             auto h = frame.PopExceptionHandler();
                             pc = h.target_pc;
@@ -5100,6 +5131,20 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (ctor_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(ctor_val.AsHeapObject());
+                    if (!native_fn->IsConstructor()) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Function is not a constructor"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
                     TaggedValue prev_target = current_new_target_;
                     current_new_target_ = ctor_val;
                     acc_ = native_fn->Invoke(TaggedValue::Undefined(), call_args);

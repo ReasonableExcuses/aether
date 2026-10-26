@@ -3122,6 +3122,7 @@ void InitializeWebAssembly(Realm& realm) {
         return TaggedValue::FromHeapObject(mod_obj);
     });
 
+    module_ctor->SetIsConstructor(true);
     module_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(module_proto), next_sid);
     module_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(module_ctor), next_sid);
 
@@ -3218,6 +3219,7 @@ void InitializeWebAssembly(Realm& realm) {
         return TaggedValue::FromHeapObject(inst_obj);
     });
 
+    instance_ctor->SetIsConstructor(true);
     instance_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(instance_proto), next_sid);
     instance_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(instance_ctor), next_sid);
     wasm_obj->SetNamedProperty("Instance", TaggedValue::FromHeapObject(instance_ctor), next_sid);
@@ -3263,6 +3265,7 @@ void InitializeWebAssembly(Realm& realm) {
         return TaggedValue::FromHeapObject(mem_obj);
     });
 
+    memory_ctor->SetIsConstructor(true);
     memory_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(memory_proto), next_sid);
     memory_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(memory_ctor), next_sid);
     wasm_obj->SetNamedProperty("Memory", TaggedValue::FromHeapObject(memory_ctor), next_sid);
@@ -3310,6 +3313,7 @@ void InitializeWebAssembly(Realm& realm) {
         return TaggedValue::FromHeapObject(tbl_obj);
     });
 
+    table_ctor->SetIsConstructor(true);
     table_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(table_proto), next_sid);
     table_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(table_ctor), next_sid);
     wasm_obj->SetNamedProperty("Table", TaggedValue::FromHeapObject(table_ctor), next_sid);
@@ -3351,6 +3355,7 @@ void InitializeWebAssembly(Realm& realm) {
         return TaggedValue::FromHeapObject(g_obj);
     });
 
+    global_ctor->SetIsConstructor(true);
     global_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(global_proto), next_sid);
     global_proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(global_ctor), next_sid);
     wasm_obj->SetNamedProperty("Global", TaggedValue::FromHeapObject(global_ctor), next_sid);
