@@ -2457,38 +2457,229 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             case Opcode::BitwiseAndSmi: {
                 int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
-                acc_ = TaggedValue::FromSmi(ToInt32(acc_) & imm);
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() & imm);
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) & imm);
+                }
                 break;
             }
             case Opcode::BitwiseOrSmi: {
                 int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
-                acc_ = TaggedValue::FromSmi(ToInt32(acc_) | imm);
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() | imm);
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) | imm);
+                }
                 break;
             }
             case Opcode::BitwiseXorSmi: {
                 int32_t imm = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
-                acc_ = TaggedValue::FromSmi(ToInt32(acc_) ^ imm);
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() ^ imm);
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) ^ imm);
+                }
                 break;
             }
             case Opcode::ShiftLeftSmi: {
                 uint8_t imm = *pc++;
-                acc_ = TaggedValue::FromSmi(ToInt32(acc_) << (imm & 0x1F));
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() << (imm & 0x1F));
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) << (imm & 0x1F));
+                }
                 break;
             }
             case Opcode::ShiftRightSmi: {
                 uint8_t imm = *pc++;
-                acc_ = TaggedValue::FromSmi(ToInt32(acc_) >> (imm & 0x1F));
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    acc_ = TaggedValue::FromSmi(acc_.AsSmi() >> (imm & 0x1F));
+                } else {
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    acc_ = TaggedValue::FromSmi(ToInt32(lnum) >> (imm & 0x1F));
+                }
                 break;
             }
             case Opcode::ShiftRightUnsignedSmi: {
                 uint8_t imm = *pc++;
-                uint32_t res = ToUint32(acc_) >> (imm & 0x1F);
-                if (res <= static_cast<uint32_t>(INT32_MAX)) {
-                    acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
+                if (AETHER_LIKELY(acc_.IsSmi())) {
+                    uint32_t res = static_cast<uint32_t>(acc_.AsSmi()) >> (imm & 0x1F);
+                    if (res <= static_cast<uint32_t>(INT32_MAX)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(res));
+                    }
                 } else {
-                    acc_ = TaggedValue::FromDouble(static_cast<double>(res));
+                    TaggedValue lnum = ToNumeric(acc_);
+                    if (has_pending_exception_) {
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    if (lnum.IsBigInt()) {
+                        SetPendingException(TaggedValue::FromHeapObject(
+                            AllocateRuntime<JSError>("TypeError", "Cannot mix BigInt and other types, use explicit conversions")));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = pending_exception_;
+                            has_pending_exception_ = false;
+                        } else {
+                            return pending_exception_;
+                        }
+                        break;
+                    }
+                    uint32_t res = ToUint32(lnum) >> (imm & 0x1F);
+                    if (res <= static_cast<uint32_t>(INT32_MAX)) {
+                        acc_ = TaggedValue::FromSmi(static_cast<int32_t>(res));
+                    } else {
+                        acc_ = TaggedValue::FromDouble(static_cast<double>(res));
+                    }
                 }
                 break;
             }
