@@ -97,6 +97,15 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
         if (key == "growable") {
             return TaggedValue::FromBoolean(ab->IsGrowable());
         }
+    } else if (IsTypedArray()) {
+        auto* ta = static_cast<const JSTypedArray*>(this);
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
+            if (idx < ta->Length()) {
+                return ta->GetElement(idx);
+            }
+            return TaggedValue::Undefined();
+        }
     }
 
     if (const AccessorDescriptor* acc = GetAccessor(key)) {
@@ -142,7 +151,7 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
 
         if (IsUserFunction() && key == "prototype") {
             auto* fn = const_cast<JSFunction*>(static_cast<const JSFunction*>(this));
-            if (!fn->IsArrow() && !fn->IsAsync()) {
+            if (!fn->IsArrow() && !fn->IsAsync() && !fn->IsMethod()) {
                 if (fn->GetConstructorPrototype().IsEmpty()) {
                     return TaggedValue::FromHeapObject(fn->GetOrCreateConstructorPrototype());
                 }
@@ -213,6 +222,11 @@ bool JSObject::HasNamedProperty(std::string_view key) const {
         if (key == "size") return true;
     } else if (IsFunction()) {
         if (key == "length" || key == "name") return true;
+    } else if (IsTypedArray()) {
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
+            return idx < static_cast<const JSTypedArray*>(this)->Length();
+        }
     }
 
     if (HasAccessor(key)) return true;
@@ -234,7 +248,7 @@ bool JSObject::HasNamedProperty(std::string_view key) const {
 
         if (IsUserFunction() && key == "prototype") {
             const auto* fn = static_cast<const JSFunction*>(this);
-            if (!fn->IsArrow() && !fn->IsAsync()) {
+            if (!fn->IsArrow() && !fn->IsAsync() && !fn->IsMethod()) {
                 return true;
             }
             return false;
@@ -347,7 +361,12 @@ bool JSObject::HasOwnProperty(std::string_view key) const {
         if (key == "length" || key == "name") return true;
         if (GetType() == HeapObjectType::JSFunction) {
             const auto* fn = static_cast<const JSFunction*>(this);
-            if (key == "prototype" && !fn->IsArrow() && !fn->IsAsync()) return true;
+            if (key == "prototype" && !fn->IsArrow() && !fn->IsAsync() && !fn->IsMethod()) return true;
+        }
+    } else if (IsTypedArray()) {
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx)) {
+            return idx < static_cast<const JSTypedArray*>(this)->Length();
         }
     }
     return false;
@@ -384,9 +403,24 @@ PropertyAttributes JSObject::GetOwnPropertyAttributes(std::string_view key) cons
             attrs = PropertyAttributes::Configurable;
         } else if (key == "prototype" && IsUserFunction()) {
             const auto* fn = static_cast<const JSFunction*>(this);
-            if (!fn->IsArrow() && !fn->IsAsync()) {
+            if (!fn->IsArrow() && !fn->IsAsync() && !fn->IsMethod()) {
                 attrs = PropertyAttributes::Writable;
             }
+        } else {
+            Shape* shape = GetShape();
+            if (shape != nullptr) {
+                if (const PropertyDescriptor* desc = shape->LookupProperty(key)) {
+                    TaggedValue val = GetFastSlot(desc->slot_index, desc->is_in_object);
+                    if (!val.IsEmpty()) {
+                        attrs = desc->attributes;
+                    }
+                }
+            }
+        }
+    } else if (IsTypedArray()) {
+        size_t idx = 0;
+        if (TryParseArrayIndex(key, idx) && idx < static_cast<const JSTypedArray*>(this)->Length()) {
+            attrs = PropertyAttributes::Writable | PropertyAttributes::Enumerable;
         } else {
             Shape* shape = GetShape();
             if (shape != nullptr) {

@@ -581,6 +581,17 @@ std::unique_ptr<Graph> SeaOfNodesBuilder::Build() {
                 acc_ = graph_->GVN(mul_node);
                 break;
             }
+            case Opcode::ModSmi: {
+                int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
+                pc += 4;
+                pc += 2;
+                Node* const_node = graph_->NewConstantInt32(imm);
+                Node* mod_node = graph_->NewNode(NodeOp::Int32Mod);
+                mod_node->AddInput(acc_);
+                mod_node->AddInput(const_node);
+                acc_ = graph_->GVN(mod_node);
+                break;
+            }
             case Opcode::BitwiseAndSmi: {
                 int32_t imm = code[pc] | (code[pc + 1] << 8) | (code[pc + 2] << 16) | (code[pc + 3] << 24);
                 pc += 4;

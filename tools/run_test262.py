@@ -16,6 +16,11 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # Global in-memory harness cache
 _HARNESS_CACHE = {}
 _HARNESS_CACHE_LOCK = threading.Lock()
@@ -231,6 +236,8 @@ def run_single_test_file(binary_path, test_path, target_root, harness_dir, timeo
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 timeout=timeout_s
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -256,7 +263,9 @@ def run_single_test_file(binary_path, test_path, target_root, harness_dir, timeo
                 "timed_out": False
             }
 
-        combined_output = (proc.stdout + "\n" + proc.stderr).strip()
+        stdout_str = proc.stdout if proc.stdout else ""
+        stderr_str = proc.stderr if proc.stderr else ""
+        combined_output = (stdout_str + "\n" + stderr_str).strip()
 
         if meta["is_negative"]:
             neg_type = meta["negative_type"]

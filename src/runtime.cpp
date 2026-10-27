@@ -41,6 +41,31 @@ static void SetRangeException(std::string_view message) {
     }
 }
 
+static void SetTypeException(std::string_view message) {
+    if (Interpreter::Current()) {
+        Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+            AllocateRuntime<JSError>("TypeError", message)));
+    }
+}
+
+static bool StrictEquals(TaggedValue a, TaggedValue b) {
+    if (a.IsNumber() && b.IsNumber()) {
+        double da = a.AsNumber();
+        double db = b.AsNumber();
+        if (std::isnan(da) || std::isnan(db)) return false;
+        return da == db;
+    }
+    if (a.IsHeapObject() && b.IsHeapObject()) {
+        HeapObject* ha = a.AsHeapObject();
+        HeapObject* hb = b.AsHeapObject();
+        if (ha->IsString() && hb->IsString()) {
+            return static_cast<JSString*>(ha)->Value() == static_cast<JSString*>(hb)->Value();
+        }
+        return ha == hb;
+    }
+    return a == b;
+}
+
 static void AppendRegexReplacement(std::string& out, std::string_view replacement,
                                    std::string_view input, const RegexMatch& match) {
     for (size_t i = 0; i < replacement.size(); ++i) {
@@ -527,6 +552,18 @@ std::string ToPropertyKeyString(TaggedValue key_val) {
     }
     if (key_val.IsSmi()) {
         return std::to_string(key_val.AsSmi());
+    }
+    if (key_val.IsHeapObject() && (key_val.AsHeapObject()->IsJSObject() || key_val.AsHeapObject()->IsProxy())) {
+        if (Interpreter::Current()) {
+            TaggedValue k = Interpreter::Current()->ToPropertyKey(key_val);
+            if (k.IsSymbol()) {
+                return static_cast<JSSymbol*>(k.AsHeapObject())->Key();
+            }
+            if (k.IsHeapObject() && k.AsHeapObject()->IsString()) {
+                return static_cast<JSString*>(k.AsHeapObject())->Value();
+            }
+            return k.ToString();
+        }
     }
     return key_val.ToString();
 }
@@ -1075,46 +1112,495 @@ static TaggedValue Console_log(const std::vector<TaggedValue>& args) {
     return TaggedValue::Undefined();
 }
 
-// Array Prototype Methods
-static TaggedValue Array_push(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::FromSmi(0);
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    for (const auto& a : args) {
-        arr->Push(a);
+// Array Prototype Methods & Helpers
+static bool StrictEqualValues(TaggedValue a, TaggedValue b) {
+    if (a.IsSmi() && b.IsSmi()) return a.AsSmi() == b.AsSmi();
+    if (a.IsNumber() && b.IsNumber()) return a.AsNumber() == b.AsNumber();
+    if (a.IsHeapObject() && b.IsHeapObject() && a.AsHeapObject()->IsString() && b.AsHeapObject()->IsString()) {
+        return static_cast<JSString*>(a.AsHeapObject())->View() == static_cast<JSString*>(b.AsHeapObject())->View();
     }
-    return TaggedValue::FromSmi(static_cast<int32_t>(arr->Length()));
+    if (a.IsHeapObject() && b.IsHeapObject() && a.AsHeapObject()->IsBigInt() && b.AsHeapObject()->IsBigInt()) {
+        return static_cast<JSBigInt*>(a.AsHeapObject())->Equals(*static_cast<JSBigInt*>(b.AsHeapObject()));
+    }
+    return a == b;
 }
 
-static TaggedValue Array_pop(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    (void)args;
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    return arr->Pop();
+static bool SameValue(TaggedValue x, TaggedValue y) {
+    if (x.IsNumber() && y.IsNumber()) {
+        double dx = x.AsNumber();
+        double dy = y.AsNumber();
+        if (std::isnan(dx) && std::isnan(dy)) return true;
+        if (dx == 0.0 && dy == 0.0) {
+            return std::signbit(dx) == std::signbit(dy);
+        }
+        return dx == dy;
+    }
+    return StrictEqualValues(x, y);
 }
 
-static TaggedValue Array_shift(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    (void)args;
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    if (arr->Length() == 0) return TaggedValue::Undefined();
-    TaggedValue first = arr->GetElement(0);
-    arr->Elements().erase(arr->Elements().begin());
+static uint64_t ToLength(TaggedValue v) {
+    double d = v.ToDouble();
+    if (std::isnan(d) || d <= 0.0) return 0;
+    if (d >= 9007199254740991.0) return 9007199254740991ULL; // 2^53 - 1
+    return static_cast<uint64_t>(d);
+}
+
+static JSObject* ToObject(TaggedValue val) {
+    if (val.IsNull() || val.IsUndefined()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
+        }
+        return nullptr;
+    }
+    if (val.IsHeapObject()) {
+        HeapObject* ho = val.AsHeapObject();
+        if (ho->IsJSObject()) return static_cast<JSObject*>(ho);
+        if (ho->IsString()) {
+            if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+                TaggedValue str_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("String");
+                if (str_ctor.IsHeapObject() && str_ctor.AsHeapObject()->IsFunction()) {
+                    TaggedValue obj = ConstructObject(str_ctor, {val});
+                    if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+                }
+            }
+        }
+        if (ho->IsBigInt()) {
+            auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+            if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+                TaggedValue bigint_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("BigInt");
+                if (bigint_ctor.IsHeapObject() && bigint_ctor.AsHeapObject()->IsJSObject()) {
+                    TaggedValue proto = static_cast<JSObject*>(bigint_ctor.AsHeapObject())->GetNamedProperty("prototype");
+                    if (proto.IsHeapObject() && proto.AsHeapObject()->IsJSObject()) {
+                        obj->SetPrototype(static_cast<JSObject*>(proto.AsHeapObject()));
+                    }
+                }
+            }
+            uint32_t next_sid = 0;
+            obj->SetNamedProperty("__bigint_data__", val, next_sid);
+            return obj;
+        }
+    } else if (val.IsSmi() || val.IsDouble()) {
+        if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+            TaggedValue num_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("Number");
+            if (num_ctor.IsHeapObject() && num_ctor.AsHeapObject()->IsFunction()) {
+                TaggedValue obj = ConstructObject(num_ctor, {val});
+                if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+            }
+        }
+    } else if (val.IsBoolean()) {
+        if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+            TaggedValue bool_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("Boolean");
+            if (bool_ctor.IsHeapObject() && bool_ctor.AsHeapObject()->IsFunction()) {
+                TaggedValue obj = ConstructObject(bool_ctor, {val});
+                if (obj.IsHeapObject() && obj.AsHeapObject()->IsJSObject()) return static_cast<JSObject*>(obj.AsHeapObject());
+            }
+        }
+    } else if (val.IsSymbol()) {
+        auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetGlobalObject()) {
+            TaggedValue sym_ctor = Realm::Current()->GetGlobalObject()->GetNamedProperty("Symbol");
+            if (sym_ctor.IsHeapObject() && sym_ctor.AsHeapObject()->IsJSObject()) {
+                TaggedValue proto = static_cast<JSObject*>(sym_ctor.AsHeapObject())->GetNamedProperty("prototype");
+                if (proto.IsHeapObject() && proto.AsHeapObject()->IsJSObject()) {
+                    obj->SetPrototype(static_cast<JSObject*>(proto.AsHeapObject()));
+                }
+            }
+        }
+        uint32_t next_sid = 0;
+        obj->SetNamedProperty("__symbol_data__", val, next_sid);
+        return obj;
+    }
+    return nullptr;
+}
+
+static bool DefinePropertyOnObject(JSObject* obj, std::string_view key, TaggedValue desc) {
+    if (!desc.IsHeapObject() || !desc.AsHeapObject()->IsECMAObject()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Property description must be an object")));
+        }
+        return false;
+    }
+    bool has_get = HasProperty(desc, "get");
+    bool has_set = HasProperty(desc, "set");
+    bool has_val = HasProperty(desc, "value");
+    bool has_wri = HasProperty(desc, "writable");
+    bool has_enu = HasProperty(desc, "enumerable");
+    bool has_cnf = HasProperty(desc, "configurable");
+
+    TaggedValue get_fn = has_get ? GetProperty(desc, "get") : TaggedValue::Undefined();
+    TaggedValue set_fn = has_set ? GetProperty(desc, "set") : TaggedValue::Undefined();
+
+    if (has_get && !get_fn.IsUndefined()) {
+        if (!get_fn.IsHeapObject() || !get_fn.AsHeapObject()->IsFunction()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Getter must be a function")));
+            }
+            return false;
+        }
+    }
+    if (has_set && !set_fn.IsUndefined()) {
+        if (!set_fn.IsHeapObject() || !set_fn.AsHeapObject()->IsFunction()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Setter must be a function")));
+            }
+            return false;
+        }
+    }
+    if ((has_get || has_set) && (has_val || has_wri)) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Invalid property descriptor: cannot specify both value/writable and get/set")));
+        }
+        return false;
+    }
+
+    bool enu = has_enu ? GetProperty(desc, "enumerable").ToBoolean() : false;
+    bool cnf = has_cnf ? GetProperty(desc, "configurable").ToBoolean() : false;
+    bool wri = has_wri ? GetProperty(desc, "writable").ToBoolean() : false;
+    TaggedValue val = has_val ? GetProperty(desc, "value") : TaggedValue::Undefined();
+
+    if (obj->IsArray() && key == "length") {
+        if (has_get || has_set) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Array length cannot be accessor")));
+            return false;
+        }
+        if (has_cnf && cnf) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot make array length configurable")));
+            return false;
+        }
+        if (has_enu && enu) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot make array length enumerable")));
+            return false;
+        }
+        auto* arr = static_cast<JSArray*>(obj);
+        PropertyAttributes cur_attrs = arr->GetOwnPropertyAttributes("length");
+        if (has_val) {
+            double d = val.ToDouble();
+            uint32_t new_len = static_cast<uint32_t>(d);
+            if (std::isnan(d) || static_cast<double>(new_len) != d) {
+                if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "Invalid array length")));
+                return false;
+            }
+            if (!(cur_attrs & PropertyAttributes::Writable) && new_len != arr->Length()) {
+                if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot change length of non-writable array")));
+                return false;
+            }
+            arr->SetLength(new_len);
+        }
+        if (has_wri && !wri) {
+            arr->SetOwnPropertyAttributes("length", PropertyAttributes::None);
+        }
+        return true;
+    }
+
+    bool current_exists = obj->HasOwnProperty(key);
+    if (!current_exists) {
+        if (!obj->IsExtensible()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Cannot define property on non-extensible object")));
+            }
+            return false;
+        }
+        if (has_get || has_set) {
+            PropertyAttributes attrs = (enu ? PropertyAttributes::Enumerable : PropertyAttributes::None) |
+                                       (cnf ? PropertyAttributes::Configurable : PropertyAttributes::None);
+            obj->SetAccessor(key, get_fn, set_fn, attrs);
+            return true;
+        }
+        PropertyAttributes attrs = (wri ? PropertyAttributes::Writable : PropertyAttributes::None) |
+                                   (enu ? PropertyAttributes::Enumerable : PropertyAttributes::None) |
+                                   (cnf ? PropertyAttributes::Configurable : PropertyAttributes::None);
+        uint32_t sid = 0;
+        obj->SetNamedProperty(key, val, sid);
+        obj->SetOwnPropertyAttributes(key, attrs);
+        return true;
+    }
+
+    PropertyAttributes cur_attrs = obj->GetOwnPropertyAttributes(key);
+    bool cur_is_accessor = obj->HasAccessor(key);
+    bool cur_cnf = (cur_attrs & PropertyAttributes::Configurable);
+    bool cur_enu = (cur_attrs & PropertyAttributes::Enumerable);
+    bool cur_wri = (cur_attrs & PropertyAttributes::Writable);
+
+    if (!cur_cnf) {
+        if (has_cnf && cnf) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot redefine non-configurable property")));
+            return false;
+        }
+        if (has_enu && enu != cur_enu) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot change enumerable attribute of non-configurable property")));
+            return false;
+        }
+        if ((has_get || has_set) && !cur_is_accessor) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot change data property to accessor on non-configurable property")));
+            return false;
+        }
+        if ((has_val || has_wri) && cur_is_accessor) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot change accessor property to data on non-configurable property")));
+            return false;
+        }
+        if (cur_is_accessor) {
+            const auto* acc = obj->GetAccessor(key);
+            TaggedValue cur_get = acc ? acc->getter : TaggedValue::Undefined();
+            TaggedValue cur_set = acc ? acc->setter : TaggedValue::Undefined();
+            if (has_get && !SameValue(get_fn, cur_get)) {
+                if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot modify getter of non-configurable accessor")));
+                return false;
+            }
+            if (has_set && !SameValue(set_fn, cur_set)) {
+                if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot modify setter of non-configurable accessor")));
+                return false;
+            }
+        } else {
+            if (!cur_wri) {
+                if (has_wri && wri) {
+                    if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot make non-writable property writable on non-configurable property")));
+                    return false;
+                }
+                if (has_val) {
+                    TaggedValue cur_val = obj->GetNamedProperty(key);
+                    if (!SameValue(val, cur_val)) {
+                        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot change value of non-writable non-configurable property")));
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    if (has_get || has_set || (cur_is_accessor && !has_val && !has_wri)) {
+        TaggedValue cur_get = TaggedValue::Undefined();
+        TaggedValue cur_set = TaggedValue::Undefined();
+        if (cur_is_accessor) {
+            const auto* acc = obj->GetAccessor(key);
+            if (acc) { cur_get = acc->getter; cur_set = acc->setter; }
+        }
+        TaggedValue final_get = has_get ? get_fn : cur_get;
+        TaggedValue final_set = has_set ? set_fn : cur_set;
+        bool final_enu = has_enu ? enu : cur_enu;
+        bool final_cnf = has_cnf ? cnf : cur_cnf;
+        PropertyAttributes final_attrs = (final_enu ? PropertyAttributes::Enumerable : PropertyAttributes::None) |
+                                         (final_cnf ? PropertyAttributes::Configurable : PropertyAttributes::None);
+        obj->SetAccessor(key, final_get, final_set, final_attrs);
+        return true;
+    } else {
+        if (cur_is_accessor) {
+            obj->RemoveAccessor(key);
+        }
+        TaggedValue final_val = has_val ? val : obj->GetNamedProperty(key);
+        bool final_wri = has_wri ? wri : cur_wri;
+        bool final_enu = has_enu ? enu : cur_enu;
+        bool final_cnf = has_cnf ? cnf : cur_cnf;
+        PropertyAttributes final_attrs = (final_wri ? PropertyAttributes::Writable : PropertyAttributes::None) |
+                                         (final_enu ? PropertyAttributes::Enumerable : PropertyAttributes::None) |
+                                         (final_cnf ? PropertyAttributes::Configurable : PropertyAttributes::None);
+        uint32_t sid = 0;
+        obj->SetNamedProperty(key, final_val, sid);
+        obj->SetOwnPropertyAttributes(key, final_attrs);
+        return true;
+    }
+}
+
+static TaggedValue ObjectDefineProperties(TaggedValue target_val, TaggedValue props_val) {
+    if (!target_val.IsHeapObject() || !target_val.AsHeapObject()->IsECMAObject()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Object.defineProperties called on non-object")));
+        }
+        return TaggedValue::Undefined();
+    }
+    JSObject* props = ToObject(props_val);
+    if (!props) {
+        return TaggedValue::Undefined();
+    }
+    TaggedValue keys_val = GetOwnKeys(TaggedValue::FromHeapObject(props));
+    if (!keys_val.IsHeapObject() || !keys_val.AsHeapObject()->IsArray()) {
+        return target_val;
+    }
+    auto* keys_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
+    struct PropEntry {
+        std::string key;
+        TaggedValue desc;
+    };
+    std::vector<PropEntry> descriptors;
+    for (size_t i = 0; i < keys_arr->Length(); ++i) {
+        std::string key = keys_arr->GetElement(i).ToString();
+        bool is_enumerable = false;
+        if (props->IsProxy()) {
+            TaggedValue d = ProxyGetOwnPropertyDescriptor(static_cast<JSProxy*>(props), key);
+            if (d.IsHeapObject() && d.AsHeapObject()->IsJSObject()) {
+                TaggedValue enum_val = static_cast<JSObject*>(d.AsHeapObject())->GetNamedProperty("enumerable");
+                is_enumerable = enum_val.IsUndefined() || enum_val.ToBoolean();
+            } else {
+                is_enumerable = true;
+            }
+        } else {
+            is_enumerable = (props->GetOwnPropertyAttributes(key) & PropertyAttributes::Enumerable) != 0;
+        }
+        if (is_enumerable) {
+            TaggedValue desc_obj = GetProperty(TaggedValue::FromHeapObject(props), key);
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                return TaggedValue::Undefined();
+            }
+            if (!desc_obj.IsHeapObject() || !desc_obj.AsHeapObject()->IsECMAObject()) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                        AllocateRuntime<JSError>("TypeError", "Property description must be an object")));
+                }
+                return TaggedValue::Undefined();
+            }
+            bool has_accessor = HasProperty(desc_obj, "get") || HasProperty(desc_obj, "set");
+            bool has_data = HasProperty(desc_obj, "value") || HasProperty(desc_obj, "writable");
+            if (has_accessor && has_data) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                        AllocateRuntime<JSError>("TypeError", "Invalid property descriptor: cannot specify both value/writable and get/set")));
+                }
+                return TaggedValue::Undefined();
+            }
+            descriptors.push_back({std::move(key), desc_obj});
+        }
+    }
+    for (const auto& entry : descriptors) {
+        if (target_val.AsHeapObject()->IsProxy()) {
+            ProxyDefineProperty(static_cast<JSProxy*>(target_val.AsHeapObject()), entry.key, entry.desc);
+        } else {
+            if (!DefinePropertyOnObject(static_cast<JSObject*>(target_val.AsHeapObject()), entry.key, entry.desc)) {
+                return TaggedValue::Undefined();
+            }
+        }
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            return TaggedValue::Undefined();
+        }
+    }
+    return target_val;
+}
+
+static TaggedValue Array_push(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        for (const auto& a : args) arr->Push(a);
+        uint64_t new_len = arr->Length();
+        return new_len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(new_len)) : TaggedValue::FromDouble(static_cast<double>(new_len));
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    if (len + args.size() > 9007199254740991ULL) {
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Array push length exceeds 2^53 - 1")));
+        return TaggedValue::Undefined();
+    }
+    for (const auto& a : args) {
+        SetProperty(TaggedValue::FromHeapObject(obj), std::to_string(len), a);
+        len++;
+    }
+    uint32_t sid = 0;
+    TaggedValue len_tv = len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(len)) : TaggedValue::FromDouble(static_cast<double>(len));
+    obj->SetNamedProperty("length", len_tv, sid);
+    return len_tv;
+}
+
+static TaggedValue Array_pop(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        return arr->Pop();
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    if (len == 0) {
+        uint32_t sid = 0;
+        obj->SetNamedProperty("length", TaggedValue::FromSmi(0), sid);
+        return TaggedValue::Undefined();
+    }
+    len--;
+    std::string idx_str = std::to_string(len);
+    TaggedValue element = GetProperty(TaggedValue::FromHeapObject(obj), idx_str);
+    obj->DeleteNamedProperty(idx_str);
+    uint32_t sid = 0;
+    obj->SetNamedProperty("length", TaggedValue::FromDouble(static_cast<double>(len)), sid);
+    return element;
+}
+
+static TaggedValue Array_shift(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        if (arr->Length() == 0) return TaggedValue::Undefined();
+        TaggedValue first = arr->GetElement(0);
+        arr->Elements().erase(arr->Elements().begin());
+        return first;
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    if (len == 0) {
+        uint32_t sid = 0;
+        obj->SetNamedProperty("length", TaggedValue::FromSmi(0), sid);
+        return TaggedValue::Undefined();
+    }
+    TaggedValue first = GetProperty(TaggedValue::FromHeapObject(obj), "0");
+    for (uint64_t k = 1; k < len; ++k) {
+        std::string from = std::to_string(k);
+        std::string to = std::to_string(k - 1);
+        if (HasProperty(TaggedValue::FromHeapObject(obj), from)) {
+            SetProperty(TaggedValue::FromHeapObject(obj), to, GetProperty(TaggedValue::FromHeapObject(obj), from));
+        } else {
+            obj->DeleteNamedProperty(to);
+        }
+    }
+    obj->DeleteNamedProperty(std::to_string(len - 1));
+    uint32_t sid = 0;
+    obj->SetNamedProperty("length", TaggedValue::FromDouble(static_cast<double>(len - 1)), sid);
     return first;
 }
 
 static TaggedValue Array_unshift(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::FromSmi(0);
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    arr->Elements().insert(arr->Elements().begin(), args.begin(), args.end());
-    return TaggedValue::FromSmi(static_cast<int32_t>(arr->Length()));
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        arr->Elements().insert(arr->Elements().begin(), args.begin(), args.end());
+        uint64_t new_len = arr->Length();
+        return new_len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(new_len)) : TaggedValue::FromDouble(static_cast<double>(new_len));
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    uint64_t arg_count = args.size();
+    if (len + arg_count > 9007199254740991ULL) {
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Array unshift length exceeds 2^53 - 1")));
+        return TaggedValue::Undefined();
+    }
+    if (arg_count > 0) {
+        for (uint64_t k = len; k > 0; --k) {
+            std::string from = std::to_string(k - 1);
+            std::string to = std::to_string(k + arg_count - 1);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), from)) {
+                SetProperty(TaggedValue::FromHeapObject(obj), to, GetProperty(TaggedValue::FromHeapObject(obj), from));
+            } else {
+                obj->DeleteNamedProperty(to);
+            }
+        }
+        for (uint64_t j = 0; j < arg_count; ++j) {
+            SetProperty(TaggedValue::FromHeapObject(obj), std::to_string(j), args[j]);
+        }
+    }
+    uint64_t new_len = len + arg_count;
+    uint32_t sid = 0;
+    TaggedValue len_tv = new_len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(new_len)) : TaggedValue::FromDouble(static_cast<double>(new_len));
+    obj->SetNamedProperty("length", len_tv, sid);
+    return len_tv;
 }
 
 static TaggedValue Array_slice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    int64_t len = static_cast<int64_t>(arr->Length());
-    int64_t start = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
-    int64_t end = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : len;
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    int64_t len = obj->IsArray() ? static_cast<int64_t>(static_cast<JSArray*>(obj)->Length()) : static_cast<int64_t>(ToLength(obj->GetNamedProperty("length")));
+    int64_t start = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble())) : 0;
+    int64_t end = args.size() > 1 && !args[1].IsUndefined() ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble())) : len;
 
     if (start < 0) start = std::max<int64_t>(0, len + start);
     else start = std::min<int64_t>(len, start);
@@ -1126,7 +1612,11 @@ static TaggedValue Array_slice(TaggedValue this_val, const std::vector<TaggedVal
     if (start < end) {
         sliced.reserve(static_cast<size_t>(end - start));
         for (int64_t i = start; i < end; ++i) {
-            sliced.push_back(arr->GetElement(static_cast<size_t>(i)));
+            if (obj->IsArray()) {
+                sliced.push_back(static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(i)));
+            } else {
+                sliced.push_back(GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(i)));
+            }
         }
     }
     auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(sliced));
@@ -1139,39 +1629,19 @@ static TaggedValue Array_slice(TaggedValue this_val, const std::vector<TaggedVal
 static TaggedValue Object_toString(TaggedValue this_val, const std::vector<TaggedValue>& args);
 
 static TaggedValue Array_join(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
     std::string sep = (args.size() > 0 && !args[0].IsUndefined()) ? args[0].ToString() : ",";
-
-    if (this_val.AsHeapObject()->IsArray()) {
-        auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-        std::string res;
-        for (size_t i = 0; i < arr->Length(); ++i) {
-            if (i > 0) res += sep;
-            TaggedValue el = arr->GetElement(i);
-            if (!el.IsUndefined() && !el.IsNull()) {
-                res += el.ToString();
-            }
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    std::string res;
+    for (uint64_t i = 0; i < len; ++i) {
+        if (i > 0) res += sep;
+        TaggedValue el = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(i)) : GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(i));
+        if (!el.IsUndefined() && !el.IsNull()) {
+            res += el.ToString();
         }
-        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
     }
-
-    if (this_val.AsHeapObject()->IsJSObject()) {
-        auto* obj = static_cast<JSObject*>(this_val.AsHeapObject());
-        TaggedValue len_val = obj->GetNamedProperty("length");
-        uint32_t len = 0;
-        if (len_val.IsSmi()) len = len_val.AsSmi() > 0 ? (uint32_t)len_val.AsSmi() : 0;
-        else if (len_val.IsNumber()) len = len_val.AsNumber() > 0 ? (uint32_t)len_val.AsNumber() : 0;
-        std::string res;
-        for (uint32_t i = 0; i < len; ++i) {
-            if (i > 0) res += sep;
-            TaggedValue el = obj->GetNamedProperty(std::to_string(i));
-            if (!el.IsUndefined() && !el.IsNull()) {
-                res += el.ToString();
-            }
-        }
-        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
-    }
-    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
 }
 
 static TaggedValue Array_toString(TaggedValue this_val, const std::vector<TaggedValue>& args) {
@@ -1192,60 +1662,84 @@ static TaggedValue Array_toLocaleString(TaggedValue this_val, const std::vector<
     return Array_toString(this_val, args);
 }
 
-static bool StrictEqualValues(TaggedValue a, TaggedValue b) {
-    if (a.IsSmi() && b.IsSmi()) return a.AsSmi() == b.AsSmi();
-    if (a.IsNumber() && b.IsNumber()) return a.AsNumber() == b.AsNumber();
-    if (a.IsHeapObject() && b.IsHeapObject() && a.AsHeapObject()->IsString() && b.AsHeapObject()->IsString()) {
-        return static_cast<JSString*>(a.AsHeapObject())->View() == static_cast<JSString*>(b.AsHeapObject())->View();
-    }
-    if (a.IsHeapObject() && b.IsHeapObject() && a.AsHeapObject()->IsBigInt() && b.AsHeapObject()->IsBigInt()) {
-        return static_cast<JSBigInt*>(a.AsHeapObject())->Equals(*static_cast<JSBigInt*>(b.AsHeapObject()));
-    }
-    return a == b;
-}
-
 static TaggedValue Array_indexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::FromSmi(-1);
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::FromSmi(-1);
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
     TaggedValue search = args.empty() ? TaggedValue::Undefined() : args[0];
-    size_t from = (args.size() > 1 && args[1].IsSmi()) ? static_cast<size_t>(std::max<int32_t>(0, args[1].AsSmi())) : 0;
-    for (size_t i = from; i < arr->Length(); ++i) {
-        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty() && StrictEqualValues(arr->GetElement(i), search)) {
-            return TaggedValue::FromSmi(static_cast<int32_t>(i));
+    int64_t from = (args.size() > 1 && args[1].IsSmi()) ? static_cast<int64_t>(args[1].AsSmi()) : (args.size() > 1 ? static_cast<int64_t>(args[1].ToDouble()) : 0);
+    if (from < 0) from = std::max<int64_t>(0, static_cast<int64_t>(len) + from);
+    for (uint64_t i = static_cast<uint64_t>(from); i < len; ++i) {
+        TaggedValue el = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(i)) : GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(i));
+        if (StrictEqualValues(el, search)) {
+            return i <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(i)) : TaggedValue::FromDouble(static_cast<double>(i));
         }
     }
     return TaggedValue::FromSmi(-1);
 }
 
 static TaggedValue Array_includes(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::FromBoolean(false);
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::FromBoolean(false);
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
     TaggedValue search = args.empty() ? TaggedValue::Undefined() : args[0];
-    for (size_t i = 0; i < arr->Length(); ++i) {
-        if (StrictEqualValues(arr->GetElement(i), search)) {
+    int64_t from = (args.size() > 1 && args[1].IsSmi()) ? static_cast<int64_t>(args[1].AsSmi()) : (args.size() > 1 ? static_cast<int64_t>(args[1].ToDouble()) : 0);
+    if (from < 0) from = std::max<int64_t>(0, static_cast<int64_t>(len) + from);
+    for (uint64_t i = static_cast<uint64_t>(from); i < len; ++i) {
+        TaggedValue el = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(i)) : GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(i));
+        if (SameValue(el, search) || (el.IsNumber() && search.IsNumber() && std::isnan(el.AsNumber()) && std::isnan(search.AsNumber()))) {
             return TaggedValue::FromBoolean(true);
         }
     }
     return TaggedValue::FromBoolean(false);
 }
 
-static TaggedValue Array_reverse(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    (void)args;
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return this_val;
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    std::reverse(arr->Elements().begin(), arr->Elements().end());
+static TaggedValue Array_reverse(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        std::reverse(arr->Elements().begin(), arr->Elements().end());
+        return this_val;
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    uint64_t middle = len / 2;
+    for (uint64_t lower = 0; lower < middle; ++lower) {
+        uint64_t upper = len - lower - 1;
+        std::string lower_s = std::to_string(lower);
+        std::string upper_s = std::to_string(upper);
+        bool lower_exists = HasProperty(TaggedValue::FromHeapObject(obj), lower_s);
+        bool upper_exists = HasProperty(TaggedValue::FromHeapObject(obj), upper_s);
+        TaggedValue lower_val = lower_exists ? GetProperty(TaggedValue::FromHeapObject(obj), lower_s) : TaggedValue::Undefined();
+        TaggedValue upper_val = upper_exists ? GetProperty(TaggedValue::FromHeapObject(obj), upper_s) : TaggedValue::Undefined();
+        if (lower_exists && upper_exists) {
+            SetProperty(TaggedValue::FromHeapObject(obj), lower_s, upper_val);
+            SetProperty(TaggedValue::FromHeapObject(obj), upper_s, lower_val);
+        } else if (!lower_exists && upper_exists) {
+            SetProperty(TaggedValue::FromHeapObject(obj), lower_s, upper_val);
+            obj->DeleteNamedProperty(upper_s);
+        } else if (lower_exists && !upper_exists) {
+            obj->DeleteNamedProperty(lower_s);
+            SetProperty(TaggedValue::FromHeapObject(obj), upper_s, lower_val);
+        }
+    }
     return this_val;
 }
 
 static TaggedValue Array_concat(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
     auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
-    for (size_t i = 0; i < arr->Length(); ++i) {
-        new_arr->Push(arr->GetElement(i));
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        for (size_t i = 0; i < arr->Length(); ++i) {
+            new_arr->Push(arr->GetElement(i));
+        }
+    } else {
+        new_arr->Push(TaggedValue::FromHeapObject(obj));
     }
     for (const auto& item : args) {
         if (item.IsHeapObject() && item.AsHeapObject()->IsArray()) {
@@ -1261,36 +1755,85 @@ static TaggedValue Array_concat(TaggedValue this_val, const std::vector<TaggedVa
 }
 
 static TaggedValue Array_map(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
-    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, arr->Length());
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.map callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, static_cast<size_t>(len));
     if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
-    for (size_t i = 0; i < arr->Length(); ++i) {
-        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
-            TaggedValue res = CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
-            new_arr->SetElement(i, res);
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val;
+        bool present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                present = true;
+            }
+        }
+        if (present) {
+            TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            new_arr->SetElement(static_cast<size_t>(k), res);
         }
     }
     return TaggedValue::FromHeapObject(new_arr);
 }
 
 static TaggedValue Array_filter(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.filter callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
     auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
-    for (size_t i = 0; i < arr->Length(); ++i) {
-        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
-            TaggedValue el = arr->GetElement(i);
-            TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val;
+        bool present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                present = true;
+            }
+        }
+        if (present) {
+            TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
             if (res.ToBoolean()) {
-                new_arr->Push(el);
+                new_arr->Push(k_val);
             }
         }
     }
@@ -1298,112 +1841,675 @@ static TaggedValue Array_filter(TaggedValue this_val, const std::vector<TaggedVa
 }
 
 static TaggedValue Array_forEach(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
-    for (size_t i = 0; i < arr->Length(); ++i) {
-        if (i < arr->Elements().size() && !arr->Elements()[i].IsEmpty()) {
-            CallFunction(cb, this_val, {arr->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.forEach callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val;
+        bool present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                present = true;
+            }
+        }
+        if (present) {
+            CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         }
     }
     return TaggedValue::Undefined();
 }
 
 static TaggedValue Array_reduce(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    TaggedValue cb = args.empty() ? TaggedValue::Undefined() : args[0];
-    size_t k = 0;
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.reduce callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    uint64_t k = 0;
     TaggedValue acc;
     if (args.size() > 1) {
         acc = args[1];
     } else {
-        bool found = false;
-        while (k < arr->Length()) {
-            if (k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                acc = arr->GetElement(k);
-                found = true;
-                k++;
-                break;
+        bool k_present = false;
+        while (k < len) {
+            if (obj->IsArray()) {
+                auto* arr = static_cast<JSArray*>(obj);
+                if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                    acc = arr->Elements()[k];
+                    k_present = true;
+                    k++;
+                    break;
+                }
+            } else {
+                std::string k_str = std::to_string(k);
+                if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                    acc = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                    k_present = true;
+                    k++;
+                    break;
+                }
             }
             k++;
         }
-        if (!found) {
+        if (!k_present) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Reduce of empty array with no initial value")));
+            }
             return TaggedValue::Undefined();
         }
     }
-    for (; k < arr->Length(); ++k) {
-        if (k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-            acc = CallFunction(cb, this_val, {acc, arr->GetElement(k), TaggedValue::FromSmi(static_cast<int32_t>(k)), this_val});
+    while (k < len) {
+        TaggedValue k_val;
+        bool k_present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                k_present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                k_present = true;
+            }
         }
+        if (k_present) {
+            acc = CallFunction(cb, TaggedValue::Undefined(), {acc, k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                return TaggedValue::Undefined();
+            }
+        }
+        k++;
     }
     return acc;
 }
 
-static TaggedValue Array_splice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return TaggedValue::Undefined();
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
-    int64_t len = static_cast<int64_t>(arr->Length());
-    if (args.empty()) {
-        auto* empty_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 0);
-        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
-            empty_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+static TaggedValue Array_reduceRight(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.reduceRight callback must be a function")));
         }
-        return TaggedValue::FromHeapObject(empty_arr);
+        return TaggedValue::Undefined();
     }
-    int64_t start = args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble());
-    if (start < 0) start = std::max<int64_t>(0, len + start);
-    else start = std::min<int64_t>(len, start);
-
-    int64_t delete_count = 0;
-    if (args.size() == 1) {
-        delete_count = len - start;
+    TaggedValue cb = args[0];
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    if (len == 0 && args.size() <= 1) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Reduce of empty array with no initial value")));
+        }
+        return TaggedValue::Undefined();
+    }
+    int64_t k = static_cast<int64_t>(len) - 1;
+    TaggedValue acc;
+    if (args.size() > 1) {
+        acc = args[1];
     } else {
-        int64_t dc = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble());
-        delete_count = std::clamp<int64_t>(dc, 0, len - start);
+        bool k_present = false;
+        while (k >= 0) {
+            if (obj->IsArray()) {
+                auto* arr = static_cast<JSArray*>(obj);
+                if (static_cast<size_t>(k) < arr->Length() && static_cast<size_t>(k) < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                    acc = arr->Elements()[k];
+                    k_present = true;
+                    k--;
+                    break;
+                }
+            } else {
+                std::string k_str = std::to_string(k);
+                if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                    acc = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                    k_present = true;
+                    k--;
+                    break;
+                }
+            }
+            k--;
+        }
+        if (!k_present) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Reduce of empty array with no initial value")));
+            }
+            return TaggedValue::Undefined();
+        }
     }
-
-    std::vector<TaggedValue> removed;
-    removed.reserve(static_cast<size_t>(delete_count));
-    for (int64_t i = 0; i < delete_count; ++i) {
-        removed.push_back(arr->GetElement(static_cast<size_t>(start + i)));
+    while (k >= 0) {
+        TaggedValue k_val;
+        bool k_present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (static_cast<size_t>(k) < arr->Length() && static_cast<size_t>(k) < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                k_present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                k_present = true;
+            }
+        }
+        if (k_present) {
+            acc = CallFunction(cb, TaggedValue::Undefined(), {acc, k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                return TaggedValue::Undefined();
+            }
+        }
+        k--;
     }
+    return acc;
+}
 
-    std::vector<TaggedValue>& elems = arr->Elements();
-    std::vector<TaggedValue> items_to_insert;
-    if (args.size() > 2) {
-        items_to_insert.assign(args.begin() + 2, args.end());
+static TaggedValue Array_some(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.some callback must be a function")));
+        }
+        return TaggedValue::Undefined();
     }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val;
+        bool k_present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                k_present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                k_present = true;
+            }
+        }
+        if (k_present) {
+            TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            if (res.ToBoolean()) return TaggedValue::FromBoolean(true);
+        }
+    }
+    return TaggedValue::FromBoolean(false);
+}
 
-    auto it = elems.begin() + start;
-    elems.erase(it, it + delete_count);
-    elems.insert(elems.begin() + start, items_to_insert.begin(), items_to_insert.end());
-    arr->SetLength(elems.size());
+static TaggedValue Array_every(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.every callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val;
+        bool k_present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                k_val = arr->Elements()[k];
+                k_present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), k_str)) {
+                k_val = GetProperty(TaggedValue::FromHeapObject(obj), k_str);
+                k_present = true;
+            }
+        }
+        if (k_present) {
+            TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            if (!res.ToBoolean()) return TaggedValue::FromBoolean(false);
+        }
+    }
+    return TaggedValue::FromBoolean(true);
+}
 
-    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(removed));
+static TaggedValue Array_find(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.find callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(k)) : GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(k));
+        TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (res.ToBoolean()) return k_val;
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue Array_findIndex(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.findIndex callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue t = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue k_val = obj->IsArray() ? static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(k)) : GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(k));
+        TaggedValue res = CallFunction(cb, t, {k_val, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(obj)});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (res.ToBoolean()) return k <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(k)) : TaggedValue::FromDouble(static_cast<double>(k));
+    }
+    return TaggedValue::FromSmi(-1);
+}
+
+static TaggedValue Array_fill(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    TaggedValue val = args.empty() ? TaggedValue::Undefined() : args[0];
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    int64_t relative_start = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble())) : 0;
+    int64_t k = relative_start < 0 ? std::max<int64_t>(static_cast<int64_t>(len) + relative_start, 0) : std::min<int64_t>(relative_start, static_cast<int64_t>(len));
+    int64_t relative_end = args.size() > 2 && !args[2].IsUndefined() ? (args[2].IsSmi() ? args[2].AsSmi() : static_cast<int64_t>(args[2].ToDouble())) : static_cast<int64_t>(len);
+    int64_t final_end = relative_end < 0 ? std::max<int64_t>(static_cast<int64_t>(len) + relative_end, 0) : std::min<int64_t>(relative_end, static_cast<int64_t>(len));
+    while (k < final_end) {
+        if (obj->IsArray()) {
+            static_cast<JSArray*>(obj)->SetElement(static_cast<size_t>(k), val);
+        } else {
+            SetProperty(TaggedValue::FromHeapObject(obj), std::to_string(k), val);
+        }
+        k++;
+    }
+    return TaggedValue::FromHeapObject(obj);
+}
+
+static TaggedValue Array_copyWithin(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    int64_t rel_target = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble())) : 0;
+    int64_t to = rel_target < 0 ? std::max<int64_t>(static_cast<int64_t>(len) + rel_target, 0) : std::min<int64_t>(rel_target, static_cast<int64_t>(len));
+    int64_t rel_start = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble())) : 0;
+    int64_t from = rel_start < 0 ? std::max<int64_t>(static_cast<int64_t>(len) + rel_start, 0) : std::min<int64_t>(rel_start, static_cast<int64_t>(len));
+    int64_t rel_end = args.size() > 2 && !args[2].IsUndefined() ? (args[2].IsSmi() ? args[2].AsSmi() : static_cast<int64_t>(args[2].ToDouble())) : static_cast<int64_t>(len);
+    int64_t final_end = rel_end < 0 ? std::max<int64_t>(static_cast<int64_t>(len) + rel_end, 0) : std::min<int64_t>(rel_end, static_cast<int64_t>(len));
+    int64_t count = std::min<int64_t>(final_end - from, static_cast<int64_t>(len) - to);
+    int64_t direction = 1;
+    if (from < to && to < from + count) {
+        direction = -1;
+        from = from + count - 1;
+        to = to + count - 1;
+    }
+    while (count > 0) {
+        TaggedValue from_val;
+        bool from_present = false;
+        if (obj->IsArray()) {
+            auto* arr = static_cast<JSArray*>(obj);
+            if (static_cast<size_t>(from) < arr->Length() && static_cast<size_t>(from) < arr->Elements().size() && !arr->Elements()[from].IsEmpty()) {
+                from_val = arr->Elements()[from];
+                from_present = true;
+            }
+        } else {
+            std::string f_str = std::to_string(from);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), f_str)) {
+                from_val = GetProperty(TaggedValue::FromHeapObject(obj), f_str);
+                from_present = true;
+            }
+        }
+        if (from_present) {
+            if (obj->IsArray()) {
+                static_cast<JSArray*>(obj)->SetElement(static_cast<size_t>(to), from_val);
+            } else {
+                SetProperty(TaggedValue::FromHeapObject(obj), std::to_string(to), from_val);
+            }
+        } else {
+            if (obj->IsArray()) {
+                static_cast<JSArray*>(obj)->SetElement(static_cast<size_t>(to), TaggedValue::Empty());
+            } else {
+                obj->DeleteNamedProperty(std::to_string(to));
+            }
+        }
+        from += direction;
+        to += direction;
+        count--;
+    }
+    return TaggedValue::FromHeapObject(obj);
+}
+
+static TaggedValue Array_at(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    int64_t relative_idx = args.empty() ? 0 : (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble()));
+    int64_t k = relative_idx >= 0 ? relative_idx : static_cast<int64_t>(len) + relative_idx;
+    if (k < 0 || static_cast<uint64_t>(k) >= len) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        return static_cast<JSArray*>(obj)->GetElement(static_cast<size_t>(k));
+    }
+    return GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(k));
+}
+
+static void FlattenIntoArray(JSArray* target, JSObject* source, uint64_t source_len, int64_t depth, TaggedValue mapper = TaggedValue::Undefined(), TaggedValue this_arg = TaggedValue::Undefined()) {
+    for (uint64_t k = 0; k < source_len; ++k) {
+        TaggedValue element;
+        bool present = false;
+        if (source->IsArray()) {
+            auto* arr = static_cast<JSArray*>(source);
+            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
+                element = arr->Elements()[k];
+                present = true;
+            }
+        } else {
+            std::string k_str = std::to_string(k);
+            if (HasProperty(TaggedValue::FromHeapObject(source), k_str)) {
+                element = GetProperty(TaggedValue::FromHeapObject(source), k_str);
+                present = true;
+            }
+        }
+        if (!present) continue;
+        if (mapper.IsHeapObject() && mapper.AsHeapObject()->IsFunction()) {
+            element = CallFunction(mapper, this_arg, {element, TaggedValue::FromDouble(static_cast<double>(k)), TaggedValue::FromHeapObject(source)});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return;
+        }
+        if (depth > 0 && element.IsHeapObject() && element.AsHeapObject()->IsArray()) {
+            auto* child_arr = static_cast<JSArray*>(element.AsHeapObject());
+            FlattenIntoArray(target, child_arr, child_arr->Length(), depth - 1);
+        } else {
+            target->Push(element);
+        }
+    }
+}
+
+static TaggedValue Array_flat(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    int64_t depth = 1;
+    if (!args.empty() && !args[0].IsUndefined()) {
+        double d = args[0].ToDouble();
+        if (std::isnan(d) || d < 0) depth = 0;
+        else if (d > 1000000.0) depth = 1000000;
+        else depth = static_cast<int64_t>(d);
+    }
+    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
         new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
     }
+    FlattenIntoArray(new_arr, obj, len, depth);
+    return TaggedValue::FromHeapObject(new_arr);
+}
+
+static TaggedValue Array_flatMap(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsFunction()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.prototype.flatMap callback must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    uint64_t len = obj->IsArray() ? static_cast<JSArray*>(obj)->Length() : ToLength(obj->GetNamedProperty("length"));
+    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    FlattenIntoArray(new_arr, obj, len, 1, cb, this_arg);
+    return TaggedValue::FromHeapObject(new_arr);
+}
+
+static TaggedValue Array_of(const std::vector<TaggedValue>& args) {
+    auto* arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, args.size());
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    for (const auto& a : args) arr->Push(a);
+    return TaggedValue::FromHeapObject(arr);
+}
+
+static TaggedValue Array_from(const std::vector<TaggedValue>& args) {
+    if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.from requires an array-like or iterable object")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue items = args[0];
+    TaggedValue map_fn = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    TaggedValue this_arg = args.size() > 2 ? args[2] : TaggedValue::Undefined();
+    bool mapping = !map_fn.IsUndefined();
+    if (mapping && (!map_fn.IsHeapObject() || !map_fn.AsHeapObject()->IsFunction())) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Array.from: when provided, the second argument must be a function")));
+        }
+        return TaggedValue::Undefined();
+    }
+    TaggedValue iter_fn = GetProperty(items, "@@iterator");
+    if (iter_fn.IsHeapObject() && iter_fn.AsHeapObject()->IsFunction()) {
+        TaggedValue iter = CallFunction(iter_fn, items, {});
+        auto* arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        uint64_t k = 0;
+        while (true) {
+            TaggedValue next_res = CallFunction(GetProperty(iter, "next"), iter, {});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            if (GetProperty(next_res, "done").ToBoolean()) break;
+            TaggedValue val = GetProperty(next_res, "value");
+            if (mapping) {
+                val = CallFunction(map_fn, this_arg, {val, TaggedValue::FromDouble(static_cast<double>(k))});
+                if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            }
+            arr->Push(val);
+            k++;
+        }
+        return TaggedValue::FromHeapObject(arr);
+    }
+    JSObject* obj = ToObject(items);
+    if (!obj) return TaggedValue::Undefined();
+    uint64_t len = ToLength(GetProperty(items, "length"));
+    auto* arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, static_cast<size_t>(len));
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    for (uint64_t k = 0; k < len; ++k) {
+        TaggedValue val = GetProperty(items, std::to_string(k));
+        if (mapping) {
+            val = CallFunction(map_fn, this_arg, {val, TaggedValue::FromDouble(static_cast<double>(k))});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        }
+        arr->Push(val);
+    }
+    return TaggedValue::FromHeapObject(arr);
+}
+
+static TaggedValue Array_splice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        int64_t len = static_cast<int64_t>(arr->Length());
+        if (args.empty()) {
+            auto* empty_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 0);
+            if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+                empty_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+            }
+            return TaggedValue::FromHeapObject(empty_arr);
+        }
+        int64_t start = args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble());
+        if (start < 0) start = std::max<int64_t>(0, len + start);
+        else start = std::min<int64_t>(len, start);
+
+        int64_t delete_count = 0;
+        if (args.size() == 1) {
+            delete_count = len - start;
+        } else {
+            int64_t dc = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble());
+            delete_count = std::clamp<int64_t>(dc, 0, len - start);
+        }
+
+        std::vector<TaggedValue> removed;
+        removed.reserve(static_cast<size_t>(delete_count));
+        for (int64_t i = 0; i < delete_count; ++i) {
+            removed.push_back(arr->GetElement(static_cast<size_t>(start + i)));
+        }
+
+        std::vector<TaggedValue>& elems = arr->Elements();
+        std::vector<TaggedValue> items_to_insert;
+        if (args.size() > 2) {
+            items_to_insert.assign(args.begin() + 2, args.end());
+        }
+
+        auto it = elems.begin() + start;
+        elems.erase(it, it + delete_count);
+        elems.insert(elems.begin() + start, items_to_insert.begin(), items_to_insert.end());
+        arr->SetLength(elems.size());
+
+        auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(removed));
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        return TaggedValue::FromHeapObject(new_arr);
+    }
+    uint64_t len = ToLength(obj->GetNamedProperty("length"));
+    int64_t start = args.empty() ? 0 : (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble()));
+    if (start < 0) start = std::max<int64_t>(0, static_cast<int64_t>(len) + start);
+    else start = std::min<int64_t>(static_cast<int64_t>(len), start);
+    int64_t delete_count = 0;
+    if (args.size() == 1) delete_count = static_cast<int64_t>(len) - start;
+    else if (args.size() > 1) {
+        int64_t dc = args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].ToDouble());
+        delete_count = std::clamp<int64_t>(dc, 0, static_cast<int64_t>(len) - start);
+    }
+    auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        new_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    for (int64_t i = 0; i < delete_count; ++i) {
+        new_arr->Push(GetProperty(TaggedValue::FromHeapObject(obj), std::to_string(start + i)));
+    }
+    int64_t insert_count = args.size() > 2 ? static_cast<int64_t>(args.size() - 2) : 0;
+    if (static_cast<int64_t>(len) + insert_count - delete_count > 9007199254740991LL) {
+        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Array splice length exceeds 2^53 - 1")));
+        return TaggedValue::Undefined();
+    }
+    if (insert_count < delete_count) {
+        for (int64_t i = start; i < static_cast<int64_t>(len) - delete_count; ++i) {
+            std::string from = std::to_string(i + delete_count);
+            std::string to = std::to_string(i + insert_count);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), from)) {
+                SetProperty(TaggedValue::FromHeapObject(obj), to, GetProperty(TaggedValue::FromHeapObject(obj), from));
+            } else {
+                obj->DeleteNamedProperty(to);
+            }
+        }
+        for (int64_t i = static_cast<int64_t>(len); i > static_cast<int64_t>(len) - delete_count + insert_count; --i) {
+            obj->DeleteNamedProperty(std::to_string(i - 1));
+        }
+    } else if (insert_count > delete_count) {
+        for (int64_t i = static_cast<int64_t>(len) - delete_count; i > start; --i) {
+            std::string from = std::to_string(i + delete_count - 1);
+            std::string to = std::to_string(i + insert_count - 1);
+            if (HasProperty(TaggedValue::FromHeapObject(obj), from)) {
+                SetProperty(TaggedValue::FromHeapObject(obj), to, GetProperty(TaggedValue::FromHeapObject(obj), from));
+            } else {
+                obj->DeleteNamedProperty(to);
+            }
+        }
+    }
+    for (int64_t i = 0; i < insert_count; ++i) {
+        SetProperty(TaggedValue::FromHeapObject(obj), std::to_string(start + i), args[2 + i]);
+    }
+    uint64_t new_len = static_cast<uint64_t>(static_cast<int64_t>(len) - delete_count + insert_count);
+    uint32_t sid = 0;
+    obj->SetNamedProperty("length", TaggedValue::FromDouble(static_cast<double>(new_len)), sid);
     return TaggedValue::FromHeapObject(new_arr);
 }
 
 static TaggedValue Array_sort(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArray()) return this_val;
-    auto* arr = static_cast<JSArray*>(this_val.AsHeapObject());
+    JSObject* obj = ToObject(this_val);
+    if (!obj) return TaggedValue::Undefined();
     TaggedValue compare_fn = args.empty() ? TaggedValue::Undefined() : args[0];
-    std::vector<TaggedValue>& elems = arr->Elements();
-
-    if (compare_fn.IsHeapObject() && compare_fn.AsHeapObject()->IsFunction()) {
-        std::stable_sort(elems.begin(), elems.end(), [&](const TaggedValue& a, const TaggedValue& b) {
-            std::vector<TaggedValue> cmp_args = {a, b};
-            TaggedValue res = CallFunction(compare_fn, TaggedValue::Undefined(), cmp_args);
-            double d = res.ToDouble();
-            return d < 0;
-        });
-    } else {
-        std::stable_sort(elems.begin(), elems.end(), [](const TaggedValue& a, const TaggedValue& b) {
-            return a.ToString() < b.ToString();
-        });
+    if (!compare_fn.IsUndefined() && (!compare_fn.IsHeapObject() || !compare_fn.AsHeapObject()->IsFunction())) {
+        if (Interpreter::Current()) {
+            Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "The comparison function must be either a function or undefined")));
+        }
+        return TaggedValue::Undefined();
+    }
+    if (obj->IsArray()) {
+        auto* arr = static_cast<JSArray*>(obj);
+        std::vector<TaggedValue>& elems = arr->Elements();
+        if (compare_fn.IsHeapObject() && compare_fn.AsHeapObject()->IsFunction()) {
+            std::stable_sort(elems.begin(), elems.end(), [&](const TaggedValue& a, const TaggedValue& b) {
+                if (a.IsUndefined() && b.IsUndefined()) return false;
+                if (a.IsUndefined()) return false;
+                if (b.IsUndefined()) return true;
+                std::vector<TaggedValue> cmp_args = {a, b};
+                TaggedValue res = CallFunction(compare_fn, TaggedValue::Undefined(), cmp_args);
+                double d = res.ToDouble();
+                return d < 0;
+            });
+        } else {
+            std::stable_sort(elems.begin(), elems.end(), [](const TaggedValue& a, const TaggedValue& b) {
+                if (a.IsUndefined() && b.IsUndefined()) return false;
+                if (a.IsUndefined()) return false;
+                if (b.IsUndefined()) return true;
+                return a.ToString() < b.ToString();
+            });
+        }
     }
     return this_val;
 }
@@ -1666,6 +2772,154 @@ static TaggedValue String_repeat(TaggedValue this_val, const std::vector<TaggedV
         res += str;
     }
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
+}
+
+static TaggedValue String_startsWith(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsRegExp()) {
+        SetTypeException("First argument to String.prototype.startsWith must not be a regular expression");
+        return TaggedValue::Undefined();
+    }
+    std::string search = args.empty() ? "undefined" : args[0].ToString();
+    int64_t pos = 0;
+    if (args.size() > 1) {
+        double p = args[1].ToDouble();
+        if (std::isnan(p) || p <= 0.0) pos = 0;
+        else pos = static_cast<int64_t>(p);
+    }
+    int64_t len = static_cast<int64_t>(s.length());
+    int64_t start = std::min<int64_t>(std::max<int64_t>(0, pos), len);
+    int64_t search_len = static_cast<int64_t>(search.length());
+    if (start + search_len > len) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(s.compare(static_cast<size_t>(start), static_cast<size_t>(search_len), search) == 0);
+}
+
+static TaggedValue String_endsWith(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsRegExp()) {
+        SetTypeException("First argument to String.prototype.endsWith must not be a regular expression");
+        return TaggedValue::Undefined();
+    }
+    std::string search = args.empty() ? "undefined" : args[0].ToString();
+    int64_t len = static_cast<int64_t>(s.length());
+    int64_t end = len;
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        double p = args[1].ToDouble();
+        if (std::isnan(p) || p <= 0.0) end = 0;
+        else end = std::min<int64_t>(len, static_cast<int64_t>(p));
+    }
+    int64_t search_len = static_cast<int64_t>(search.length());
+    if (search_len == 0) return TaggedValue::FromBoolean(true);
+    if (end < search_len) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(s.compare(static_cast<size_t>(end - search_len), static_cast<size_t>(search_len), search) == 0);
+}
+
+static TaggedValue String_padStart(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    if (args.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    int64_t max_len = static_cast<int64_t>(ToLength(args[0]));
+    int64_t str_len = static_cast<int64_t>(s.length());
+    if (max_len <= str_len) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    std::string filler = " ";
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        filler = args[1].ToString();
+        if (filler.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    }
+    int64_t fill_len = max_len - str_len;
+    std::string pad;
+    pad.reserve(fill_len);
+    while (static_cast<int64_t>(pad.length()) < fill_len) {
+        pad += filler;
+    }
+    pad.resize(static_cast<size_t>(fill_len));
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(pad + s));
+}
+
+static TaggedValue String_padEnd(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    if (args.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    int64_t max_len = static_cast<int64_t>(ToLength(args[0]));
+    int64_t str_len = static_cast<int64_t>(s.length());
+    if (max_len <= str_len) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    std::string filler = " ";
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        filler = args[1].ToString();
+        if (filler.empty()) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s));
+    }
+    int64_t fill_len = max_len - str_len;
+    std::string pad;
+    pad.reserve(fill_len);
+    while (static_cast<int64_t>(pad.length()) < fill_len) {
+        pad += filler;
+    }
+    pad.resize(static_cast<size_t>(fill_len));
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s + pad));
+}
+
+static TaggedValue String_codePointAt(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    int64_t pos = 0;
+    if (!args.empty()) {
+        double d = args[0].ToDouble();
+        if (std::isnan(d) || d < 0.0) return TaggedValue::Undefined();
+        pos = static_cast<int64_t>(d);
+    }
+    int64_t size = static_cast<int64_t>(s.size());
+    if (pos < 0 || pos >= size) return TaggedValue::Undefined();
+
+    uint8_t c0 = static_cast<uint8_t>(s[pos]);
+    if (c0 < 0x80) return TaggedValue::FromSmi(c0);
+    if ((c0 & 0xE0) == 0xC0 && pos + 1 < size) {
+        uint32_t cp = ((c0 & 0x1F) << 6) | (static_cast<uint8_t>(s[pos + 1]) & 0x3F);
+        return TaggedValue::FromSmi(static_cast<int32_t>(cp));
+    }
+    if ((c0 & 0xF0) == 0xE0 && pos + 2 < size) {
+        uint32_t cp = ((c0 & 0x0F) << 12) | ((static_cast<uint8_t>(s[pos + 1]) & 0x3F) << 6) | (static_cast<uint8_t>(s[pos + 2]) & 0x3F);
+        return TaggedValue::FromSmi(static_cast<int32_t>(cp));
+    }
+    if ((c0 & 0xF8) == 0xF0 && pos + 3 < size) {
+        uint32_t cp = ((c0 & 0x07) << 18) | ((static_cast<uint8_t>(s[pos + 1]) & 0x3F) << 12) | ((static_cast<uint8_t>(s[pos + 2]) & 0x3F) << 6) | (static_cast<uint8_t>(s[pos + 3]) & 0x3F);
+        return TaggedValue::FromSmi(static_cast<int32_t>(cp));
+    }
+    return TaggedValue::FromSmi(c0);
+}
+
+static TaggedValue String_at(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (this_val.IsUndefined() || this_val.IsNull()) {
+        SetTypeException("Cannot convert undefined or null to object");
+        return TaggedValue::Undefined();
+    }
+    std::string s = this_val.ToString();
+    int64_t len = static_cast<int64_t>(s.length());
+    int64_t rel_idx = 0;
+    if (!args.empty()) {
+        double d = args[0].ToDouble();
+        if (std::isnan(d)) rel_idx = 0;
+        else rel_idx = static_cast<int64_t>(d);
+    }
+    int64_t k = (rel_idx >= 0) ? rel_idx : (len + rel_idx);
+    if (k < 0 || k >= len) return TaggedValue::Undefined();
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s.substr(static_cast<size_t>(k), 1)));
 }
 
 static TaggedValue Function_call(TaggedValue this_val, const std::vector<TaggedValue>& args) {
@@ -2725,6 +3979,155 @@ static TaggedValue RegExp_exec(TaggedValue this_val, const std::vector<TaggedVal
     }
 }
 
+static TaggedValue RegExp_get_flags(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
+        SetTypeException("RegExp.prototype.flags getter called on non-object");
+        return TaggedValue::Undefined();
+    }
+    if (this_val.AsHeapObject()->IsRegExp()) {
+        auto* re = static_cast<JSRegExp*>(this_val.AsHeapObject());
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(re->Flags()));
+    }
+    auto* obj = static_cast<JSObject*>(this_val.AsHeapObject());
+    std::string result;
+    for (char flag : {'d', 'g', 'i', 'm', 's', 'u', 'y'}) {
+        std::string prop;
+        switch (flag) {
+            case 'd': prop = "hasIndices"; break;
+            case 'g': prop = "global"; break;
+            case 'i': prop = "ignoreCase"; break;
+            case 'm': prop = "multiline"; break;
+            case 's': prop = "dotAll"; break;
+            case 'u': prop = "unicode"; break;
+            case 'y': prop = "sticky"; break;
+        }
+        TaggedValue v = obj->GetNamedProperty(prop);
+        if (v.ToBoolean()) result.push_back(flag);
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(result));
+}
+
+static TaggedValue RegExp_get_source(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
+        SetTypeException("RegExp.prototype.source getter called on non-object");
+        return TaggedValue::Undefined();
+    }
+    if (this_val.AsHeapObject()->IsRegExp()) {
+        auto* re = static_cast<JSRegExp*>(this_val.AsHeapObject());
+        std::string pat = re->Pattern();
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(pat.empty() ? "(?:)" : pat));
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("(?:)"));
+}
+
+static TaggedValue RegExp_get_global(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('g') != std::string::npos);
+}
+
+static TaggedValue RegExp_get_ignoreCase(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('i') != std::string::npos);
+}
+
+static TaggedValue RegExp_get_multiline(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('m') != std::string::npos);
+}
+
+static TaggedValue RegExp_get_dotAll(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('s') != std::string::npos);
+}
+
+static TaggedValue RegExp_get_unicode(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('u') != std::string::npos);
+}
+
+static TaggedValue RegExp_get_sticky(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsRegExp()) return TaggedValue::FromBoolean(false);
+    return TaggedValue::FromBoolean(static_cast<JSRegExp*>(this_val.AsHeapObject())->Flags().find('y') != std::string::npos);
+}
+
+static TaggedValue RegExp_match(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
+        SetTypeException("RegExp.prototype[Symbol.match] called on non-object");
+        return TaggedValue::Undefined();
+    }
+    std::string s_str = args.empty() ? "undefined" : args[0].ToString();
+    TaggedValue str_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s_str));
+    auto* obj = static_cast<JSObject*>(this_val.AsHeapObject());
+    TaggedValue global_val = obj->GetNamedProperty("global");
+    bool global = global_val.ToBoolean();
+    if (!global) {
+        TaggedValue exec_fn = obj->GetNamedProperty("exec");
+        if (exec_fn.IsHeapObject() && exec_fn.AsHeapObject()->IsFunction()) {
+            return CallFunction(exec_fn, this_val, {str_val});
+        }
+        return RegExp_exec(this_val, {str_val});
+    }
+
+    uint32_t sid = 0;
+    obj->SetNamedProperty("lastIndex", TaggedValue::FromSmi(0), sid);
+    auto* arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+        arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+    }
+    TaggedValue exec_fn = obj->GetNamedProperty("exec");
+    while (true) {
+        TaggedValue result;
+        if (exec_fn.IsHeapObject() && exec_fn.AsHeapObject()->IsFunction()) {
+            result = CallFunction(exec_fn, this_val, {str_val});
+        } else {
+            result = RegExp_exec(this_val, {str_val});
+        }
+        if (result.IsNull()) {
+            if (arr->Length() == 0) return TaggedValue::Null();
+            return TaggedValue::FromHeapObject(arr);
+        }
+        if (!result.IsHeapObject() || !result.AsHeapObject()->IsJSObject()) {
+            SetTypeException("RegExp exec returned non-object");
+            return TaggedValue::Undefined();
+        }
+        TaggedValue match_str = static_cast<JSObject*>(result.AsHeapObject())->GetNamedProperty("0");
+        std::string match = match_str.ToString();
+        arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(match)));
+        if (match.empty()) {
+            TaggedValue last_idx = obj->GetNamedProperty("lastIndex");
+            int64_t this_idx = last_idx.IsNumber() ? static_cast<int64_t>(last_idx.AsNumber()) : 0;
+            obj->SetNamedProperty("lastIndex", TaggedValue::FromSmi(static_cast<int32_t>(this_idx + 1)), sid);
+        }
+    }
+}
+
+static TaggedValue RegExp_search(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsJSObject()) {
+        SetTypeException("RegExp.prototype[Symbol.search] called on non-object");
+        return TaggedValue::Undefined();
+    }
+    std::string s_str = args.empty() ? "undefined" : args[0].ToString();
+    TaggedValue str_val = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s_str));
+    auto* obj = static_cast<JSObject*>(this_val.AsHeapObject());
+    TaggedValue prev_last_index = obj->GetNamedProperty("lastIndex");
+    uint32_t sid = 0;
+    obj->SetNamedProperty("lastIndex", TaggedValue::FromSmi(0), sid);
+    TaggedValue exec_fn = obj->GetNamedProperty("exec");
+    TaggedValue result;
+    if (exec_fn.IsHeapObject() && exec_fn.AsHeapObject()->IsFunction()) {
+        result = CallFunction(exec_fn, this_val, {str_val});
+    } else {
+        result = RegExp_exec(this_val, {str_val});
+    }
+    obj->SetNamedProperty("lastIndex", prev_last_index, sid);
+    if (result.IsNull()) return TaggedValue::FromSmi(-1);
+    if (result.IsHeapObject() && result.AsHeapObject()->IsJSObject()) {
+        TaggedValue idx = static_cast<JSObject*>(result.AsHeapObject())->GetNamedProperty("index");
+        return idx.IsSmi() ? idx : TaggedValue::FromSmi(static_cast<int32_t>(idx.AsNumber()));
+    }
+    return TaggedValue::FromSmi(-1);
+}
+
 // Event Loop, Timer & Microtask Callbacks
 static TaggedValue Global_setTimeout(const std::vector<TaggedValue>& args) {
     if (args.empty() || !EventLoop::Current()) return TaggedValue::FromSmi(0);
@@ -2913,32 +4316,60 @@ static TaggedValue TypedArray_fill(TaggedValue this_val, const std::vector<Tagge
 }
 
 static TaggedValue TypedArray_indexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
-        return TaggedValue::FromSmi(-1);
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.indexOf called on incompatible receiver");
+        return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    if (len == 0 || args.empty()) return TaggedValue::FromSmi(-1);
     TaggedValue target = args[0];
-    size_t from = 0;
-    if (args.size() > 1 && args[1].IsNumber()) {
-        double d = args[1].AsNumber();
-        if (d > 0) from = static_cast<size_t>(d);
-    }
-    for (size_t i = from; i < ta->Length(); ++i) {
-        TaggedValue elem = ta->GetElement(i);
-        if (elem.IsNumber() && target.IsNumber() && elem.AsNumber() == target.AsNumber()) {
-            return TaggedValue::FromSmi(static_cast<int32_t>(i));
+    int64_t from = 0;
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        double d = args[1].ToDouble();
+        if (!std::isnan(d)) {
+            from = static_cast<int64_t>(d);
+            if (from < 0) from = std::max<int64_t>(0, len + from);
         }
+    }
+    for (int64_t i = from; i < len; ++i) {
+        TaggedValue elem = ta->GetElement(static_cast<size_t>(i));
+        if (StrictEquals(elem, target)) return TaggedValue::FromDouble(static_cast<double>(i));
     }
     return TaggedValue::FromSmi(-1);
 }
 
 static TaggedValue TypedArray_includes(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    TaggedValue idx = TypedArray_indexOf(this_val, args);
-    return TaggedValue::FromBoolean(idx.AsSmi() >= 0);
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.includes called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    if (len == 0 || args.empty()) return TaggedValue::FromBoolean(false);
+    TaggedValue target = args[0];
+    int64_t from = 0;
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        double d = args[1].ToDouble();
+        if (!std::isnan(d)) {
+            from = static_cast<int64_t>(d);
+            if (from < 0) from = std::max<int64_t>(0, len + from);
+        }
+    }
+    bool target_is_nan = target.IsNumber() && std::isnan(target.AsNumber());
+    for (int64_t i = from; i < len; ++i) {
+        TaggedValue elem = ta->GetElement(static_cast<size_t>(i));
+        if (target_is_nan && elem.IsNumber() && std::isnan(elem.AsNumber())) return TaggedValue::FromBoolean(true);
+        if (StrictEquals(elem, target)) return TaggedValue::FromBoolean(true);
+    }
+    return TaggedValue::FromBoolean(false);
 }
 
 static TaggedValue TypedArray_reverse(TaggedValue this_val, const std::vector<TaggedValue>&) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return this_val;
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.reverse called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     size_t n = ta->Length();
     for (size_t i = 0; i < n / 2; ++i) {
@@ -2950,9 +4381,12 @@ static TaggedValue TypedArray_reverse(TaggedValue this_val, const std::vector<Ta
 }
 
 static TaggedValue TypedArray_join(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return TaggedValue::Undefined();
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.join called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
-    std::string sep = args.size() > 0 ? args[0].ToString() : ",";
+    std::string sep = (!args.empty() && !args[0].IsUndefined()) ? args[0].ToString() : ",";
     std::string res;
     for (size_t i = 0; i < ta->Length(); ++i) {
         if (i > 0) res += sep;
@@ -2962,23 +4396,36 @@ static TaggedValue TypedArray_join(TaggedValue this_val, const std::vector<Tagge
 }
 
 static TaggedValue TypedArray_forEach(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.forEach called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.forEach: callback must be a function");
         return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     for (size_t i = 0; i < ta->Length(); ++i) {
-        CallFunction(cb, this_val, {ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        CallFunction(cb, this_arg, {ta->GetElement(i), TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     }
     return TaggedValue::Undefined();
 }
 
 static TaggedValue TypedArray_map(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.map called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.map: callback must be a function");
         return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
     auto* ab = AllocateRuntime<JSArrayBuffer>(ta->Length() * ta->BytesPerElement(), root_shape);
     if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
@@ -2989,22 +4436,30 @@ static TaggedValue TypedArray_map(TaggedValue this_val, const std::vector<Tagged
         new_ta->SetPrototype(ta->GetPrototype());
     }
     for (size_t i = 0; i < ta->Length(); ++i) {
-        TaggedValue res = CallFunction(cb, this_val, {ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {ta->GetElement(i), TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         new_ta->SetElement(i, res);
     }
     return TaggedValue::FromHeapObject(new_ta);
 }
 
 static TaggedValue TypedArray_filter(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.filter called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.filter: callback must be a function");
         return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     std::vector<TaggedValue> kept;
     for (size_t i = 0; i < ta->Length(); ++i) {
         TaggedValue el = ta->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         if (res.ToBoolean()) {
             kept.push_back(el);
         }
@@ -3025,35 +4480,52 @@ static TaggedValue TypedArray_filter(TaggedValue this_val, const std::vector<Tag
 }
 
 static TaggedValue TypedArray_reduce(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.reduce called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.reduce: callback must be a function");
         return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
-    if (ta->Length() == 0 && args.size() < 2) return TaggedValue::Undefined();
+    int64_t len = static_cast<int64_t>(ta->Length());
     TaggedValue cb = args[0];
     size_t i = 0;
     TaggedValue accum;
     if (args.size() > 1) {
         accum = args[1];
     } else {
+        if (len == 0) {
+            SetTypeException("Reduce of empty typed array with no initial value");
+            return TaggedValue::Undefined();
+        }
         accum = ta->GetElement(0);
         i = 1;
     }
-    for (; i < ta->Length(); ++i) {
-        accum = CallFunction(cb, this_val, {accum, ta->GetElement(i), TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+    for (; i < static_cast<size_t>(len); ++i) {
+        accum = CallFunction(cb, TaggedValue::Undefined(), {accum, ta->GetElement(i), TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     }
     return accum;
 }
 
 static TaggedValue TypedArray_find(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.find called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.find: callback must be a function");
         return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     for (size_t i = 0; i < ta->Length(); ++i) {
         TaggedValue el = ta->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         if (res.ToBoolean()) {
             return el;
         }
@@ -3062,23 +4534,33 @@ static TaggedValue TypedArray_find(TaggedValue this_val, const std::vector<Tagge
 }
 
 static TaggedValue TypedArray_findIndex(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
-        return TaggedValue::FromSmi(-1);
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.findIndex called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.findIndex: callback must be a function");
+        return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     for (size_t i = 0; i < ta->Length(); ++i) {
         TaggedValue el = ta->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         if (res.ToBoolean()) {
-            return TaggedValue::FromSmi(static_cast<int32_t>(i));
+            return TaggedValue::FromDouble(static_cast<double>(i));
         }
     }
     return TaggedValue::FromSmi(-1);
 }
 
 static TaggedValue TypedArray_sort(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) return this_val;
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.sort called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     size_t n = ta->Length();
     if (n <= 1) return this_val;
@@ -3086,9 +4568,13 @@ static TaggedValue TypedArray_sort(TaggedValue this_val, const std::vector<Tagge
     elems.reserve(n);
     for (size_t i = 0; i < n; ++i) elems.push_back(ta->GetElement(i));
 
-    if (!args.empty() && args[0].IsHeapObject() && (args[0].AsHeapObject()->IsFunction() || args[0].AsHeapObject()->IsNativeFunction())) {
+    if (!args.empty() && !args[0].IsUndefined()) {
+        if (!args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+            SetTypeException("The comparison function must be either a function or undefined");
+            return TaggedValue::Undefined();
+        }
         TaggedValue cmp_fn = args[0];
-        std::stable_sort(elems.begin(), elems.end(), [this_val, cmp_fn](TaggedValue a, TaggedValue b) {
+        std::stable_sort(elems.begin(), elems.end(), [cmp_fn](TaggedValue a, TaggedValue b) {
             TaggedValue r = CallFunction(cmp_fn, TaggedValue::Undefined(), {a, b});
             return r.IsNumber() && r.AsNumber() < 0;
         });
@@ -3109,31 +4595,273 @@ static TaggedValue TypedArray_sort(TaggedValue this_val, const std::vector<Tagge
 }
 
 static TaggedValue TypedArray_every(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
-        return TaggedValue::FromBoolean(true);
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.every called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.every: callback must be a function");
+        return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     for (size_t i = 0; i < ta->Length(); ++i) {
         TaggedValue el = ta->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         if (!res.ToBoolean()) return TaggedValue::FromBoolean(false);
     }
     return TaggedValue::FromBoolean(true);
 }
 
 static TaggedValue TypedArray_some(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray() || args.empty()) {
-        return TaggedValue::FromBoolean(false);
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.some called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.some: callback must be a function");
+        return TaggedValue::Undefined();
     }
     auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
     TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
     for (size_t i = 0; i < ta->Length(); ++i) {
         TaggedValue el = ta->GetElement(i);
-        TaggedValue res = CallFunction(cb, this_val, {el, TaggedValue::FromSmi(static_cast<int32_t>(i)), this_val});
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
         if (res.ToBoolean()) return TaggedValue::FromBoolean(true);
     }
     return TaggedValue::FromBoolean(false);
+}
+
+static TaggedValue TypedArray_at(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.at called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    int64_t relative_idx = args.empty() ? 0 : (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].ToDouble()));
+    int64_t k = relative_idx >= 0 ? relative_idx : len + relative_idx;
+    if (k < 0 || k >= len) return TaggedValue::Undefined();
+    return ta->GetElement(static_cast<size_t>(k));
+}
+
+static TaggedValue TypedArray_findLast(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.findLast called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.findLast: callback must be a function");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    int64_t len = static_cast<int64_t>(ta->Length());
+    for (int64_t i = len - 1; i >= 0; --i) {
+        TaggedValue el = ta->GetElement(static_cast<size_t>(i));
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (res.ToBoolean()) return el;
+    }
+    return TaggedValue::Undefined();
+}
+
+static TaggedValue TypedArray_findLastIndex(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.findLastIndex called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.findLastIndex: callback must be a function");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    TaggedValue cb = args[0];
+    TaggedValue this_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    int64_t len = static_cast<int64_t>(ta->Length());
+    for (int64_t i = len - 1; i >= 0; --i) {
+        TaggedValue el = ta->GetElement(static_cast<size_t>(i));
+        TaggedValue res = CallFunction(cb, this_arg, {el, TaggedValue::FromDouble(static_cast<double>(i)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (res.ToBoolean()) return TaggedValue::FromDouble(static_cast<double>(i));
+    }
+    return TaggedValue::FromSmi(-1);
+}
+
+static TaggedValue TypedArray_lastIndexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.lastIndexOf called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    if (len == 0 || args.empty()) return TaggedValue::FromSmi(-1);
+    TaggedValue target = args[0];
+    int64_t from = len - 1;
+    if (args.size() > 1 && !args[1].IsUndefined()) {
+        double d = args[1].ToDouble();
+        if (std::isnan(d)) return TaggedValue::FromSmi(-1);
+        from = static_cast<int64_t>(d);
+        if (from >= 0) from = std::min(from, len - 1);
+        else from = len + from;
+    }
+    if (from < 0) return TaggedValue::FromSmi(-1);
+    for (int64_t i = from; i >= 0; --i) {
+        TaggedValue el = ta->GetElement(static_cast<size_t>(i));
+        if (StrictEquals(el, target)) return TaggedValue::FromDouble(static_cast<double>(i));
+    }
+    return TaggedValue::FromSmi(-1);
+}
+
+static TaggedValue TypedArray_reduceRight(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.reduceRight called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    if (args.empty() || !args[0].IsHeapObject() || (!args[0].AsHeapObject()->IsFunction() && !args[0].AsHeapObject()->IsNativeFunction())) {
+        SetTypeException("TypedArray.prototype.reduceRight: callback must be a function");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    TaggedValue cb = args[0];
+    TaggedValue accum = TaggedValue::Undefined();
+    int64_t k = len - 1;
+    if (args.size() > 1) {
+        accum = args[1];
+    } else {
+        if (len == 0) {
+            SetTypeException("Reduce of empty typed array with no initial value");
+            return TaggedValue::Undefined();
+        }
+        accum = ta->GetElement(static_cast<size_t>(k));
+        --k;
+    }
+    for (; k >= 0; --k) {
+        accum = CallFunction(cb, TaggedValue::Undefined(), {accum, ta->GetElement(static_cast<size_t>(k)), TaggedValue::FromDouble(static_cast<double>(k)), this_val});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+    }
+    return accum;
+}
+
+static TaggedValue TypedArray_copyWithin(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.copyWithin called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    int64_t target = args.empty() ? 0 : static_cast<int64_t>(args[0].ToDouble());
+    int64_t start = args.size() > 1 ? static_cast<int64_t>(args[1].ToDouble()) : 0;
+    int64_t end = args.size() > 2 ? static_cast<int64_t>(args[2].ToDouble()) : len;
+
+    int64_t to = target < 0 ? std::max<int64_t>(len + target, 0) : std::min<int64_t>(target, len);
+    int64_t from = start < 0 ? std::max<int64_t>(len + start, 0) : std::min<int64_t>(start, len);
+    int64_t final_end = end < 0 ? std::max<int64_t>(len + end, 0) : std::min<int64_t>(end, len);
+
+    int64_t count = std::min<int64_t>(final_end - from, len - to);
+    if (count <= 0) return this_val;
+
+    std::vector<TaggedValue> temp(count);
+    for (int64_t i = 0; i < count; ++i) {
+        temp[i] = ta->GetElement(static_cast<size_t>(from + i));
+    }
+    for (int64_t i = 0; i < count; ++i) {
+        ta->SetElement(static_cast<size_t>(to + i), temp[i]);
+    }
+    return this_val;
+}
+
+static TaggedValue TypedArray_toReversed(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.toReversed called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    size_t len = ta->Length();
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    size_t elem_size = TypedArrayElementSize(ta->Kind());
+    auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, len, root_shape);
+    if (ta->GetPrototype()) new_ta->SetPrototype(ta->GetPrototype());
+    for (size_t i = 0; i < len; ++i) {
+        new_ta->SetElement(i, ta->GetElement(len - 1 - i));
+    }
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_toSorted(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.toSorted called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    size_t len = ta->Length();
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    size_t elem_size = TypedArrayElementSize(ta->Kind());
+    auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, len, root_shape);
+    if (ta->GetPrototype()) new_ta->SetPrototype(ta->GetPrototype());
+    for (size_t i = 0; i < len; ++i) {
+        new_ta->SetElement(i, ta->GetElement(i));
+    }
+    TypedArray_sort(TaggedValue::FromHeapObject(new_ta), args);
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_with(TaggedValue this_val, const std::vector<TaggedValue>& args) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.with called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    int64_t len = static_cast<int64_t>(ta->Length());
+    int64_t relative_idx = args.empty() ? 0 : static_cast<int64_t>(args[0].ToDouble());
+    int64_t actual_idx = relative_idx >= 0 ? relative_idx : len + relative_idx;
+    if (actual_idx < 0 || actual_idx >= len) {
+        SetRangeException("Index out of range in TypedArray.prototype.with");
+        return TaggedValue::Undefined();
+    }
+    TaggedValue value = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    size_t elem_size = TypedArrayElementSize(ta->Kind());
+    auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
+    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+    }
+    auto* new_ta = AllocateRuntime<JSTypedArray>(ta->Kind(), ab, 0, static_cast<size_t>(len), root_shape);
+    if (ta->GetPrototype()) new_ta->SetPrototype(ta->GetPrototype());
+    for (int64_t i = 0; i < len; ++i) {
+        if (i == actual_idx) new_ta->SetElement(static_cast<size_t>(i), value);
+        else new_ta->SetElement(static_cast<size_t>(i), ta->GetElement(static_cast<size_t>(i)));
+    }
+    return TaggedValue::FromHeapObject(new_ta);
+}
+
+static TaggedValue TypedArray_toLocaleString(TaggedValue this_val, const std::vector<TaggedValue>&) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+        SetTypeException("Method TypedArray.prototype.toLocaleString called on incompatible receiver");
+        return TaggedValue::Undefined();
+    }
+    auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+    size_t len = ta->Length();
+    std::string res;
+    for (size_t i = 0; i < len; ++i) {
+        if (i > 0) res += ",";
+        res += ta->GetElement(i).ToString();
+    }
+    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
 }
 
 // DataView Methods
@@ -4030,27 +5758,37 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     console_object_->SetNamedProperty("log", TaggedValue::FromHeapObject(make_native("log", &Console_log)), next_shape_id_);
 
     // Array Prototype Methods
-    array_prototype_->SetNamedProperty("push", TaggedValue::FromHeapObject(make_native("push", &Array_push)), next_shape_id_);
-    array_prototype_->SetNamedProperty("pop", TaggedValue::FromHeapObject(make_native("pop", &Array_pop)), next_shape_id_);
-    array_prototype_->SetNamedProperty("shift", TaggedValue::FromHeapObject(make_native("shift", &Array_shift)), next_shape_id_);
-    array_prototype_->SetNamedProperty("unshift", TaggedValue::FromHeapObject(make_native("unshift", &Array_unshift)), next_shape_id_);
-    array_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &Array_slice)), next_shape_id_);
-    array_prototype_->SetNamedProperty("splice", TaggedValue::FromHeapObject(make_native("splice", &Array_splice)), next_shape_id_);
-    array_prototype_->SetNamedProperty("sort", TaggedValue::FromHeapObject(make_native("sort", &Array_sort)), next_shape_id_);
-    array_prototype_->SetNamedProperty("join", TaggedValue::FromHeapObject(make_native("join", &Array_join)), next_shape_id_);
-    array_prototype_->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Array_toString)), next_shape_id_);
-    array_prototype_->SetNamedProperty("toLocaleString", TaggedValue::FromHeapObject(make_native("toLocaleString", &Array_toLocaleString)), next_shape_id_);
-    array_prototype_->SetNamedProperty("indexOf", TaggedValue::FromHeapObject(make_native("indexOf", &Array_indexOf)), next_shape_id_);
-    array_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &Array_includes)), next_shape_id_);
-    array_prototype_->SetNamedProperty("reverse", TaggedValue::FromHeapObject(make_native("reverse", &Array_reverse)), next_shape_id_);
-    array_prototype_->SetNamedProperty("concat", TaggedValue::FromHeapObject(make_native("concat", &Array_concat)), next_shape_id_);
-    array_prototype_->SetNamedProperty("map", TaggedValue::FromHeapObject(make_native("map", &Array_map)), next_shape_id_);
-    array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &Array_filter)), next_shape_id_);
-    array_prototype_->SetNamedProperty("forEach", TaggedValue::FromHeapObject(make_native("forEach", &Array_forEach)), next_shape_id_);
-    array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &Array_reduce)), next_shape_id_);
-    auto* arr_values = make_native("values", &Array_values);
-    auto* arr_keys = make_native("keys", &Array_keys);
-    auto* arr_entries = make_native("entries", &Array_entries);
+    array_prototype_->SetNamedProperty("push", TaggedValue::FromHeapObject(make_native("push", &Array_push, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("pop", TaggedValue::FromHeapObject(make_native("pop", &Array_pop, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("shift", TaggedValue::FromHeapObject(make_native("shift", &Array_shift, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("unshift", TaggedValue::FromHeapObject(make_native("unshift", &Array_unshift, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &Array_slice, 2)), next_shape_id_);
+    array_prototype_->SetNamedProperty("splice", TaggedValue::FromHeapObject(make_native("splice", &Array_splice, 2)), next_shape_id_);
+    array_prototype_->SetNamedProperty("sort", TaggedValue::FromHeapObject(make_native("sort", &Array_sort, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("join", TaggedValue::FromHeapObject(make_native("join", &Array_join, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("toString", TaggedValue::FromHeapObject(make_native("toString", &Array_toString, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("toLocaleString", TaggedValue::FromHeapObject(make_native("toLocaleString", &Array_toLocaleString, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("indexOf", TaggedValue::FromHeapObject(make_native("indexOf", &Array_indexOf, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &Array_includes, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("reverse", TaggedValue::FromHeapObject(make_native("reverse", &Array_reverse, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("concat", TaggedValue::FromHeapObject(make_native("concat", &Array_concat, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("map", TaggedValue::FromHeapObject(make_native("map", &Array_map, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &Array_filter, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("forEach", TaggedValue::FromHeapObject(make_native("forEach", &Array_forEach, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &Array_reduce, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("reduceRight", TaggedValue::FromHeapObject(make_native("reduceRight", &Array_reduceRight, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("some", TaggedValue::FromHeapObject(make_native("some", &Array_some, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("every", TaggedValue::FromHeapObject(make_native("every", &Array_every, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("find", TaggedValue::FromHeapObject(make_native("find", &Array_find, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("findIndex", TaggedValue::FromHeapObject(make_native("findIndex", &Array_findIndex, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("fill", TaggedValue::FromHeapObject(make_native("fill", &Array_fill, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("copyWithin", TaggedValue::FromHeapObject(make_native("copyWithin", &Array_copyWithin, 2)), next_shape_id_);
+    array_prototype_->SetNamedProperty("flat", TaggedValue::FromHeapObject(make_native("flat", &Array_flat, 0)), next_shape_id_);
+    array_prototype_->SetNamedProperty("flatMap", TaggedValue::FromHeapObject(make_native("flatMap", &Array_flatMap, 1)), next_shape_id_);
+    array_prototype_->SetNamedProperty("at", TaggedValue::FromHeapObject(make_native("at", &Array_at, 1)), next_shape_id_);
+    auto* arr_values = make_native("values", &Array_values, 0);
+    auto* arr_keys = make_native("keys", &Array_keys, 0);
+    auto* arr_entries = make_native("entries", &Array_entries, 0);
     array_prototype_->SetNamedProperty("values", TaggedValue::FromHeapObject(arr_values), next_shape_id_);
     array_prototype_->SetNamedProperty("keys", TaggedValue::FromHeapObject(arr_keys), next_shape_id_);
     array_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(arr_entries), next_shape_id_);
@@ -4066,15 +5804,19 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             for (const auto& a : a_args) arr->Push(a);
         }
         return TaggedValue::FromHeapObject(arr);
-    });
+    }, 1);
     array_ctor->SetIsConstructor(true);
     array_ctor->SetNamedProperty("isArray", TaggedValue::FromHeapObject(make_native("isArray", &Array_isArray, 1)), next_shape_id_);
     array_ctor->SetOwnPropertyAttributes("isArray", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    array_ctor->SetNamedProperty("from", TaggedValue::FromHeapObject(make_native("from", &Array_from, 1)), next_shape_id_);
+    array_ctor->SetOwnPropertyAttributes("from", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    array_ctor->SetNamedProperty("of", TaggedValue::FromHeapObject(make_native("of", &Array_of, 0)), next_shape_id_);
+    array_ctor->SetOwnPropertyAttributes("of", PropertyAttributes::Writable | PropertyAttributes::Configurable);
     array_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(array_prototype_), next_shape_id_);
     array_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     array_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(array_ctor), next_shape_id_);
     array_prototype_->SetNamedProperty("length", TaggedValue::FromSmi(0), next_shape_id_);
-    for (const char* arr_meth : {"push", "pop", "shift", "unshift", "slice", "splice", "sort", "join", "toString", "toLocaleString", "indexOf", "includes", "reverse", "concat", "map", "filter", "forEach", "reduce", "values", "keys", "entries", "constructor"}) {
+    for (const char* arr_meth : {"push", "pop", "shift", "unshift", "slice", "splice", "sort", "join", "toString", "toLocaleString", "indexOf", "includes", "reverse", "concat", "map", "filter", "forEach", "reduce", "reduceRight", "some", "every", "find", "findIndex", "fill", "copyWithin", "flat", "flatMap", "at", "values", "keys", "entries", "constructor"}) {
         array_prototype_->SetOwnPropertyAttributes(arr_meth, PropertyAttributes::Writable | PropertyAttributes::Configurable);
     }
 
@@ -4094,6 +5836,12 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     string_prototype_->SetNamedProperty("includes", TaggedValue::FromHeapObject(make_native("includes", &String_includes)), next_shape_id_);
     string_prototype_->SetNamedProperty("replace", TaggedValue::FromHeapObject(make_native("replace", &String_replace)), next_shape_id_);
     string_prototype_->SetNamedProperty("repeat", TaggedValue::FromHeapObject(make_native("repeat", &String_repeat)), next_shape_id_);
+    string_prototype_->SetNamedProperty("startsWith", TaggedValue::FromHeapObject(make_native("startsWith", &String_startsWith, 1)), next_shape_id_);
+    string_prototype_->SetNamedProperty("endsWith", TaggedValue::FromHeapObject(make_native("endsWith", &String_endsWith, 1)), next_shape_id_);
+    string_prototype_->SetNamedProperty("padStart", TaggedValue::FromHeapObject(make_native("padStart", &String_padStart, 1)), next_shape_id_);
+    string_prototype_->SetNamedProperty("padEnd", TaggedValue::FromHeapObject(make_native("padEnd", &String_padEnd, 1)), next_shape_id_);
+    string_prototype_->SetNamedProperty("codePointAt", TaggedValue::FromHeapObject(make_native("codePointAt", &String_codePointAt, 1)), next_shape_id_);
+    string_prototype_->SetNamedProperty("at", TaggedValue::FromHeapObject(make_native("at", &String_at, 1)), next_shape_id_);
     auto* str_iter = make_native("values", &String_iterator);
     string_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(str_iter), next_shape_id_);
 
@@ -4158,8 +5906,33 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     // RegExp Prototype & Constructor
     regexp_prototype_->SetNamedProperty("test", TaggedValue::FromHeapObject(make_native("test", &RegExp_test)), next_shape_id_);
     regexp_prototype_->SetNamedProperty("exec", TaggedValue::FromHeapObject(make_native("exec", &RegExp_exec)), next_shape_id_);
+    auto make_re_accessor = [this, &heap](std::string_view name, auto getter_fn) {
+        auto* get = heap.AllocateOld<JSNativeFunction>(std::string("get ") + std::string(name), getter_fn, nullptr, 0);
+        regexp_prototype_->SetAccessor(name, TaggedValue::FromHeapObject(get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+    };
+    make_re_accessor("flags", &RegExp_get_flags);
+    make_re_accessor("source", &RegExp_get_source);
+    make_re_accessor("global", &RegExp_get_global);
+    make_re_accessor("ignoreCase", &RegExp_get_ignoreCase);
+    make_re_accessor("multiline", &RegExp_get_multiline);
+    make_re_accessor("dotAll", &RegExp_get_dotAll);
+    make_re_accessor("unicode", &RegExp_get_unicode);
+    make_re_accessor("sticky", &RegExp_get_sticky);
+
+    regexp_prototype_->SetNamedProperty("@@match", TaggedValue::FromHeapObject(make_native("[Symbol.match]", &RegExp_match, 1)), next_shape_id_);
+    regexp_prototype_->SetOwnPropertyAttributes("@@match", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    regexp_prototype_->SetNamedProperty("@@search", TaggedValue::FromHeapObject(make_native("[Symbol.search]", &RegExp_search, 1)), next_shape_id_);
+    regexp_prototype_->SetOwnPropertyAttributes("@@search", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
+    auto* species_get = heap.AllocateOld<JSNativeFunction>("get [Symbol.species]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        return this_val;
+    }, nullptr, 0);
+
     auto* regexp_ctor = make_native("RegExp", &RegExp_ctor);
     regexp_ctor->SetIsConstructor(true);
+    regexp_ctor->SetAccessor("@@species", TaggedValue::FromHeapObject(species_get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+    promise_ctor->SetAccessor("@@species", TaggedValue::FromHeapObject(species_get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+    array_ctor->SetAccessor("@@species", TaggedValue::FromHeapObject(species_get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
     regexp_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(regexp_prototype_), next_shape_id_);
     regexp_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(regexp_ctor), next_shape_id_);
 
@@ -4323,23 +6096,31 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         object_prototype_->SetOwnPropertyAttributes(op_prop, PropertyAttributes::Writable | PropertyAttributes::Configurable);
     }
     object_ctor->SetNamedProperty("create", TaggedValue::FromHeapObject(make_native("create", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || (!args[0].IsNull() && (!args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()))) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Object prototype may only be an Object or null")));
+            }
+            return TaggedValue::Undefined();
+        }
         auto* obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
-        if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
-            obj->SetPrototype(static_cast<JSObject*>(args[0].AsHeapObject()));
-        } else if (args.empty() || args[0].IsNull()) {
+        if (args[0].IsNull()) {
             obj->SetPrototype(nullptr);
-        } else if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
-            obj->SetPrototype(Realm::Current()->GetObjectPrototype());
+        } else {
+            obj->SetPrototype(static_cast<JSObject*>(args[0].AsHeapObject()));
+        }
+        if (args.size() > 1 && !args[1].IsUndefined()) {
+            return ObjectDefineProperties(TaggedValue::FromHeapObject(obj), args[1]);
         }
         return TaggedValue::FromHeapObject(obj);
-    })), next_shape_id_);
+    }, 2)), next_shape_id_);
     object_ctor->SetNamedProperty("getPrototypeOf", TaggedValue::FromHeapObject(make_native("getPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Null();
         }
         return GetPrototypeOf(args[0]);
-    })), next_shape_id_);
+    }, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("setPrototypeOf", TaggedValue::FromHeapObject(make_native("setPrototypeOf", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
@@ -4356,7 +6137,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return TaggedValue::Undefined();
         }
         return args[0];
-    })), next_shape_id_);
+    }, 2)), next_shape_id_);
     object_ctor->SetNamedProperty("keys", TaggedValue::FromHeapObject(make_native("keys", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
@@ -4392,7 +6173,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             }
         }
         return TaggedValue::FromHeapObject(arr);
-    })), next_shape_id_);
+    }, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("getOwnPropertyNames", TaggedValue::FromHeapObject(make_native("getOwnPropertyNames", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
@@ -4413,148 +6194,133 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             }
         }
         return TaggedValue::FromHeapObject(arr);
-    })), next_shape_id_);
+    }, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("getOwnPropertySymbols", TaggedValue::FromHeapObject(make_native("getOwnPropertySymbols", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
+            return TaggedValue::Undefined();
+        }
+        JSObject* obj = ToObject(args[0]);
+        if (!obj) return TaggedValue::Undefined();
+        Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+        auto* arr = AllocateRuntime<JSArray>(root);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        TaggedValue all_keys = GetOwnKeys(TaggedValue::FromHeapObject(obj));
+        if (all_keys.IsHeapObject() && all_keys.AsHeapObject()->IsArray()) {
+            auto* k_arr = static_cast<JSArray*>(all_keys.AsHeapObject());
+            for (size_t i = 0; i < k_arr->Length(); ++i) {
+                TaggedValue k = k_arr->GetElement(i);
+                std::string k_str = k.ToString();
+                if (k.IsSymbol() || k_str.rfind("@@", 0) == 0) {
+                    arr->Push(k);
+                }
+            }
+        }
+        return TaggedValue::FromHeapObject(arr);
+    }, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("defineProperty", TaggedValue::FromHeapObject(make_native("defineProperty", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.defineProperty called on non-object")));
             return TaggedValue::Undefined();
         }
         std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            return TaggedValue::Undefined();
+        }
         TaggedValue desc = args.size() > 2 ? args[2] : TaggedValue::Undefined();
         if (args[0].AsHeapObject()->IsProxy()) {
             ProxyDefineProperty(static_cast<JSProxy*>(args[0].AsHeapObject()), key, desc);
             return args[0];
         }
-        TaggedValue get_fn = TaggedValue::Undefined();
-        TaggedValue set_fn = TaggedValue::Undefined();
-        bool has_accessor = false;
-        bool has_data = false;
-        bool enumerable = false;
-        bool configurable = false;
-        bool writable = false;
-        if (desc.IsHeapObject() && desc.AsHeapObject()->IsECMAObject()) {
-            has_accessor = HasProperty(desc, "get") || HasProperty(desc, "set");
-            has_data = HasProperty(desc, "value") || HasProperty(desc, "writable");
-            get_fn = GetProperty(desc, "get");
-            set_fn = GetProperty(desc, "set");
-            enumerable = HasProperty(desc, "enumerable") && GetProperty(desc, "enumerable").ToBoolean();
-            configurable = HasProperty(desc, "configurable") && GetProperty(desc, "configurable").ToBoolean();
-            writable = HasProperty(desc, "writable") && GetProperty(desc, "writable").ToBoolean();
-        }
-        if (has_accessor && has_data) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Invalid property descriptor")));
+        if (!DefinePropertyOnObject(static_cast<JSObject*>(args[0].AsHeapObject()), key, desc)) {
             return TaggedValue::Undefined();
-        }
-        if (has_accessor && args[0].AsHeapObject()->IsJSObject()) {
-            auto* obj = static_cast<JSObject*>(args[0].AsHeapObject());
-            obj->SetAccessor(key, get_fn, set_fn,
-                static_cast<PropertyAttributes>((enumerable ? static_cast<uint8_t>(PropertyAttributes::Enumerable) : 0) |
-                                                (configurable ? static_cast<uint8_t>(PropertyAttributes::Configurable) : 0)));
-            return args[0];
-        }
-        TaggedValue val = TaggedValue::Undefined();
-        if (desc.IsHeapObject() && desc.AsHeapObject()->IsECMAObject()) {
-            val = GetProperty(desc, "value");
-        }
-        SetProperty(args[0], key, val);
-        if (args[0].AsHeapObject()->IsJSObject()) {
-            static_cast<JSObject*>(args[0].AsHeapObject())->SetOwnPropertyAttributes(
-                key, static_cast<PropertyAttributes>((writable ? static_cast<uint8_t>(PropertyAttributes::Writable) : 0) |
-                                                      (enumerable ? static_cast<uint8_t>(PropertyAttributes::Enumerable) : 0) |
-                                                      (configurable ? static_cast<uint8_t>(PropertyAttributes::Configurable) : 0)));
         }
         return args[0];
-    })), next_shape_id_);
+    }, 3)), next_shape_id_);
     object_ctor->SetNamedProperty("defineProperties", TaggedValue::FromHeapObject(make_native("defineProperties", [](const std::vector<TaggedValue>& args) -> TaggedValue {
-        if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
-            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Object.defineProperties called on non-object")));
-            return TaggedValue::Undefined();
-        }
-        if (args.size() < 2 || args[1].IsNull() || args[1].IsUndefined()) {
+        TaggedValue target = !args.empty() ? args[0] : TaggedValue::Undefined();
+        TaggedValue props = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+        return ObjectDefineProperties(target, props);
+    }, 2)), next_shape_id_);
+    object_ctor->SetNamedProperty("getOwnPropertyDescriptor", TaggedValue::FromHeapObject(make_native("getOwnPropertyDescriptor", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
             return TaggedValue::Undefined();
         }
-        TaggedValue target = args[0];
-        TaggedValue props = args[1];
-        if (!props.IsHeapObject() || !props.AsHeapObject()->IsJSObject()) {
-            return target;
-        }
-        auto keys_val = GetOwnKeys(props);
-        if (keys_val.IsHeapObject() && keys_val.AsHeapObject()->IsArray()) {
-            auto* keys_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
-            for (size_t i = 0; i < keys_arr->Length(); ++i) {
-                TaggedValue k = keys_arr->GetElement(i);
-                std::string key_str = k.ToString();
-                TaggedValue desc = GetProperty(props, key_str);
-                if (desc.IsHeapObject() && desc.AsHeapObject()->IsECMAObject()) {
-                    if (target.AsHeapObject()->IsProxy()) {
-                        ProxyDefineProperty(static_cast<JSProxy*>(target.AsHeapObject()), key_str, desc);
-                        continue;
-                    }
-                    bool has_accessor = HasProperty(desc, "get") || HasProperty(desc, "set");
-                    bool has_data = HasProperty(desc, "value") || HasProperty(desc, "writable");
-                    TaggedValue get_fn = GetProperty(desc, "get");
-                    TaggedValue set_fn = GetProperty(desc, "set");
-                    bool enumerable = HasProperty(desc, "enumerable") && GetProperty(desc, "enumerable").ToBoolean();
-                    bool configurable = HasProperty(desc, "configurable") && GetProperty(desc, "configurable").ToBoolean();
-                    bool writable = HasProperty(desc, "writable") && GetProperty(desc, "writable").ToBoolean();
-                    if (has_accessor && has_data) {
-                        if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Invalid property descriptor")));
-                        return TaggedValue::Undefined();
-                    }
-                    if (has_accessor && target.AsHeapObject()->IsJSObject()) {
-                        auto* obj = static_cast<JSObject*>(target.AsHeapObject());
-                        obj->SetAccessor(key_str, get_fn, set_fn,
-                            static_cast<PropertyAttributes>((enumerable ? static_cast<uint8_t>(PropertyAttributes::Enumerable) : 0) |
-                                                            (configurable ? static_cast<uint8_t>(PropertyAttributes::Configurable) : 0)));
-                        continue;
-                    }
-                    TaggedValue val = TaggedValue::Undefined();
-                    if (HasProperty(desc, "value")) {
-                        val = GetProperty(desc, "value");
-                    }
-                    SetProperty(target, key_str, val);
-                    if (target.AsHeapObject()->IsJSObject()) {
-                        static_cast<JSObject*>(target.AsHeapObject())->SetOwnPropertyAttributes(
-                            key_str, static_cast<PropertyAttributes>((writable ? static_cast<uint8_t>(PropertyAttributes::Writable) : 0) |
-                                                                  (enumerable ? static_cast<uint8_t>(PropertyAttributes::Enumerable) : 0) |
-                                                                  (configurable ? static_cast<uint8_t>(PropertyAttributes::Configurable) : 0)));
-                    }
-                }
-            }
-        }
-        return target;
-    })), next_shape_id_);
-    object_ctor->SetNamedProperty("getOwnPropertyDescriptor", TaggedValue::FromHeapObject(make_native("getOwnPropertyDescriptor", [](const std::vector<TaggedValue>& args) -> TaggedValue {
-        if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsECMAObject()) {
+        JSObject* obj = ToObject(args[0]);
+        if (!obj) return TaggedValue::Undefined();
+        std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
             return TaggedValue::Undefined();
         }
-        std::string key = args.size() > 1 ? ToPropertyKeyString(args[1]) : "undefined";
-        if (args[0].AsHeapObject()->IsProxy()) {
-            return ProxyGetOwnPropertyDescriptor(static_cast<JSProxy*>(args[0].AsHeapObject()), key);
+        if (obj->IsProxy()) {
+            return ProxyGetOwnPropertyDescriptor(static_cast<JSProxy*>(obj), key);
         }
-        if (args[0].AsHeapObject()->IsJSObject()) {
-            auto* obj = static_cast<JSObject*>(args[0].AsHeapObject());
-            if (obj->HasOwnProperty(key)) {
-                Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
-                auto* desc = AllocateRuntime<JSObject>(root);
-                uint32_t sid = 9400;
-                if (const auto* accessor = obj->GetAccessor(key)) {
-                    desc->SetNamedProperty("get", accessor->getter, sid);
-                    desc->SetNamedProperty("set", accessor->setter, sid);
-                } else {
-                    desc->SetNamedProperty("value", obj->GetNamedProperty(key), sid);
-                    PropertyAttributes attrs = obj->GetOwnPropertyAttributes(key);
-                    desc->SetNamedProperty("writable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Writable), sid);
-                }
+        if (obj->HasOwnProperty(key)) {
+            Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+            auto* desc = AllocateRuntime<JSObject>(root);
+            uint32_t sid = 9400;
+            if (const auto* accessor = obj->GetAccessor(key)) {
+                desc->SetNamedProperty("get", accessor->getter, sid);
+                desc->SetNamedProperty("set", accessor->setter, sid);
+            } else {
+                desc->SetNamedProperty("value", obj->GetNamedProperty(key), sid);
                 PropertyAttributes attrs = obj->GetOwnPropertyAttributes(key);
-                desc->SetNamedProperty("enumerable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Enumerable), sid);
-                desc->SetNamedProperty("configurable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Configurable), sid);
-                return TaggedValue::FromHeapObject(desc);
+                desc->SetNamedProperty("writable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Writable), sid);
             }
+            PropertyAttributes attrs = obj->GetOwnPropertyAttributes(key);
+            desc->SetNamedProperty("enumerable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Enumerable), sid);
+            desc->SetNamedProperty("configurable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Configurable), sid);
+            return TaggedValue::FromHeapObject(desc);
         }
         return TaggedValue::Undefined();
-    })), next_shape_id_);
+    }, 2)), next_shape_id_);
+    object_ctor->SetNamedProperty("getOwnPropertyDescriptors", TaggedValue::FromHeapObject(make_native("getOwnPropertyDescriptors", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
+            return TaggedValue::Undefined();
+        }
+        JSObject* obj = ToObject(args[0]);
+        if (!obj) return TaggedValue::Undefined();
+        Shape* root = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+        auto* result = AllocateRuntime<JSObject>(root);
+        if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
+            result->SetPrototype(Realm::Current()->GetObjectPrototype());
+        }
+        TaggedValue keys_val = GetOwnKeys(TaggedValue::FromHeapObject(obj));
+        if (keys_val.IsHeapObject() && keys_val.AsHeapObject()->IsArray()) {
+            auto* keys_arr = static_cast<JSArray*>(keys_val.AsHeapObject());
+            uint32_t sid = 9500;
+            for (size_t i = 0; i < keys_arr->Length(); ++i) {
+                std::string key = keys_arr->GetElement(i).ToString();
+                if (key.rfind("__private__", 0) == 0) continue;
+                TaggedValue desc_val = TaggedValue::Undefined();
+                if (obj->IsProxy()) {
+                    desc_val = ProxyGetOwnPropertyDescriptor(static_cast<JSProxy*>(obj), key);
+                } else if (obj->HasOwnProperty(key)) {
+                    auto* desc = AllocateRuntime<JSObject>(root);
+                    if (const auto* accessor = obj->GetAccessor(key)) {
+                        desc->SetNamedProperty("get", accessor->getter, sid);
+                        desc->SetNamedProperty("set", accessor->setter, sid);
+                    } else {
+                        desc->SetNamedProperty("value", obj->GetNamedProperty(key), sid);
+                        PropertyAttributes attrs = obj->GetOwnPropertyAttributes(key);
+                        desc->SetNamedProperty("writable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Writable), sid);
+                    }
+                    PropertyAttributes attrs = obj->GetOwnPropertyAttributes(key);
+                    desc->SetNamedProperty("enumerable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Enumerable), sid);
+                    desc->SetNamedProperty("configurable", TaggedValue::FromBoolean(attrs & PropertyAttributes::Configurable), sid);
+                    desc_val = TaggedValue::FromHeapObject(desc);
+                }
+                if (!desc_val.IsUndefined()) {
+                    result->SetNamedProperty(key, desc_val, sid);
+                }
+            }
+        }
+        return TaggedValue::FromHeapObject(result);
+    }, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("assign", TaggedValue::FromHeapObject(make_native("assign", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
             if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
@@ -4574,26 +6340,34 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             }
         }
         return target;
-    })), next_shape_id_);
-    object_ctor->SetNamedProperty("values", TaggedValue::FromHeapObject(make_native("values", &Object_values)), next_shape_id_);
-    object_ctor->SetNamedProperty("entries", TaggedValue::FromHeapObject(make_native("entries", &Object_entries)), next_shape_id_);
-    object_ctor->SetNamedProperty("fromEntries", TaggedValue::FromHeapObject(make_native("fromEntries", &Object_fromEntries)), next_shape_id_);
-    object_ctor->SetNamedProperty("is", TaggedValue::FromHeapObject(make_native("is", &Object_is)), next_shape_id_);
-    object_ctor->SetNamedProperty("freeze", TaggedValue::FromHeapObject(make_native("freeze", &Object_freeze)), next_shape_id_);
-    object_ctor->SetNamedProperty("isFrozen", TaggedValue::FromHeapObject(make_native("isFrozen", &Object_isFrozen)), next_shape_id_);
-    object_ctor->SetNamedProperty("seal", TaggedValue::FromHeapObject(make_native("seal", &Object_seal)), next_shape_id_);
-    object_ctor->SetNamedProperty("isSealed", TaggedValue::FromHeapObject(make_native("isSealed", &Object_isSealed)), next_shape_id_);
+    }, 2)), next_shape_id_);
+    object_ctor->SetNamedProperty("values", TaggedValue::FromHeapObject(make_native("values", &Object_values, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("entries", TaggedValue::FromHeapObject(make_native("entries", &Object_entries, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("fromEntries", TaggedValue::FromHeapObject(make_native("fromEntries", &Object_fromEntries, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("is", TaggedValue::FromHeapObject(make_native("is", &Object_is, 2)), next_shape_id_);
+    object_ctor->SetNamedProperty("freeze", TaggedValue::FromHeapObject(make_native("freeze", &Object_freeze, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("isFrozen", TaggedValue::FromHeapObject(make_native("isFrozen", &Object_isFrozen, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("seal", TaggedValue::FromHeapObject(make_native("seal", &Object_seal, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("isSealed", TaggedValue::FromHeapObject(make_native("isSealed", &Object_isSealed, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("preventExtensions", TaggedValue::FromHeapObject(make_native("preventExtensions", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (!args.empty() && args[0].IsHeapObject() && args[0].AsHeapObject()->IsJSObject()) {
             static_cast<JSObject*>(args[0].AsHeapObject())->PreventExtensions();
         }
         return args.empty() ? TaggedValue::Undefined() : args[0];
-    })), next_shape_id_);
+    }, 1)), next_shape_id_);
     object_ctor->SetNamedProperty("isExtensible", TaggedValue::FromHeapObject(make_native("isExtensible", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsJSObject()) return TaggedValue::FromBoolean(true);
         return TaggedValue::FromBoolean(static_cast<JSObject*>(args[0].AsHeapObject())->IsExtensible());
-    })), next_shape_id_);
-    object_ctor->SetNamedProperty("hasOwn", TaggedValue::FromHeapObject(make_native("hasOwn", &Object_hasOwn)), next_shape_id_);
+    }, 1)), next_shape_id_);
+    object_ctor->SetNamedProperty("hasOwn", TaggedValue::FromHeapObject(make_native("hasOwn", &Object_hasOwn, 2)), next_shape_id_);
+    for (const char* op_prop : {
+        "create", "getPrototypeOf", "setPrototypeOf", "keys", "getOwnPropertyNames",
+        "getOwnPropertySymbols", "defineProperty", "defineProperties", "getOwnPropertyDescriptor",
+        "getOwnPropertyDescriptors", "assign", "values", "entries", "fromEntries",
+        "is", "freeze", "isFrozen", "seal", "isSealed", "preventExtensions", "isExtensible", "hasOwn"
+    }) {
+        object_ctor->SetOwnPropertyAttributes(op_prop, PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    }
     global_object_->SetNamedProperty("Object", TaggedValue::FromHeapObject(object_ctor), next_shape_id_);
     global_object_->SetNamedProperty("parseInt", TaggedValue::FromHeapObject(make_native("parseInt", &Global_parseInt)), next_shape_id_);
     global_object_->SetNamedProperty("parseFloat", TaggedValue::FromHeapObject(make_native("parseFloat", &Global_parseFloat)), next_shape_id_);
@@ -5170,11 +6944,25 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     typed_array_prototype_->SetNamedProperty("map", TaggedValue::FromHeapObject(make_native("map", &TypedArray_map)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("filter", TaggedValue::FromHeapObject(make_native("filter", &TypedArray_filter)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("reduce", TaggedValue::FromHeapObject(make_native("reduce", &TypedArray_reduce)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("reduceRight", TaggedValue::FromHeapObject(make_native("reduceRight", &TypedArray_reduceRight)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("find", TaggedValue::FromHeapObject(make_native("find", &TypedArray_find)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("findIndex", TaggedValue::FromHeapObject(make_native("findIndex", &TypedArray_findIndex)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("findLast", TaggedValue::FromHeapObject(make_native("findLast", &TypedArray_findLast)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("findLastIndex", TaggedValue::FromHeapObject(make_native("findLastIndex", &TypedArray_findLastIndex)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("lastIndexOf", TaggedValue::FromHeapObject(make_native("lastIndexOf", &TypedArray_lastIndexOf)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("sort", TaggedValue::FromHeapObject(make_native("sort", &TypedArray_sort)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("every", TaggedValue::FromHeapObject(make_native("every", &TypedArray_every)), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("some", TaggedValue::FromHeapObject(make_native("some", &TypedArray_some)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("at", TaggedValue::FromHeapObject(make_native("at", &TypedArray_at)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("copyWithin", TaggedValue::FromHeapObject(make_native("copyWithin", &TypedArray_copyWithin)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("toReversed", TaggedValue::FromHeapObject(make_native("toReversed", &TypedArray_toReversed)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("toSorted", TaggedValue::FromHeapObject(make_native("toSorted", &TypedArray_toSorted)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("with", TaggedValue::FromHeapObject(make_native("with", &TypedArray_with)), next_shape_id_);
+    typed_array_prototype_->SetNamedProperty("toLocaleString", TaggedValue::FromHeapObject(make_native("toLocaleString", &TypedArray_toLocaleString)), next_shape_id_);
+    if (array_prototype_) {
+        typed_array_prototype_->SetNamedProperty("toString", array_prototype_->GetNamedProperty("toString"), next_shape_id_);
+        typed_array_prototype_->SetOwnPropertyAttributes("toString", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+    }
     auto* ta_values = make_native("values", &TypedArray_values);
     auto* ta_keys = make_native("keys", &TypedArray_keys);
     auto* ta_entries = make_native("entries", &TypedArray_entries);
@@ -5183,11 +6971,163 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     typed_array_prototype_->SetNamedProperty("entries", TaggedValue::FromHeapObject(ta_entries), next_shape_id_);
     typed_array_prototype_->SetNamedProperty("@@iterator", TaggedValue::FromHeapObject(ta_values), next_shape_id_);
 
+    // TypedArray Prototype Accessors
+    auto* ta_get_length = make_native("get length", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+            SetTypeException("Method get TypedArray.prototype.length called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        return TaggedValue::FromSmi(static_cast<int32_t>(static_cast<JSTypedArray*>(this_val.AsHeapObject())->Length()));
+    });
+    typed_array_prototype_->SetAccessor("length", TaggedValue::FromHeapObject(ta_get_length), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* ta_get_byteLength = make_native("get byteLength", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+            SetTypeException("Method get TypedArray.prototype.byteLength called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        return TaggedValue::FromDouble(static_cast<double>(static_cast<JSTypedArray*>(this_val.AsHeapObject())->ByteLength()));
+    });
+    typed_array_prototype_->SetAccessor("byteLength", TaggedValue::FromHeapObject(ta_get_byteLength), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* ta_get_byteOffset = make_native("get byteOffset", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+            SetTypeException("Method get TypedArray.prototype.byteOffset called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        return TaggedValue::FromDouble(static_cast<double>(static_cast<JSTypedArray*>(this_val.AsHeapObject())->ByteOffset()));
+    });
+    typed_array_prototype_->SetAccessor("byteOffset", TaggedValue::FromHeapObject(ta_get_byteOffset), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* ta_get_buffer = make_native("get buffer", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+            SetTypeException("Method get TypedArray.prototype.buffer called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+        return ta->Buffer() ? TaggedValue::FromHeapObject(ta->Buffer()) : TaggedValue::Undefined();
+    });
+    typed_array_prototype_->SetAccessor("buffer", TaggedValue::FromHeapObject(ta_get_buffer), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* ta_get_toStringTag = make_native("get [Symbol.toStringTag]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsTypedArray()) {
+            return TaggedValue::Undefined();
+        }
+        auto* ta = static_cast<JSTypedArray*>(this_val.AsHeapObject());
+        switch (ta->Kind()) {
+            case TypedArrayKind::Int8: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Int8Array"));
+            case TypedArrayKind::Uint8: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Uint8Array"));
+            case TypedArrayKind::Uint8Clamped: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Uint8ClampedArray"));
+            case TypedArrayKind::Int16: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Int16Array"));
+            case TypedArrayKind::Uint16: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Uint16Array"));
+            case TypedArrayKind::Int32: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Int32Array"));
+            case TypedArrayKind::Uint32: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Uint32Array"));
+            case TypedArrayKind::Float32: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Float32Array"));
+            case TypedArrayKind::Float64: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("Float64Array"));
+            case TypedArrayKind::BigInt64: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("BigInt64Array"));
+            case TypedArrayKind::BigUint64: return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("BigUint64Array"));
+            default: return TaggedValue::Undefined();
+        }
+    });
+    typed_array_prototype_->SetAccessor("@@toStringTag", TaggedValue::FromHeapObject(ta_get_toStringTag), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    // %TypedArray% Intrinsics Constructor
+    auto* typed_array_ctor = make_native("TypedArray", [](const std::vector<TaggedValue>&) -> TaggedValue {
+        SetTypeException("TypedArray constructor cannot be called directly");
+        return TaggedValue::Undefined();
+    });
+    typed_array_ctor->SetIsConstructor(true);
+    typed_array_ctor->SetNamedProperty("length", TaggedValue::FromSmi(0), next_shape_id_);
+    typed_array_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(typed_array_prototype_), next_shape_id_);
+    typed_array_ctor->SetOwnPropertyAttributes("prototype", PropertyAttributes::None);
+    typed_array_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(typed_array_ctor), next_shape_id_);
+    typed_array_prototype_->SetOwnPropertyAttributes("constructor", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
+    auto* ta_species_get = make_native("get [Symbol.species]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        return this_val;
+    });
+    typed_array_ctor->SetAccessor("@@species", TaggedValue::FromHeapObject(ta_species_get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* ta_of = make_native("of", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || (!this_val.AsHeapObject()->IsFunction() && !this_val.AsHeapObject()->IsNativeFunction())) {
+            SetTypeException("TypedArray.of: this is not a constructor");
+            return TaggedValue::Undefined();
+        }
+        size_t len = args.size();
+        TaggedValue new_ta_val = CallFunction(this_val, TaggedValue::Undefined(), {TaggedValue::FromDouble(static_cast<double>(len))});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (new_ta_val.IsHeapObject() && new_ta_val.AsHeapObject()->IsTypedArray()) {
+            auto* ta = static_cast<JSTypedArray*>(new_ta_val.AsHeapObject());
+            for (size_t i = 0; i < len; ++i) {
+                ta->SetElement(i, args[i]);
+            }
+        }
+        return new_ta_val;
+    });
+    typed_array_ctor->SetNamedProperty("of", TaggedValue::FromHeapObject(ta_of), next_shape_id_);
+    typed_array_ctor->SetOwnPropertyAttributes("of", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
+    auto* ta_from = make_native("from", [](TaggedValue this_val, const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (!this_val.IsHeapObject() || (!this_val.AsHeapObject()->IsFunction() && !this_val.AsHeapObject()->IsNativeFunction())) {
+            SetTypeException("TypedArray.from: this is not a constructor");
+            return TaggedValue::Undefined();
+        }
+        if (args.empty() || args[0].IsNull() || args[0].IsUndefined()) {
+            SetTypeException("TypedArray.from requires an array-like or iterable object");
+            return TaggedValue::Undefined();
+        }
+        TaggedValue source = args[0];
+        TaggedValue map_fn = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+        TaggedValue this_arg = args.size() > 2 ? args[2] : TaggedValue::Undefined();
+        bool mapping = !map_fn.IsUndefined();
+        if (mapping && (!map_fn.IsHeapObject() || (!map_fn.AsHeapObject()->IsFunction() && !map_fn.AsHeapObject()->IsNativeFunction()))) {
+            SetTypeException("TypedArray.from: mapfn must be a function");
+            return TaggedValue::Undefined();
+        }
+
+        std::vector<TaggedValue> items;
+        TaggedValue iter_fn = GetProperty(source, "@@iterator");
+        if (iter_fn.IsHeapObject() && (iter_fn.AsHeapObject()->IsFunction() || iter_fn.AsHeapObject()->IsNativeFunction())) {
+            TaggedValue iter = CallFunction(iter_fn, source, {});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            while (true) {
+                TaggedValue next_res = CallFunction(GetProperty(iter, "next"), iter, {});
+                if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+                if (GetProperty(next_res, "done").ToBoolean()) break;
+                items.push_back(GetProperty(next_res, "value"));
+            }
+        } else {
+            uint64_t len = ToLength(GetProperty(source, "length"));
+            items.reserve(static_cast<size_t>(len));
+            for (uint64_t i = 0; i < len; ++i) {
+                items.push_back(GetProperty(source, std::to_string(i)));
+            }
+        }
+
+        TaggedValue new_ta_val = CallFunction(this_val, TaggedValue::Undefined(), {TaggedValue::FromDouble(static_cast<double>(items.size()))});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+        if (new_ta_val.IsHeapObject() && new_ta_val.AsHeapObject()->IsTypedArray()) {
+            auto* ta = static_cast<JSTypedArray*>(new_ta_val.AsHeapObject());
+            for (size_t i = 0; i < items.size(); ++i) {
+                TaggedValue val = items[i];
+                if (mapping) {
+                    val = CallFunction(map_fn, this_arg, {val, TaggedValue::FromDouble(static_cast<double>(i))});
+                    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+                }
+                ta->SetElement(i, val);
+            }
+        }
+        return new_ta_val;
+    });
+    typed_array_ctor->SetNamedProperty("from", TaggedValue::FromHeapObject(ta_from), next_shape_id_);
+    typed_array_ctor->SetOwnPropertyAttributes("from", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
     auto make_typed_array_ctor = [&](TypedArrayKind kind, std::string_view name) -> JSNativeFunction* {
         auto* proto = make_old_obj();
         proto->SetPrototype(typed_array_prototype_);
         size_t elem_size = TypedArrayElementSize(kind);
         proto->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
+        proto->SetOwnPropertyAttributes("BYTES_PER_ELEMENT", PropertyAttributes::None);
 
         auto* ctor = make_native(name, [this, kind, elem_size, proto](const std::vector<TaggedValue>& args) -> TaggedValue {
             Shape* root_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
@@ -5252,9 +7192,18 @@ void Realm::InitializeIntrinsics(Heap& heap) {
                     return TaggedValue::FromHeapObject(ta);
                 }
 
-                if (ho->IsArray()) {
-                    auto* src_arr = static_cast<JSArray*>(ho);
-                    size_t len = src_arr->Length();
+                TaggedValue iter_fn = GetProperty(first, "@@iterator");
+                if (iter_fn.IsHeapObject() && (iter_fn.AsHeapObject()->IsFunction() || iter_fn.AsHeapObject()->IsNativeFunction())) {
+                    std::vector<TaggedValue> items;
+                    TaggedValue iter = CallFunction(iter_fn, first, {});
+                    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+                    while (true) {
+                        TaggedValue next_res = CallFunction(GetProperty(iter, "next"), iter, {});
+                        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+                        if (GetProperty(next_res, "done").ToBoolean()) break;
+                        items.push_back(GetProperty(next_res, "value"));
+                    }
+                    size_t len = items.size();
                     auto* ab = AllocateRuntime<JSArrayBuffer>(len * elem_size, root_shape);
                     if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
                         ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
@@ -5262,7 +7211,22 @@ void Realm::InitializeIntrinsics(Heap& heap) {
                     auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, len, root_shape);
                     ta->SetPrototype(proto);
                     for (size_t i = 0; i < len; ++i) {
-                        ta->SetElement(i, src_arr->GetElement(i));
+                        ta->SetElement(i, items[i]);
+                    }
+                    return TaggedValue::FromHeapObject(ta);
+                }
+
+                if (ho->IsJSObject()) {
+                    auto* jso = static_cast<JSObject*>(ho);
+                    uint64_t len = ToLength(jso->GetNamedProperty("length"));
+                    auto* ab = AllocateRuntime<JSArrayBuffer>(static_cast<size_t>(len) * elem_size, root_shape);
+                    if (Realm::Current() && Realm::Current()->GetArrayBufferPrototype()) {
+                        ab->SetPrototype(Realm::Current()->GetArrayBufferPrototype());
+                    }
+                    auto* ta = AllocateRuntime<JSTypedArray>(kind, ab, 0, static_cast<size_t>(len), root_shape);
+                    ta->SetPrototype(proto);
+                    for (size_t i = 0; i < static_cast<size_t>(len); ++i) {
+                        ta->SetElement(i, GetProperty(first, std::to_string(i)));
                     }
                     return TaggedValue::FromHeapObject(ta);
                 }
@@ -5274,10 +7238,15 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return TaggedValue::FromHeapObject(ta);
         });
 
+        ctor->SetPrototype(typed_array_ctor);
         ctor->SetIsConstructor(true);
         ctor->SetNamedProperty("length", TaggedValue::FromSmi(3), next_shape_id_);
         ctor->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
+        ctor->SetOwnPropertyAttributes("BYTES_PER_ELEMENT", PropertyAttributes::None);
         ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
+        ctor->SetOwnPropertyAttributes("prototype", PropertyAttributes::None);
+        proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor), next_shape_id_);
+        proto->SetOwnPropertyAttributes("constructor", PropertyAttributes::Writable | PropertyAttributes::Configurable);
         global_object_->SetNamedProperty(name, TaggedValue::FromHeapObject(ctor), next_shape_id_);
         return ctor;
     };

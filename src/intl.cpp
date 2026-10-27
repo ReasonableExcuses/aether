@@ -2322,8 +2322,37 @@ void InitializeNumber(Realm& realm) {
 
     // String Constructor on global if not already present
     auto* string_ctor = make_native("String", [&realm, root, &next_sid](const std::vector<TaggedValue>& args) -> TaggedValue {
-        std::string s = args.empty() ? "" : args[0].ToString();
         bool is_construct = Interpreter::Current() && !Interpreter::Current()->GetNewTarget().IsUndefined();
+        if (args.empty()) {
+            if (is_construct) {
+                auto* obj = AllocateRuntime<JSObject>(root);
+                if (realm.GetStringPrototype()) obj->SetPrototype(realm.GetStringPrototype());
+                obj->SetNamedProperty("__string_data__", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("")), next_sid);
+                obj->SetNamedProperty("length", TaggedValue::FromSmi(0), next_sid);
+                return TaggedValue::FromHeapObject(obj);
+            }
+            return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+        }
+        TaggedValue arg = args[0];
+        if (is_construct && arg.IsSymbol()) {
+            if (Interpreter::Current()) Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                AllocateRuntime<JSError>("TypeError", "Cannot convert a Symbol value to a string")));
+            return TaggedValue::Undefined();
+        }
+        std::string s;
+        if (arg.IsSymbol()) {
+            s = arg.ToString();
+        } else if (arg.IsHeapObject() && (arg.AsHeapObject()->IsJSObject() || arg.AsHeapObject()->IsProxy())) {
+            if (Interpreter::Current()) {
+                TaggedValue prim = Interpreter::Current()->ToPrimitive(arg, "string");
+                if (Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+                s = prim.ToString();
+            } else {
+                s = arg.ToString();
+            }
+        } else {
+            s = arg.ToString();
+        }
         if (is_construct) {
             auto* obj = AllocateRuntime<JSObject>(root);
             if (realm.GetStringPrototype()) {
@@ -2354,6 +2383,86 @@ void InitializeNumber(Realm& realm) {
         return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(result));
     });
     string_ctor->SetNamedProperty("fromCharCode", TaggedValue::FromHeapObject(str_from_char_code), next_sid);
+    string_ctor->SetOwnPropertyAttributes("fromCharCode", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
+    auto* str_from_code_point = make_native("fromCodePoint", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        std::string result;
+        for (const auto& arg : args) {
+            double d = arg.ToDouble();
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
+            if (std::isnan(d) || std::isinf(d) || std::floor(d) != d || d < 0.0 || d > 0x10FFFF) {
+                if (Interpreter::Current()) {
+                    Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                        AllocateRuntime<JSError>("RangeError", "Invalid code point")));
+                }
+                return TaggedValue::Undefined();
+            }
+            uint32_t cp = static_cast<uint32_t>(d);
+            if (cp < 0x80) {
+                result.push_back(static_cast<char>(cp));
+            } else if (cp < 0x800) {
+                result.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if (cp < 0x10000) {
+                result.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+                result.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                result.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                result.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        }
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(result));
+    });
+    str_from_code_point->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
+    string_ctor->SetNamedProperty("fromCodePoint", TaggedValue::FromHeapObject(str_from_code_point), next_sid);
+    string_ctor->SetOwnPropertyAttributes("fromCodePoint", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
+    auto* str_raw = make_native("raw", [](const std::vector<TaggedValue>& args) -> TaggedValue {
+        if (args.empty() || args[0].IsUndefined() || args[0].IsNull()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Cannot convert undefined or null to object")));
+            }
+            return TaggedValue::Undefined();
+        }
+        TaggedValue cooked = args[0];
+        if (!cooked.IsHeapObject() || !cooked.AsHeapObject()->IsJSObject()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Template object must be an object")));
+            }
+            return TaggedValue::Undefined();
+        }
+        TaggedValue raw = static_cast<JSObject*>(cooked.AsHeapObject())->GetNamedProperty("raw");
+        if (!raw.IsHeapObject() || !raw.AsHeapObject()->IsJSObject()) {
+            if (Interpreter::Current()) {
+                Interpreter::Current()->SetPendingException(TaggedValue::FromHeapObject(
+                    AllocateRuntime<JSError>("TypeError", "Template raw must be an object")));
+            }
+            return TaggedValue::Undefined();
+        }
+        auto* raw_obj = static_cast<JSObject*>(raw.AsHeapObject());
+        TaggedValue len_val = raw_obj->GetNamedProperty("length");
+        int64_t len = len_val.IsNumber() ? static_cast<int64_t>(len_val.AsNumber()) : 0;
+        if (len <= 0) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+
+        std::string result;
+        for (int64_t i = 0; i < len; ++i) {
+            TaggedValue next_str = raw_obj->GetNamedProperty(std::to_string(i));
+            result += next_str.ToString();
+            if (i + 1 < len && static_cast<size_t>(i + 1) < args.size()) {
+                result += args[i + 1].ToString();
+            }
+        }
+        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(result));
+    });
+    str_raw->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
+    string_ctor->SetNamedProperty("raw", TaggedValue::FromHeapObject(str_raw), next_sid);
+    string_ctor->SetOwnPropertyAttributes("raw", PropertyAttributes::Writable | PropertyAttributes::Configurable);
+
     string_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_sid);
     if (realm.GetStringPrototype()) {
         string_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(realm.GetStringPrototype()), next_sid);

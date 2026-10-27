@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <functional>
 
 namespace aether {
 
@@ -98,6 +99,18 @@ private:
     std::unique_ptr<Stmt> ParseExportDecl();
     bool MatchContextualKeyword(std::string_view kw);
     void ValidateSubstatement(const Stmt* stmt, bool is_if = false);
+    struct ParsedParams {
+        std::vector<std::string> params;
+        std::vector<std::unique_ptr<Expr>> param_defaults;
+        std::string rest_param;
+        std::vector<std::unique_ptr<Stmt>> destructuring_stmts;
+    };
+    ParsedParams ParseParameterList(bool is_async = false, bool is_generator = false);
+    void ParsePatternDestructuring(
+        const std::string& source_var,
+        std::vector<std::unique_ptr<Stmt>>& destructuring_stmts,
+        std::function<void(const std::string&)> add_param_name = nullptr);
+
 
     // Expression parsers
     std::unique_ptr<Expr> ParsePrefix(Precedence precedence = Precedence::Assignment);

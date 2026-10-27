@@ -124,17 +124,69 @@ bool TaggedValue::IsBigInt() const noexcept {
     return IsHeapObject() && AsHeapObject()->GetType() == HeapObjectType::JSBigInt;
 }
 
+static std::string ECMAScriptDoubleToString(double d) {
+    if (std::isnan(d)) return "NaN";
+    if (std::isinf(d)) return d > 0 ? "Infinity" : "-Infinity";
+    if (d == 0.0) return "0";
+
+    std::string prefix = "";
+    if (d < 0.0) {
+        prefix = "-";
+        d = -d;
+    }
+
+    if (d >= 1.0 && d < 1e21 && std::floor(d) == d) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.0f", d);
+        return prefix + buf;
+    }
+
+    char buf[128];
+    if (d >= 1e-6 && d < 1e21) {
+        std::snprintf(buf, sizeof(buf), "%.16g", d);
+        std::string s(buf);
+        auto e_pos = s.find_first_of("eE");
+        if (e_pos != std::string::npos) {
+            std::snprintf(buf, sizeof(buf), "%.20f", d);
+            std::string fixed(buf);
+            size_t end = fixed.find_last_not_of('0');
+            if (end != std::string::npos && fixed[end] == '.') {
+                end--;
+            }
+            if (end != std::string::npos) {
+                fixed = fixed.substr(0, end + 1);
+            }
+            return prefix + fixed;
+        }
+        return prefix + s;
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.16g", d);
+        std::string s(buf);
+        auto e_pos = s.find_first_of("eE");
+        if (e_pos != std::string::npos) {
+            std::string mantissa = s.substr(0, e_pos);
+            char exp_sign = s[e_pos + 1];
+            std::string exp_digits = (exp_sign == '+' || exp_sign == '-') ? s.substr(e_pos + 2) : s.substr(e_pos + 1);
+            size_t first_non_zero = exp_digits.find_first_not_of('0');
+            if (first_non_zero == std::string::npos) exp_digits = "0";
+            else exp_digits = exp_digits.substr(first_non_zero);
+
+            std::string result = prefix + mantissa + "e";
+            if (exp_sign == '-') result += "-";
+            else result += "+";
+            result += exp_digits;
+            return result;
+        }
+        return prefix + s;
+    }
+}
+
 std::string TaggedValue::ToString() const {
     if (IsSmi()) {
         return std::to_string(AsSmi());
     }
     if (IsDouble()) {
-        double d = AsDouble();
-        if (std::isnan(d)) return "NaN";
-        if (std::isinf(d)) return d > 0 ? "Infinity" : "-Infinity";
-        std::ostringstream ss;
-        ss << d;
-        return ss.str();
+        return ECMAScriptDoubleToString(AsDouble());
     }
     if (IsBoolean()) {
         return AsBoolean() ? "true" : "false";

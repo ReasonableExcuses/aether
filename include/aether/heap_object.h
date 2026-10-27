@@ -615,6 +615,14 @@ public:
     bool HasAccessor(std::string_view key) const {
         return accessors_.count(key) > 0;
     }
+    bool RemoveAccessor(std::string_view key) {
+        auto it = accessors_.find(key);
+        if (it != accessors_.end()) {
+            accessors_.erase(it);
+            return true;
+        }
+        return false;
+    }
     const auto& GetAccessors() const {
         return accessors_.Get();
     }
@@ -1104,6 +1112,7 @@ public:
            is_generator_(other.is_generator_),
            is_async_(other.is_async_),
            is_arrow_(other.is_arrow_),
+           is_method_(other.is_method_),
            lexical_this_(other.lexical_this_),
            lexical_new_target_(other.lexical_new_target_),
            with_storage_(std::move(other.with_storage_)),
@@ -1134,6 +1143,9 @@ public:
 
     bool IsArrow() const noexcept { return is_arrow_; }
     void SetArrow(bool a) noexcept { is_arrow_ = a; }
+
+    bool IsMethod() const noexcept { return is_method_; }
+    void SetIsMethod(bool m) noexcept { is_method_ = m; }
 
     TaggedValue GetLexicalThis() const noexcept { return lexical_this_; }
     void SetLexicalThis(TaggedValue t) noexcept { lexical_this_ = t; }
@@ -1191,6 +1203,7 @@ private:
     bool is_generator_{false};
     bool is_async_{false};
     bool is_arrow_{false};
+    bool is_method_{false};
     TaggedValue lexical_this_{TaggedValue::Undefined()};
     TaggedValue lexical_new_target_{TaggedValue::Undefined()};
     MemoryCharge with_storage_;

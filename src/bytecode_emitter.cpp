@@ -2761,7 +2761,9 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
     uint32_t dummy_sid = 1;
     ctor_fn->SetConstructorPrototype(TaggedValue::FromHeapObject(proto_obj));
     ctor_fn->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto_obj), dummy_sid);
+    ctor_fn->SetOwnPropertyAttributes("prototype", PropertyAttributes::None);
     proto_obj->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor_fn), dummy_sid);
+    proto_obj->SetOwnPropertyAttributes("constructor", PropertyAttributes::Writable | PropertyAttributes::Configurable);
     if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
         ctor_fn->SetPrototype(Realm::Current()->GetFunctionPrototype());
     }
@@ -2816,6 +2818,7 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
     for (const auto& m : node->Methods()) {
         if (m->Name() == "constructor") continue;
         auto* method_fn = AllocateRuntime<JSFunction>(m->Name(), nullptr);
+        method_fn->SetIsMethod(true);
         if (m->IsAsync()) method_fn->SetAsync(true);
         if (m->IsGenerator()) method_fn->SetGenerator(true);
         if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
@@ -2879,6 +2882,7 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
             target_obj->SetAccessor(prop, existing_getter, TaggedValue::FromHeapObject(method_fn), PropertyAttributes::Configurable);
         } else {
             target_obj->SetNamedProperty(m_name, TaggedValue::FromHeapObject(method_fn), dummy_id);
+            target_obj->SetOwnPropertyAttributes(m_name, PropertyAttributes::Writable | PropertyAttributes::Configurable);
         }
     }
 
