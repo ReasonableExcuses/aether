@@ -33,7 +33,11 @@ struct NativeStackGuard {
         if (!origin) origin = current;
         const auto consumed = current > origin ? current - origin : origin - current;
 #if defined(AETHER_SANITIZE_ACTIVE) || defined(__SANITIZE_ADDRESS__) || defined(_MSVC_SANITIZE_ADDRESS)
-        constexpr size_t kDefaultStackBudget = 2048 * 1024; // 2 MB for ASan/TSan frame bloat
+#if defined(_WIN32)
+        constexpr size_t kDefaultStackBudget = 512 * 1024;  // 512 KB on Windows under ASan
+#else
+        constexpr size_t kDefaultStackBudget = 1024 * 1024; // 1 MB on Linux/macOS under ASan/TSan
+#endif
 #else
         constexpr size_t kDefaultStackBudget = 256 * 1024;  // 256 KB release default
 #endif
