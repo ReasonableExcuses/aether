@@ -17,6 +17,9 @@ class OptimizingJIT {
 public:
     static std::unique_ptr<ExecutableMemory> Compile(const BytecodeArray& bytecode, TypeFeedbackVector* feedback = nullptr);
 
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((no_sanitize("function", "undefined")))
+#endif
     static TaggedValue Invoke(const ExecutableMemory& exec, const TaggedValue* args = nullptr, uint32_t count = 0) {
         auto fn = exec.AsFunction<JITEntrypoint>();
         uint64_t raw = fn(reinterpret_cast<const uint64_t*>(args), count);
