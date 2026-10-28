@@ -88,5 +88,8 @@ foreach(TEST_SRC ${TEST_SOURCES})
         target_link_options(${TEST_NAME} PRIVATE /DEBUG)
     endif()
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
-    set_tests_properties(${TEST_NAME} PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(${TEST_NAME} PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        TIMEOUT 60
+    )
 endforeach()

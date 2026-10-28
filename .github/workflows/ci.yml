@@ -12,7 +12,7 @@ jobs:
   matrix-build:
     name: ${{ matrix.name }} (${{ matrix.config }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.allow-failure || false }}
+    continue-on-error: ${{ matrix.allow_failure == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +60,7 @@ jobs:
             os: macos-latest
             config: Release
             cmake_flags: ""
-            allow-failure: true
+            allow_failure: true
 
     steps:
       - name: Checkout repository
@@ -71,6 +71,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.c_compiler }} ${{ matrix.cxx_compiler }}
+
+      - name: Setup MSVC Developer Command Prompt
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure CMake
         env:
@@ -85,7 +89,7 @@ jobs:
         run: cmake --build build --config ${{ matrix.config }} -j
 
       - name: Run Tests (CTest)
-        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --timeout 60
 
   tsan:
     name: ubuntu-tsan
@@ -112,7 +116,7 @@ jobs:
         run: cmake --build build --config RelWithDebInfo -j
 
       - name: Run Tests (CTest)
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 60
 
   matrix-test:
     name: full-matrix-validation

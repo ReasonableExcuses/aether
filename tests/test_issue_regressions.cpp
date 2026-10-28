@@ -207,7 +207,7 @@ static void Test4_BigIntTypedArrays() {
 
     // 4. Unsigned 64-bit values and unsigned wraparound
     // Write -1LL into BigUint64Array -> wraps around to 18446744073709551615 (2^64 - 1)
-    bu64.SetElement(4, TaggedValue::FromHeapObject(JSBigInt::Create(-1LL)));
+    bu64.SetElement(4, TaggedValue::FromHeapObject(JSBigInt::Create(static_cast<int64_t>(-1))));
     TaggedValue v4 = bu64.GetElement(4);
     Assert(v4.IsBigInt(), "BigUint64 element 4 must be BigInt");
     Assert(v4.ToString() == "18446744073709551615", "BigUint64 unsigned wraparound mismatch for -1");
