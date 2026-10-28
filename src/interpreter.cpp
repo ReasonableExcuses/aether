@@ -1250,7 +1250,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 uint16_t idx = pc[0] | (pc[1] << 8);
                 pc += 2;
                 TaggedValue const_val = bytecode.Constants()[idx];
-                if (const_val.IsHeapObject() && const_val.AsHeapObject()->IsFunction()) {
+                if (const_val.IsHeapObject() && const_val.AsHeapObject()->IsUserFunction()) {
                     auto* fn = static_cast<JSFunction*>(const_val.AsHeapObject());
                     if (!fn->GetEnvironment() && frame.GetEnvironment()) {
                         fn->SetEnvironment(frame.GetEnvironment());
@@ -1259,7 +1259,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             for (const auto& name : proto->GetOwnPropertyNames()) {
                                 if (proto->HasAccessor(name)) continue;
                                 TaggedValue prop_val = proto->GetNamedProperty(name);
-                                if (prop_val.IsHeapObject() && prop_val.AsHeapObject()->IsFunction()) {
+                                if (prop_val.IsHeapObject() && prop_val.AsHeapObject()->IsUserFunction()) {
                                     auto* m_fn = static_cast<JSFunction*>(prop_val.AsHeapObject());
                                     if (!m_fn->GetEnvironment()) {
                                         m_fn->SetEnvironment(frame.GetEnvironment());
@@ -1268,13 +1268,13 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             }
                             for (const auto& [acc_name, acc_desc] : proto->GetAccessors()) {
                                 (void)acc_name;
-                                if (acc_desc.getter.IsHeapObject() && acc_desc.getter.AsHeapObject()->IsFunction()) {
+                                if (acc_desc.getter.IsHeapObject() && acc_desc.getter.AsHeapObject()->IsUserFunction()) {
                                     auto* g_fn = static_cast<JSFunction*>(acc_desc.getter.AsHeapObject());
                                     if (!g_fn->GetEnvironment()) {
                                         g_fn->SetEnvironment(frame.GetEnvironment());
                                     }
                                 }
-                                if (acc_desc.setter.IsHeapObject() && acc_desc.setter.AsHeapObject()->IsFunction()) {
+                                if (acc_desc.setter.IsHeapObject() && acc_desc.setter.AsHeapObject()->IsUserFunction()) {
                                     auto* s_fn = static_cast<JSFunction*>(acc_desc.setter.AsHeapObject());
                                     if (!s_fn->GetEnvironment()) {
                                         s_fn->SetEnvironment(frame.GetEnvironment());
@@ -3335,7 +3335,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (HasProperty(obj, getter_key)) {
                     TaggedValue getter = GetProperty(obj, getter_key);
                     frame_roots.CreateHandle(getter);
-                    if (getter.IsHeapObject() && getter.AsHeapObject()->IsFunction()) {
+                    if (getter.IsHeapObject() && getter.AsHeapObject()->IsUserFunction()) {
                         auto* fn = static_cast<JSFunction*>(getter.AsHeapObject());
                         acc_ = Execute(*fn->GetBytecode(), {}, obj, fn->GetEnvironment());
                         if (has_pending_exception_) {
@@ -3370,7 +3370,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (HasProperty(obj, setter_key)) {
                     TaggedValue setter = GetProperty(obj, setter_key);
                     frame_roots.CreateHandle(setter);
-                    if (setter.IsHeapObject() && setter.AsHeapObject()->IsFunction()) {
+                    if (setter.IsHeapObject() && setter.AsHeapObject()->IsUserFunction()) {
                         auto* fn = static_cast<JSFunction*>(setter.AsHeapObject());
                         Execute(*fn->GetBytecode(), {acc_}, obj, fn->GetEnvironment());
                         if (has_pending_exception_) {
@@ -5053,7 +5053,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 uint16_t const_idx = pc[0] | (pc[1] << 8);
                 pc += 2;
                 TaggedValue proto_val = bytecode.Constants()[const_idx];
-                assert(proto_val.IsHeapObject() && proto_val.AsHeapObject()->IsFunction());
+                assert(proto_val.IsHeapObject() && proto_val.AsHeapObject()->IsUserFunction());
                 auto* proto_fn = static_cast<JSFunction*>(proto_val.AsHeapObject());
                 auto* closure = AllocateRuntime<JSFunction>(proto_fn->Name(),
                                                proto_fn->GetSharedBytecode() ? proto_fn->GetSharedBytecode() : std::shared_ptr<const BytecodeArray>(proto_fn->GetBytecode(), [](const BytecodeArray*){}), 
@@ -5439,7 +5439,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (callee_val.AsHeapObject()->IsNativeFunction()) {
                     auto* native_fn = static_cast<JSNativeFunction*>(callee_val.AsHeapObject());
                     acc_ = native_fn->Invoke(effective_this, call_args);
-                } else if (callee_val.AsHeapObject()->IsFunction()) {
+                } else if (callee_val.AsHeapObject()->IsUserFunction()) {
                     auto* func = static_cast<JSFunction*>(callee_val.AsHeapObject());
                     if (!func->GetEnvironment() && frame.GetEnvironment()) {
                         func->SetEnvironment(frame.GetEnvironment());

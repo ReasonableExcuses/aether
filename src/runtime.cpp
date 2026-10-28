@@ -137,7 +137,7 @@ TaggedValue CallFunction(TaggedValue callee, TaggedValue this_val, const std::ve
         }
         return res;
     }
-    if (h_obj->IsFunction()) {
+    if (h_obj->IsUserFunction()) {
         auto* fn = static_cast<JSFunction*>(h_obj);
         TaggedValue effective_this = fn->IsArrow() ? fn->GetLexicalThis() : this_val;
         if (fn->IsAsyncGenerator()) {
@@ -716,7 +716,7 @@ TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& ar
         }
         return CallFunction(ctor, TaggedValue::Undefined(), args, target);
     }
-    if (ho->IsFunction()) {
+    if (ho->IsUserFunction()) {
         auto* fn = static_cast<JSFunction*>(ho);
         if (fn->IsArrow() || fn->IsAsync() || fn->IsGenerator()) {
             if (Interpreter::Current()) {
@@ -6697,7 +6697,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             HeapObject* ho = v.AsHeapObject();
             if (ho->IsProxy()) return true;
             if (ho->IsNativeFunction()) return static_cast<JSNativeFunction*>(ho)->IsConstructor();
-            if (ho->IsFunction()) {
+            if (ho->IsUserFunction()) {
                 auto* fn = static_cast<JSFunction*>(ho);
                 return !fn->IsArrow() && !fn->IsAsync() && !fn->IsGenerator();
             }
