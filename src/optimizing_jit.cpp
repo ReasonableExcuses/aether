@@ -255,10 +255,10 @@ std::unique_ptr<ExecutableMemory> OptimizingJIT::Compile(const BytecodeArray& by
     size_t stack_frame_size = 56 + (max_node_id + 16) * 8;
     if (stack_frame_size % 16 != 0) stack_frame_size += 8;
     masm.Prologue(stack_frame_size);
-    masm.MovRegReg(X86Reg::RBX, X86Reg::RCX);
-    // Keep the argument count in a callee-saved register; RDX is used by
+    masm.MovRegReg(X86Reg::RBX, kJITArg0Reg);
+    // Keep the argument count in a callee-saved register; RDX/RSI is used by
     // arithmetic lowering and is not stable across emitted nodes.
-    masm.MovRegReg(X86Reg::R12, X86Reg::RDX);
+    masm.MovRegReg(X86Reg::R12, kJITArg1Reg);
 
     auto GetNodeOffset = [](uint32_t id) -> int32_t {
         return -(56 + static_cast<int32_t>((id + 1) * 8));

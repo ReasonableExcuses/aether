@@ -110,15 +110,15 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
     size_t stack_frame_size = (bytecode.RegisterCount() + 4) * 8;
     masm.Prologue(stack_frame_size);
 
-    // Initialize parameters from RCX into virtual register slots
+    // Initialize parameters into virtual register slots
     for (uint32_t i = 0; i < bytecode.ParameterCount(); ++i) {
         // Missing arguments are represented as undefined.  Check the
         // argument count before touching the caller-owned argument vector.
         JITLabel missing_parameter;
         JITLabel parameter_ready;
-        masm.CmpRegImm32(X86Reg::RDX, static_cast<int32_t>(i + 1));
+        masm.CmpRegImm32(kJITArg1Reg, static_cast<int32_t>(i + 1));
         masm.Jcc(Condition::Less, missing_parameter);
-        masm.MovMemToReg(X86Reg::RAX, X86Reg::RCX, static_cast<int32_t>(i * 8));
+        masm.MovMemToReg(X86Reg::RAX, kJITArg0Reg, static_cast<int32_t>(i * 8));
         masm.Jmp(parameter_ready);
         masm.Bind(missing_parameter);
         masm.MovRegImm64(X86Reg::RAX, TaggedValue::Undefined().RawBits());
@@ -683,7 +683,7 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 size_t target_pc = pc + offset;
                 // Preserve accumulator in RBX (callee-saved)
                 masm.MovRegReg(X86Reg::RBX, X86Reg::RAX);
-                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.MovRegReg(kJITArg0Reg, X86Reg::RAX);
                 masm.SubRspImm32(40);
                 masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
                 masm.CallReg(X86Reg::R10);
@@ -702,7 +702,7 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 size_t target_pc = pc + offset;
                 // Preserve accumulator in RBX (callee-saved)
                 masm.MovRegReg(X86Reg::RBX, X86Reg::RAX);
-                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.MovRegReg(kJITArg0Reg, X86Reg::RAX);
                 masm.SubRspImm32(40);
                 masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
                 masm.CallReg(X86Reg::R10);
@@ -776,7 +776,7 @@ std::unique_ptr<ExecutableMemory> BaselineJIT::Compile(const BytecodeArray& byte
                 break;
             }
             case Opcode::LogicalNot: {
-                masm.MovRegReg(X86Reg::RCX, X86Reg::RAX);
+                masm.MovRegReg(kJITArg0Reg, X86Reg::RAX);
                 masm.SubRspImm32(40);
                 masm.MovRegImm64(X86Reg::R10, reinterpret_cast<uint64_t>(&Aether_ToBoolean));
                 masm.CallReg(X86Reg::R10);

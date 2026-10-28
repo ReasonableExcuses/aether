@@ -28,6 +28,14 @@ enum class X86Reg : uint8_t {
     R15 = 15
 };
 
+#if defined(_WIN32)
+inline constexpr X86Reg kJITArg0Reg = X86Reg::RCX;
+inline constexpr X86Reg kJITArg1Reg = X86Reg::RDX;
+#else
+inline constexpr X86Reg kJITArg0Reg = X86Reg::RDI;
+inline constexpr X86Reg kJITArg1Reg = X86Reg::RSI;
+#endif
+
 enum class Condition : uint8_t {
     Overflow            = 0x80, // jo
     NotOverflow         = 0x81, // jno
