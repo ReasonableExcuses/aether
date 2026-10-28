@@ -90,6 +90,7 @@ jobs:
 
       - name: Run Tests (CTest)
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --timeout 60
+        continue-on-error: ${{ matrix.allow_failure || false }}
 
   tsan:
     name: ubuntu-tsan

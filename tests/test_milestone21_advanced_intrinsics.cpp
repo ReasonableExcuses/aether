@@ -345,8 +345,8 @@ static void Test7_AtomicsFutexWaitNotify() {
     // Give worker time to enter futex sleep
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    // Main thread updates value and notifies waiter
-    *ptr = 1;
+    // Main thread updates value atomically and notifies waiter
+    std::atomic_ref<int32_t>(*ptr).store(1, std::memory_order_release);
     uint32_t awoken = FutexManager::Instance().Notify(ptr, 1);
     Assert(awoken == 1, "Futex notify should wake 1 waiter");
 

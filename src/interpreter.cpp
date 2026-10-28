@@ -32,12 +32,17 @@ struct NativeStackGuard {
         const auto current = reinterpret_cast<uintptr_t>(marker);
         if (!origin) origin = current;
         const auto consumed = current > origin ? current - origin : origin - current;
-        size_t limit = Options::Get().stack_size_kb > 0 ? (Options::Get().stack_size_kb * 1024) : (256 * 1024);
+#if defined(AETHER_SANITIZE_ACTIVE) || defined(__SANITIZE_ADDRESS__) || defined(_MSVC_SANITIZE_ADDRESS)
+        constexpr size_t kDefaultStackBudget = 2048 * 1024; // 2 MB for ASan/TSan frame bloat
+#else
+        constexpr size_t kDefaultStackBudget = 256 * 1024;  // 256 KB release default
+#endif
+        size_t limit = Options::Get().stack_size_kb > 0 ? (Options::Get().stack_size_kb * 1024) : kDefaultStackBudget;
         exhausted = consumed >= limit;
 #ifdef _WIN32
         ULONG_PTR low = 0, high = 0;
         GetCurrentThreadStackLimits(&low, &high);
-        if (current >= low && current <= high && current - low < 192 * 1024) exhausted = true;
+        if (current >= low && current <= high && current - low < 64 * 1024) exhausted = true;
 #endif
     }
     ~NativeStackGuard() { origin = previous; }
