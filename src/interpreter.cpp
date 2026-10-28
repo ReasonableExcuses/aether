@@ -12,6 +12,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <pthread.h>
 #endif
 
 namespace aether {
@@ -22,6 +24,46 @@ IsolateHeap& ExecutionHeap() {
     return heap ? *heap : IsolateHeap::RuntimeFallbackHeap();
 }
 
+inline void GetThreadStackLimits(uintptr_t* out_low, uintptr_t* out_high) {
+#if defined(_WIN32)
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    *out_low = static_cast<uintptr_t>(low);
+    *out_high = static_cast<uintptr_t>(high);
+#elif defined(__linux__)
+    static thread_local uintptr_t cached_low = 0;
+    static thread_local uintptr_t cached_high = 0;
+    if (AETHER_UNLIKELY(!cached_high)) {
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            void* stackaddr = nullptr;
+            size_t stacksize = 0;
+            pthread_attr_getstack(&attr, &stackaddr, &stacksize);
+            pthread_attr_destroy(&attr);
+            cached_low = reinterpret_cast<uintptr_t>(stackaddr);
+            cached_high = cached_low + stacksize;
+        }
+    }
+    *out_low = cached_low;
+    *out_high = cached_high;
+#elif defined(__APPLE__)
+    static thread_local uintptr_t cached_low = 0;
+    static thread_local uintptr_t cached_high = 0;
+    if (AETHER_UNLIKELY(!cached_high)) {
+        pthread_t self = pthread_self();
+        void* stackaddr = pthread_get_stackaddr_np(self);
+        size_t stacksize = pthread_get_stacksize_np(self);
+        cached_high = reinterpret_cast<uintptr_t>(stackaddr);
+        cached_low = cached_high - stacksize;
+    }
+    *out_low = cached_low;
+    *out_high = cached_high;
+#else
+    *out_low = 0;
+    *out_high = 0;
+#endif
+}
+
 // Shared by all interpreters on the thread, including native callbacks that
 // reenter with another interpreter. Check before entering the large opcode loop.
 struct NativeStackGuard {
@@ -29,29 +71,56 @@ struct NativeStackGuard {
     uintptr_t previous;
     bool exhausted;
     explicit NativeStackGuard(const void* marker) : previous(origin), exhausted(false) {
+#if defined(__GNUC__) || defined(__clang__)
+        const auto current = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+#else
         const auto current = reinterpret_cast<uintptr_t>(marker);
+#endif
+        (void)marker;
         if (!origin) origin = current;
         const auto consumed = current > origin ? current - origin : origin - current;
+
+        // If an explicit stack size limit is configured via Options (--stack-size=N), enforce it
+        if (Options::Get().stack_size_kb > 0) {
+            size_t limit = Options::Get().stack_size_kb * 1024;
+            if (consumed >= limit) {
+                exhausted = true;
+                return;
+            }
+        }
+
+        // Real OS stack headroom check
+        uintptr_t low = 0, high = 0;
+        GetThreadStackLimits(&low, &high);
+        if (low != 0 && high != 0 && current >= low && current <= high) {
 #if defined(AETHER_SANITIZE_ACTIVE) || defined(__SANITIZE_ADDRESS__) || defined(_MSVC_SANITIZE_ADDRESS)
 #if defined(_WIN32)
-        constexpr size_t kDefaultStackBudget = 512 * 1024;  // 512 KB on Windows under ASan
+            constexpr uintptr_t kHeadroom = 256 * 1024;  // 256 KB on Windows under ASan
 #else
-        constexpr size_t kDefaultStackBudget = 1024 * 1024; // 1 MB on Linux/macOS under ASan/TSan
+            constexpr uintptr_t kHeadroom = 1024 * 1024; // 1 MB on Linux/macOS under ASan/TSan
 #endif
 #else
-        constexpr size_t kDefaultStackBudget = 256 * 1024;  // 256 KB release default
+#if defined(_WIN32)
+            constexpr uintptr_t kHeadroom = 64 * 1024;   // 64 KB on Windows release
+#else
+            constexpr uintptr_t kHeadroom = 128 * 1024;  // 128 KB on Linux/macOS release
 #endif
-        size_t limit = Options::Get().stack_size_kb > 0 ? (Options::Get().stack_size_kb * 1024) : kDefaultStackBudget;
-        exhausted = consumed >= limit;
-#ifdef _WIN32
-        ULONG_PTR low = 0, high = 0;
-        GetCurrentThreadStackLimits(&low, &high);
+#endif
+            if (current - low < kHeadroom) {
+                exhausted = true;
+                return;
+            }
+        } else {
+            // Fallback budget if OS stack bounds cannot be determined
 #if defined(AETHER_SANITIZE_ACTIVE) || defined(__SANITIZE_ADDRESS__) || defined(_MSVC_SANITIZE_ADDRESS)
-        if (current >= low && current <= high && current - low < 256 * 1024) exhausted = true;
+            constexpr size_t kFallbackBudget = 1024 * 1024;
 #else
-        if (current >= low && current <= high && current - low < 64 * 1024) exhausted = true;
+            constexpr size_t kFallbackBudget = 256 * 1024;
 #endif
-#endif
+            if (consumed >= kFallbackBudget) {
+                exhausted = true;
+            }
+        }
     }
     ~NativeStackGuard() { origin = previous; }
 };
