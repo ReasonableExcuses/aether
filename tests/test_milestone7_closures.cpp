@@ -103,6 +103,8 @@ void TestPrototypeInheritance() {
     child->SetNamedProperty("baseVal", TaggedValue::FromSmi(99), shape_id);
     assert(child->GetNamedProperty("baseVal").AsSmi() == 99);
     assert(proto->GetNamedProperty("baseVal").AsSmi() == 42);
+    delete child;
+    delete proto;
 
     // 2. Constructor Prototype Chain via JavaScript code
     const char* src =

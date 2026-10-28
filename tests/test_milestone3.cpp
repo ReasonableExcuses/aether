@@ -41,6 +41,7 @@ void TestCardTableWriteBarrier() {
     void* old_mem = heap.GetOldGen().Allocate(sizeof(JSObject));
     JSObject* old_obj = new (old_mem) JSObject(root_shape.get());
     old_obj->SetOld(true);
+    heap.GetOldGen().RegisterObject(old_obj);
 
     // 2. Allocate a young-generation object in Nursery
     JSObject* young_obj = heap.Allocate<JSObject>(root_shape.get());

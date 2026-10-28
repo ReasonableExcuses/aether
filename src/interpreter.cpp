@@ -42,7 +42,11 @@ struct NativeStackGuard {
 #ifdef _WIN32
         ULONG_PTR low = 0, high = 0;
         GetCurrentThreadStackLimits(&low, &high);
+#if defined(AETHER_SANITIZE_ACTIVE) || defined(__SANITIZE_ADDRESS__) || defined(_MSVC_SANITIZE_ADDRESS)
+        if (current >= low && current <= high && current - low < 256 * 1024) exhausted = true;
+#else
         if (current >= low && current <= high && current - low < 64 * 1024) exhausted = true;
+#endif
 #endif
     }
     ~NativeStackGuard() { origin = previous; }

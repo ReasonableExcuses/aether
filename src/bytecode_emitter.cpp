@@ -3010,7 +3010,7 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
         functions_[node->Name()] = ctor_fn;
     }
 
-    auto* proto_shape = new Shape(0, nullptr, "", TaggedValue::Null());
+    Shape* proto_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
     auto* proto_obj = AllocateRuntime<JSObject>(proto_shape);
     if (!node->SuperName().empty()) {
         JSFunction* super_fn = LookupFunction(node->SuperName());

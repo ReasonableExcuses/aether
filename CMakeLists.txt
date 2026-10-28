@@ -17,6 +17,7 @@ option(AETHER_GC_STRESS_DEFAULT "Enable GC stress by default" OFF)
 
 if(MSVC)
     add_compile_options(/std:c++latest /W4 /permissive- /Zc:preprocessor)
+    add_link_options(/STACK:8388608)
     if(AETHER_SANITIZE)
         add_compile_definitions(AETHER_SANITIZE_ACTIVE=1)
         add_compile_options(/fsanitize=address)
