@@ -597,7 +597,9 @@ private:
 
 class BlockStmt : public Stmt {
 public:
-    BlockStmt() = default;
+    explicit BlockStmt(bool is_lexical_scope = true) : is_lexical_scope_(is_lexical_scope) {}
+    bool IsLexicalScope() const noexcept { return is_lexical_scope_; }
+    void SetLexicalScope(bool s) noexcept { is_lexical_scope_ = s; }
     void AddStatement(std::unique_ptr<Stmt> stmt) {
         statements_.push_back(std::move(stmt));
     }
@@ -607,6 +609,7 @@ public:
 
 private:
     std::vector<std::unique_ptr<Stmt>> statements_;
+    bool is_lexical_scope_{true};
 };
 
 class IfStmt : public Stmt {
@@ -714,6 +717,20 @@ class DebuggerStmt : public Stmt {
 public:
     DebuggerStmt() = default;
     void Accept(ASTVisitor* visitor) override;
+};
+
+class LabeledStmt : public Stmt {
+public:
+    LabeledStmt(std::string_view label, std::unique_ptr<Stmt> body)
+        : label_(label), body_(std::move(body)) {}
+
+    const std::string& Label() const noexcept { return label_; }
+    Stmt* Body() const noexcept { return body_.get(); }
+    void Accept(ASTVisitor* visitor) override;
+
+private:
+    std::string label_;
+    std::unique_ptr<Stmt> body_;
 };
 
 class FunctionDeclStmt : public Stmt {
@@ -1046,6 +1063,7 @@ public:
     virtual void VisitImportDecl(ImportDeclStmt* node) = 0;
     virtual void VisitExportDecl(ExportDeclStmt* node) = 0;
     virtual void VisitWith(WithStmt* node) { (void)node; }
+    virtual void VisitLabeled(LabeledStmt* node) { (void)node; }
     virtual void VisitThrow(ThrowStmt* node) = 0;
     virtual void VisitTryCatch(TryCatchStmt* node) = 0;
     virtual void VisitReturn(ReturnStmt* node) = 0;
@@ -1104,6 +1122,7 @@ inline void ThrowStmt::Accept(ASTVisitor* v) { v->VisitThrow(this); }
 inline void TryCatchStmt::Accept(ASTVisitor* v) { v->VisitTryCatch(this); }
 inline void ReturnStmt::Accept(ASTVisitor* v) { v->VisitReturn(this); }
 inline void WithStmt::Accept(ASTVisitor* v) { v->VisitWith(this); }
+inline void LabeledStmt::Accept(ASTVisitor* v) { v->VisitLabeled(this); }
 inline void PrivateIdentifierExpr::Accept(ASTVisitor* v) { v->VisitPrivateIdentifier(this); }
 inline void ClassExpr::Accept(ASTVisitor* v) { v->VisitClassExpr(this); }
 inline void Program::Accept(ASTVisitor* v) { v->VisitProgram(this); }

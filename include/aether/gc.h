@@ -51,10 +51,24 @@ public:
         return cards_[index] == kDirtyCard;
     }
 
+    AETHER_ALWAYS_INLINE bool IsCardMarked(const void* ptr) const noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr < heap_base_) return false;
+        size_t idx = (addr - heap_base_) >> kCardShift;
+        return IsDirty(idx);
+    }
+
     AETHER_ALWAYS_INLINE void ClearCard(size_t index) noexcept {
         if (index < card_count_) {
             cards_[index] = kCleanCard;
         }
+    }
+
+    AETHER_ALWAYS_INLINE void ClearCard(const void* ptr) noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (addr < heap_base_) return;
+        size_t idx = (addr - heap_base_) >> kCardShift;
+        ClearCard(idx);
     }
 
     void Clear() noexcept {

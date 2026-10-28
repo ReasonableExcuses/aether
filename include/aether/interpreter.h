@@ -33,6 +33,12 @@ public:
         for (size_t i = 0; i < args.size() && i < registers_.size(); ++i) {
             registers_[i] = args[i];
         }
+        for (const auto& lex_name : bytecode.GetLexicalNames()) {
+            auto it = bytecode.GetRegisterScope().find(lex_name);
+            if (it != bytecode.GetRegisterScope().end() && it->second < registers_.size()) {
+                registers_[it->second] = TaggedValue::Empty();
+            }
+        }
     }
 
     AETHER_ALWAYS_INLINE TaggedValue GetRegister(uint8_t reg) const noexcept {

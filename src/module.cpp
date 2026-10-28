@@ -206,6 +206,9 @@ void SourceTextModuleRecord::Parse(std::string_view source) {
             if (n->Object()) n->Object()->Accept(this);
             if (n->Body()) n->Body()->Accept(this);
         }
+        void VisitLabeled(LabeledStmt* n) override {
+            if (n->Body()) n->Body()->Accept(this);
+        }
         void VisitThrow(ThrowStmt* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
         void VisitTryCatch(TryCatchStmt* n) override {
             if (n->TryBlock()) n->TryBlock()->Accept(this);

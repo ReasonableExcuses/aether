@@ -198,6 +198,9 @@ struct YieldAwaitChecker : public ASTVisitor {
         if (n->Object()) n->Object()->Accept(this);
         if (n->Body()) n->Body()->Accept(this);
     }
+    void VisitLabeled(LabeledStmt* n) override {
+        if (n->Body()) n->Body()->Accept(this);
+    }
     void VisitThrow(ThrowStmt* n) override { if (n->GetExpr()) n->GetExpr()->Accept(this); }
     void VisitTryCatch(TryCatchStmt* n) override {
         if (n->TryBlock()) n->TryBlock()->Accept(this);
@@ -206,6 +209,19 @@ struct YieldAwaitChecker : public ASTVisitor {
     }
     void VisitReturn(ReturnStmt* n) override { if (n->Value()) n->Value()->Accept(this); }
     void VisitProgram(Program* n) override { for (const auto& s : n->Statements()) if (s) s->Accept(this); }
+};
+
+struct JumpChecker : public YieldAwaitChecker {
+    bool has_jump{false};
+    void VisitBreak(BreakStmt*) override { has_jump = true; }
+    void VisitContinue(ContinueStmt*) override { has_jump = true; }
+    void VisitReturn(ReturnStmt*) override { has_jump = true; }
+};
+
+struct ClosureChecker : public YieldAwaitChecker {
+    bool has_closure{false};
+    void VisitFunctionExpr(FunctionExpr*) override { has_closure = true; }
+    void VisitFunctionDecl(FunctionDeclStmt*) override { has_closure = true; }
 };
 
 Token Parser::Consume(TokenKind kind, std::string_view error_message) {
@@ -355,6 +371,20 @@ std::unique_ptr<Program> Parser::ParseProgram() {
 
 std::unique_ptr<Stmt> Parser::ParseStatement() {
     NoGCScope compilation;
+    if (Check(TokenKind::Identifier) || Check(TokenKind::Async) ||
+        (!strict_mode_ && !in_generator_ && Check(TokenKind::Yield)) ||
+        (!is_module_ && !in_async_ && Check(TokenKind::Await))) {
+        Lexer saved_lexer = lexer_;
+        Token saved_tok = current_token_;
+        Token id_tok = Advance();
+        if (Check(TokenKind::Colon)) {
+            Advance(); // consume ':'
+            auto body = ParseStatement();
+            return std::make_unique<LabeledStmt>(id_tok.text, std::move(body));
+        }
+        lexer_ = saved_lexer;
+        current_token_ = saved_tok;
+    }
     if (Match(TokenKind::Var)) {
         return ParseVarDecl(/*is_const=*/false, VarDeclStmt::Kind::Var);
     }
@@ -439,7 +469,7 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
         return ParseBlock();
     }
     if (Match(TokenKind::Semicolon)) {
-        return std::make_unique<BlockStmt>(); // Empty statement
+        return std::make_unique<BlockStmt>(/*is_lexical_scope=*/false); // Empty statement
     }
     return ParseExprStmt();
 }
@@ -447,122 +477,18 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
 std::unique_ptr<Stmt> Parser::ParseVarDecl(bool is_const, VarDeclStmt::Kind kind) {
     auto parse_one_declarator = [&]() -> std::vector<std::unique_ptr<Stmt>> {
         std::vector<std::unique_ptr<Stmt>> stmts;
-        // 1. Array destructuring: let [a, b, c = def] = expr;
-        if (Match(TokenKind::OpenBracket)) {
-            struct ArrayElem {
-                std::string name;
-                std::unique_ptr<Expr> default_val;
-            };
-            std::vector<ArrayElem> elems;
-            if (!Check(TokenKind::CloseBracket)) {
-                do {
-                    Token elem_tok = Consume(TokenKind::Identifier, "Expected identifier in array destructuring");
-                    std::unique_ptr<Expr> def_val = nullptr;
-                    if (Match(TokenKind::Equal)) {
-                        def_val = ParseExpression();
-                    }
-                    elems.push_back(ArrayElem{elem_tok.text, std::move(def_val)});
-                } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBracket));
-            }
-            Consume(TokenKind::CloseBracket, "Expected ']' in array destructuring");
+        // Destructuring declaration: [a, b] = expr or { a, b: c } = expr
+        if (Check(TokenKind::OpenBracket) || Check(TokenKind::OpenBrace)) {
+            static uint32_t s_destruct_decl_id = 0;
+            std::string temp_var = "$d_decl_" + std::to_string(++s_destruct_decl_id);
+            std::vector<std::unique_ptr<Stmt>> dstr_stmts;
+            ParsePatternDestructuring(temp_var, dstr_stmts, nullptr, is_const, kind);
             Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
             auto rhs = ParseExpression();
-
-            static uint32_t s_destruct_arr_id = 0;
-            std::string temp_var = "$d_arr_" + std::to_string(++s_destruct_arr_id);
-            stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-            for (size_t i = 0; i < elems.size(); ++i) {
-                auto idx_access = std::make_unique<IndexAccessExpr>(
-                    std::make_unique<IdentifierExpr>(temp_var),
-                    std::make_unique<LiteralExpr>(TaggedValue::FromSmi(static_cast<int32_t>(i)))
-                );
-                std::unique_ptr<Expr> init_expr;
-                if (elems[i].default_val) {
-                    init_expr = std::make_unique<BinaryExpr>(
-                        BinaryOp::NullishCoalescing,
-                        std::move(idx_access),
-                        std::move(elems[i].default_val)
-                    );
-                } else {
-                    init_expr = std::move(idx_access);
-                }
-                stmts.push_back(std::make_unique<VarDeclStmt>(elems[i].name, std::move(init_expr), is_const, kind));
+            stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs), false, kind));
+            for (auto& s : dstr_stmts) {
+                stmts.push_back(std::move(s));
             }
-            return stmts;
-        }
-
-        // 2. Object destructuring: let { a, b: c, active = true, coords: { lat, lng } } = expr;
-        if (Match(TokenKind::OpenBrace)) {
-            struct BindingItem {
-                std::string prop;
-                std::string local_var;
-                std::unique_ptr<Expr> default_val;
-                std::vector<BindingItem> nested_items;
-                bool is_nested{false};
-            };
-            std::function<std::vector<BindingItem>()> parse_pattern = [&]() {
-                std::vector<BindingItem> items;
-                if (!Check(TokenKind::CloseBrace)) {
-                    do {
-                        Token prop_tok = Consume(TokenKind::Identifier, "Expected property in object destructuring");
-                        BindingItem item;
-                        item.prop = prop_tok.text;
-                        item.local_var = prop_tok.text;
-                        if (Match(TokenKind::Colon)) {
-                            if (Match(TokenKind::OpenBrace)) {
-                                item.is_nested = true;
-                                item.nested_items = parse_pattern();
-                            } else {
-                                Token alias_tok = Consume(TokenKind::Identifier, "Expected alias name in object destructuring");
-                                item.local_var = alias_tok.text;
-                            }
-                        }
-                        if (Match(TokenKind::Equal)) {
-                            item.default_val = ParseExpression();
-                        }
-                        items.push_back(std::move(item));
-                    } while (Match(TokenKind::Comma) && !Check(TokenKind::CloseBrace));
-                }
-                Consume(TokenKind::CloseBrace, "Expected '}' in object destructuring");
-                return items;
-            };
-
-            auto items = parse_pattern();
-            Consume(TokenKind::Equal, "Expected '=' in destructuring declaration");
-            auto rhs = ParseExpression();
-
-            static uint32_t s_destruct_obj_id = 0;
-            std::string temp_var = "$d_obj_" + std::to_string(++s_destruct_obj_id);
-            stmts.push_back(std::make_unique<VarDeclStmt>(temp_var, std::move(rhs)));
-
-            std::function<void(const std::string&, std::vector<BindingItem>&)> emit_bindings =
-                [&](const std::string& parent_var, std::vector<BindingItem>& item_list) {
-                for (auto& it : item_list) {
-                    auto prop_access = std::make_unique<PropertyAccessExpr>(
-                        std::make_unique<IdentifierExpr>(parent_var),
-                        it.prop
-                    );
-                    if (it.is_nested) {
-                        std::string sub_var = "$d_sub_" + std::to_string(++s_destruct_obj_id);
-                        stmts.push_back(std::make_unique<VarDeclStmt>(sub_var, std::move(prop_access)));
-                        emit_bindings(sub_var, it.nested_items);
-                    } else {
-                        std::unique_ptr<Expr> init_expr;
-                        if (it.default_val) {
-                            init_expr = std::make_unique<BinaryExpr>(
-                                BinaryOp::NullishCoalescing,
-                                std::move(prop_access),
-                                std::move(it.default_val)
-                            );
-                        } else {
-                            init_expr = std::move(prop_access);
-                        }
-                        stmts.push_back(std::make_unique<VarDeclStmt>(it.local_var, std::move(init_expr), is_const, kind));
-                    }
-                }
-            };
-
-            emit_bindings(temp_var, items);
             return stmts;
         }
 
@@ -606,7 +532,7 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl(bool is_const, VarDeclStmt::Kind kind
     if (all_stmts.size() == 1) {
         return std::move(all_stmts[0]);
     }
-    auto block = std::make_unique<BlockStmt>();
+    auto block = std::make_unique<BlockStmt>(/*is_lexical_scope=*/false);
     for (auto& s : all_stmts) {
         block->AddStatement(std::move(s));
     }
@@ -618,7 +544,9 @@ static uint32_t s_destruct_counter = 0;
 void Parser::ParsePatternDestructuring(
     const std::string& source_var,
     std::vector<std::unique_ptr<Stmt>>& destructuring_stmts,
-    std::function<void(const std::string&)> add_param_name) {
+    std::function<void(const std::string&)> add_param_name,
+    bool is_const,
+    VarDeclStmt::Kind kind) {
     if (Check(TokenKind::OpenBracket)) {
         Advance(); // Consume '['
         std::string iter_var = "$d_iter_" + std::to_string(++s_destruct_counter);
@@ -705,9 +633,9 @@ void Parser::ParsePatternDestructuring(
                         throw std::runtime_error("SyntaxError: Rest element cannot have default initializer");
                     }
                     destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(
-                        r_tok.text, std::make_unique<IdentifierExpr>(rest_arr)));
+                        r_tok.text, std::make_unique<IdentifierExpr>(rest_arr), is_const, kind));
                 } else if (Check(TokenKind::OpenBracket) || Check(TokenKind::OpenBrace)) {
-                    ParsePatternDestructuring(rest_arr, destructuring_stmts, add_param_name);
+                    ParsePatternDestructuring(rest_arr, destructuring_stmts, add_param_name, is_const, kind);
                 }
                 break;
             }
@@ -772,11 +700,11 @@ void Parser::ParsePatternDestructuring(
                 } else {
                     init_expr = std::make_unique<IdentifierExpr>(val_var);
                 }
-                destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(el_tok.text, std::move(init_expr)));
+                destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(el_tok.text, std::move(init_expr), is_const, kind));
             } else if (Check(TokenKind::OpenBracket) || Check(TokenKind::OpenBrace)) {
                 std::string sub_var = "$d_sub_" + std::to_string(++s_destruct_counter);
                 size_t insert_idx = destructuring_stmts.size();
-                ParsePatternDestructuring(sub_var, destructuring_stmts, add_param_name);
+                ParsePatternDestructuring(sub_var, destructuring_stmts, add_param_name, is_const, kind);
                 std::unique_ptr<Expr> init_expr;
                 if (Match(TokenKind::Equal)) {
                     auto def_expr = ParseExpression();
@@ -909,7 +837,7 @@ void Parser::ParsePatternDestructuring(
                     assign_args.push_back(std::make_unique<ObjectLiteralExpr>(std::vector<ObjectLiteralExpr::Property>{}));
                     assign_args.push_back(std::make_unique<IdentifierExpr>(source_var));
                     auto assign_call = std::make_unique<CallExpr>(std::move(assign_callee), std::move(assign_args));
-                    destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(r_tok.text, std::move(assign_call)));
+                    destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(r_tok.text, std::move(assign_call), is_const, kind));
 
                     // delete rest[key] for each extracted property
                     for (const auto& ep : extracted_props) {
@@ -1022,11 +950,11 @@ void Parser::ParsePatternDestructuring(
                     } else {
                         init_expr = std::make_unique<IdentifierExpr>(val_var);
                     }
-                    destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(local_name, std::move(init_expr)));
+                    destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(local_name, std::move(init_expr), is_const, kind));
                 } else if (Check(TokenKind::OpenBracket) || Check(TokenKind::OpenBrace)) {
                     std::string sub_var = "$d_sub_" + std::to_string(++s_destruct_counter);
                     size_t insert_idx = destructuring_stmts.size();
-                    ParsePatternDestructuring(sub_var, destructuring_stmts, add_param_name);
+                    ParsePatternDestructuring(sub_var, destructuring_stmts, add_param_name, is_const, kind);
                     std::unique_ptr<Expr> init_expr;
                     if (Match(TokenKind::Equal)) {
                         auto def_expr = ParseExpression();
@@ -1083,7 +1011,7 @@ void Parser::ParsePatternDestructuring(
                 } else {
                     init_expr = std::make_unique<IdentifierExpr>(val_var);
                 }
-                destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(local_name, std::move(init_expr)));
+                destructuring_stmts.push_back(std::make_unique<VarDeclStmt>(local_name, std::move(init_expr), is_const, kind));
             }
 
             if (Match(TokenKind::Comma)) {
@@ -1219,6 +1147,10 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
 
 void Parser::ValidateSubstatement(const Stmt* stmt, bool is_if) {
     if (!stmt) return;
+    if (auto* lbl = dynamic_cast<const LabeledStmt*>(stmt)) {
+        ValidateSubstatement(lbl->Body(), is_if);
+        return;
+    }
     if (auto* var_decl = dynamic_cast<const VarDeclStmt*>(stmt)) {
         if (var_decl->GetKind() == VarDeclStmt::Kind::Let || var_decl->GetKind() == VarDeclStmt::Kind::Const) {
             throw std::runtime_error("SyntaxError: Lexical declaration cannot appear in a single-statement context");
@@ -1524,7 +1456,40 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
         // update: $step = (await)? $iter.next()
         auto update_step = std::make_unique<AssignExpr>(step_var, call_next());
 
-        outer_block->AddStatement(std::make_unique<ForStmt>(nullptr, std::move(cond), std::move(update_step), std::move(loop_body)));
+        auto for_stmt = std::make_unique<ForStmt>(nullptr, std::move(cond), std::move(update_step), std::move(loop_body));
+
+        if (is_for_of) {
+            auto not_done = std::make_unique<UnaryExpr>(
+                UnaryOp::LogicalNot,
+                std::make_unique<PropertyAccessExpr>(
+                    std::make_unique<IdentifierExpr>(step_var), "done"));
+            auto ret_prop = std::make_unique<PropertyAccessExpr>(
+                std::make_unique<IdentifierExpr>(iter_var), "return");
+            auto ret_type = std::make_unique<UnaryExpr>(UnaryOp::TypeOf, std::move(ret_prop));
+            auto is_fn = std::make_unique<BinaryExpr>(
+                BinaryOp::StrictEqual,
+                std::move(ret_type),
+                std::make_unique<LiteralExpr>(TaggedValue::FromHeapObject(AllocateRuntime<JSString>("function"))));
+            auto close_cond = std::make_unique<BinaryExpr>(
+                BinaryOp::LogicalAnd,
+                std::move(not_done),
+                std::move(is_fn));
+            auto call_ret = std::make_unique<CallExpr>(
+                std::make_unique<PropertyAccessExpr>(
+                    std::make_unique<IdentifierExpr>(iter_var), "return"),
+                std::vector<std::unique_ptr<Expr>>{});
+            auto if_close = std::make_unique<IfStmt>(
+                std::move(close_cond),
+                std::make_unique<ExprStmt>(std::move(call_ret)),
+                nullptr);
+            auto finally_block = std::make_unique<BlockStmt>();
+            finally_block->AddStatement(std::move(if_close));
+
+            auto try_finally = std::make_unique<TryCatchStmt>(std::move(for_stmt), "", nullptr, std::move(finally_block));
+            outer_block->AddStatement(std::move(try_finally));
+        } else {
+            outer_block->AddStatement(std::move(for_stmt));
+        }
         return outer_block;
     }
 
@@ -1536,6 +1501,9 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
     lexer_ = saved_lexer;
     current_token_ = saved_tok;
 
+    bool is_let_loop = false;
+    std::string let_loop_name;
+
     std::unique_ptr<Stmt> init = nullptr;
     if (!Check(TokenKind::Semicolon)) {
         bool saved_allow_in = allow_in_;
@@ -1543,7 +1511,11 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
         if (Match(TokenKind::Var)) {
             init = ParseVarDecl(false, VarDeclStmt::Kind::Var);
         } else if (Match(TokenKind::Let)) {
+            is_let_loop = true;
             init = ParseVarDecl(false, VarDeclStmt::Kind::Let);
+            if (auto* vd = dynamic_cast<VarDeclStmt*>(init.get())) {
+                let_loop_name = vd->Name();
+            }
         } else if (Match(TokenKind::Const)) {
             init = ParseVarDecl(true, VarDeclStmt::Kind::Const);
         } else {
@@ -1568,6 +1540,24 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
 
     auto body = ParseStatement();
     ValidateSubstatement(body.get(), /*is_if=*/false);
+
+    if (is_let_loop && !let_loop_name.empty() && body) {
+        JumpChecker jc;
+        body->Accept(&jc);
+        ClosureChecker cc;
+        body->Accept(&cc);
+        if (!jc.has_jump && cc.has_closure) {
+            auto fn_body = std::make_unique<BlockStmt>();
+            fn_body->AddStatement(std::move(body));
+            auto iife_fn = std::make_unique<FunctionExpr>("", std::vector<std::string>{let_loop_name}, std::move(fn_body));
+            iife_fn->SetArrow(true);
+            std::vector<std::unique_ptr<Expr>> iife_args;
+            iife_args.push_back(std::make_unique<IdentifierExpr>(let_loop_name));
+            auto iife_call = std::make_unique<CallExpr>(std::move(iife_fn), std::move(iife_args));
+            body = std::make_unique<ExprStmt>(std::move(iife_call));
+        }
+    }
+
     return std::make_unique<ForStmt>(std::move(init), std::move(cond), std::move(update), std::move(body));
 }
 

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <functional>
+#include <unordered_set>
 
 namespace aether {
 
@@ -298,7 +299,8 @@ public:
           is_compiling_tier2_(other.is_compiling_tier2_.load(std::memory_order_relaxed)),
           feedback_(std::move(other.feedback_)),
           register_scope_(std::move(other.register_scope_)),
-          context_slots_(std::move(other.context_slots_)) {
+          context_slots_(std::move(other.context_slots_)),
+          lexical_names_(std::move(other.lexical_names_)) {
         std::lock_guard<std::mutex> lock(other.tier_mutex_);
         tier1_code_ = std::move(other.tier1_code_);
         tier2_code_ = std::move(other.tier2_code_);
@@ -317,6 +319,7 @@ public:
             feedback_ = std::move(other.feedback_);
             register_scope_ = std::move(other.register_scope_);
             context_slots_ = std::move(other.context_slots_);
+            lexical_names_ = std::move(other.lexical_names_);
             std::scoped_lock lock(tier_mutex_, other.tier_mutex_);
             tier1_code_ = std::move(other.tier1_code_);
             tier2_code_ = std::move(other.tier2_code_);
@@ -332,6 +335,7 @@ public:
         copy->is_strict_ = is_strict_;
         copy->register_scope_ = register_scope_;
         copy->context_slots_ = context_slots_;
+        copy->lexical_names_ = lexical_names_;
         copy->invocation_count_.store(invocation_count_.load(std::memory_order_relaxed));
         copy->is_compiling_tier2_.store(is_compiling_tier2_.load(std::memory_order_relaxed));
         auto snap = feedback_.Snapshot();
@@ -373,6 +377,10 @@ public:
 
     const std::unordered_map<std::string, uint16_t>& GetContextSlots() const noexcept { return context_slots_; }
     void SetContextSlots(std::unordered_map<std::string, uint16_t> cs) { context_slots_ = std::move(cs); }
+
+    const std::unordered_set<std::string>& GetLexicalNames() const noexcept { return lexical_names_; }
+    void AddLexicalName(std::string name) { lexical_names_.insert(std::move(name)); }
+    bool IsLexicalName(const std::string& name) const noexcept { return lexical_names_.count(name) != 0; }
 
     // Emission primitives
     size_t CurrentOffset() const noexcept { return bytes_.size(); }
@@ -458,6 +466,7 @@ private:
     mutable TypeFeedbackVector feedback_;
     std::unordered_map<std::string, uint8_t> register_scope_;
     std::unordered_map<std::string, uint16_t> context_slots_;
+    std::unordered_set<std::string> lexical_names_;
 };
 
 } // namespace aether

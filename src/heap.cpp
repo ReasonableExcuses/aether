@@ -2,6 +2,8 @@
 #include "aether/concurrent_marker.h"
 #include "aether/advanced_intrinsics.h"
 #include "aether/wasm.h"
+#include "aether/heap_verifier.h"
+#include "aether/options.h"
 #include <deque>
 #include <cstring>
 #include <stdexcept>
@@ -65,6 +67,9 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
     }
     concurrent_marker_ = std::make_unique<ConcurrentMarker>(*this);
+    if (Options::Get().max_heap_mb > 0) {
+        budget_->SetTotalLimit(Options::Get().max_heap_mb * 1024 * 1024);
+    }
     previous_current_heap_ = s_current_heap_;
     s_current_heap_ = this;
 }
@@ -166,6 +171,7 @@ void IsolateHeap::ProcessWeak(const std::vector<HeapObject*>& live,
 void IsolateHeap::MinorGC() {
     AssertOwnerThread();
     if (!GCAllowed()) return;
+    HeapVerifier::VerifyBeforeGC(*this);
     CollectionScope collecting(collecting_);
     // Until every mutation path has a complete barrier, scan all tenured
     // objects. This is conservative for a minor cycle, not permanent rooting.
@@ -246,6 +252,10 @@ void IsolateHeap::MinorGC() {
     nursery_.Flip(bump);
     card_table_.Clear();
     ++minor_gc_count_;
+    HeapVerifier::VerifyAfterGC(*this);
+    if (Options::Get().trace_gc) {
+        std::cout << "[GC] MinorGC #" << minor_gc_count_ << ": live young=" << survivors.size() << std::endl;
+    }
 }
 
 void IsolateHeap::NotifyConcurrentWrite(HeapObject* source, TaggedValue value) noexcept {
@@ -274,6 +284,7 @@ void IsolateHeap::FinalizeConcurrentGC() {
 void IsolateHeap::MajorGC() {
     AssertOwnerThread();
     if (!GCAllowed()) return;
+    HeapVerifier::VerifyBeforeGC(*this);
     CollectionScope collecting(collecting_);
     auto live = Trace({});
     std::unordered_set<HeapObject*> alive(live.begin(), live.end());
@@ -296,6 +307,10 @@ void IsolateHeap::MajorGC() {
     old_gen_.Sweep();
     card_table_.Clear();
     ++major_gc_count_;
+    HeapVerifier::VerifyAfterGC(*this);
+    if (Options::Get().trace_gc) {
+        std::cout << "[GC] MajorGC #" << major_gc_count_ << ": live=" << live.size() << " objects, usage=" << (budget_->ChargedBytes() / 1024) << "KB" << std::endl;
+    }
 }
 
 bool IsolateHeap::CollectAtSafepoint() {

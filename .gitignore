@@ -19,7 +19,9 @@ CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 PASSOVER.md
+AETHER_AGENT_PLAN.md
 enterprise_hardening_plan.md
+
 # Visual Studio / IDE
 .vs/
 .vscode/

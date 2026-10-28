@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * 0' # Weekly matrix on Sunday at midnight UTC
+
+jobs:
+  matrix-build:
+    name: ${{ matrix.name }} (${{ matrix.config }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.allow-failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu GCC
+          - name: ubuntu-gcc
+            os: ubuntu-24.04
+            c_compiler: gcc-13
+            cxx_compiler: g++-13
+            config: Release
+            cmake_flags: ""
+          - name: ubuntu-gcc-sanitize
+            os: ubuntu-24.04
+            c_compiler: gcc-13
+            cxx_compiler: g++-13
+            config: RelWithDebInfo
+            cmake_flags: "-DAETHER_SANITIZE=ON"
+
+          # Ubuntu Clang
+          - name: ubuntu-clang
+            os: ubuntu-24.04
+            c_compiler: clang-18
+            cxx_compiler: clang++-18
+            config: Release
+            cmake_flags: ""
+          - name: ubuntu-clang-sanitize
+            os: ubuntu-24.04
+            c_compiler: clang-18
+            cxx_compiler: clang++-18
+            config: RelWithDebInfo
+            cmake_flags: "-DAETHER_SANITIZE=ON"
+
+          # Windows MSVC
+          - name: windows-msvc
+            os: windows-latest
+            config: Release
+            cmake_flags: ""
+          - name: windows-msvc-sanitize
+            os: windows-latest
+            config: RelWithDebInfo
+            cmake_flags: "-DAETHER_SANITIZE=ON"
+
+          # macOS Clang (allow-fail)
+          - name: macos-clang
+            os: macos-latest
+            config: Release
+            cmake_flags: ""
+            allow-failure: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Linux Compilers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.c_compiler }} ${{ matrix.cxx_compiler }}
+
+      - name: Configure CMake
+        env:
+          CC: ${{ matrix.c_compiler }}
+          CXX: ${{ matrix.cxx_compiler }}
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          ${{ matrix.cmake_flags }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} -j
+
+      - name: Run Tests (CTest)
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+  tsan:
+    name: ubuntu-tsan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 clang++-18
+
+      - name: Configure CMake with TSan
+        env:
+          CC: clang-18
+          CXX: clang++-18
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DAETHER_TSAN=ON
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo -j
+
+      - name: Run Tests (CTest)
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+  matrix-test:
+    name: full-matrix-validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run Full Matrix Suite
+        run: python3 tools/matrix.py
+

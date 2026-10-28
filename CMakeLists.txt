@@ -5,10 +5,37 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type" FORCE)
+endif()
+
+find_package(Threads REQUIRED)
+
+option(AETHER_SANITIZE "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(AETHER_TSAN "Enable ThreadSanitizer" OFF)
+option(AETHER_GC_STRESS_DEFAULT "Enable GC stress by default" OFF)
+
 if(MSVC)
     add_compile_options(/std:c++latest /W4 /permissive- /Zc:preprocessor)
+    if(AETHER_SANITIZE)
+        add_compile_options(/fsanitize=address)
+    endif()
+    if(AETHER_GC_STRESS_DEFAULT)
+        add_compile_definitions(AETHER_GC_STRESS_DEFAULT=1)
+    endif()
 else()
     add_compile_options(-Wall -Wextra -Wpedantic)
+    if(AETHER_SANITIZE)
+        add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address,undefined)
+    endif()
+    if(AETHER_TSAN)
+        add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=thread)
+    endif()
+    if(AETHER_GC_STRESS_DEFAULT)
+        add_compile_definitions(AETHER_GC_STRESS_DEFAULT=1)
+    endif()
 endif()
 
 include_directories(include)
@@ -37,99 +64,29 @@ set(AETHER_SOURCES
     src/test262.cpp
     src/advanced_intrinsics.cpp
     src/bounded_regex.cpp
+    src/options.cpp
+    src/heap_verifier.cpp
 )
 
 add_library(aether_core STATIC ${AETHER_SOURCES})
-target_compile_options(aether_core PRIVATE /Zi)
-
-
-add_executable(test_milestone1 tests/test_milestone1.cpp)
-target_link_libraries(test_milestone1 PRIVATE aether_core)
-
-add_executable(test_milestone2 tests/test_milestone2.cpp)
-target_link_libraries(test_milestone2 PRIVATE aether_core)
-
-add_executable(test_milestone3 tests/test_milestone3.cpp)
-target_link_libraries(test_milestone3 PRIVATE aether_core)
-
-add_executable(test_milestone4_jit tests/test_milestone4_jit.cpp)
-target_link_libraries(test_milestone4_jit PRIVATE aether_core)
-
-add_executable(test_milestone5_son_jit tests/test_milestone5_son_jit.cpp)
-target_link_libraries(test_milestone5_son_jit PRIVATE aether_core)
-
-add_executable(test_milestone6_runtime tests/test_milestone6_runtime.cpp)
-target_link_libraries(test_milestone6_runtime PRIVATE aether_core)
-
-add_executable(test_milestone7_closures tests/test_milestone7_closures.cpp)
-target_link_libraries(test_milestone7_closures PRIVATE aether_core)
-
-add_executable(test_milestone8_intrinsics tests/test_milestone8_intrinsics.cpp)
-target_link_libraries(test_milestone8_intrinsics PRIVATE aether_core)
-
-add_executable(test_milestone9_event_loop tests/test_milestone9_event_loop.cpp)
-target_link_libraries(test_milestone9_event_loop PRIVATE aether_core)
-
-add_executable(test_milestone10_modules tests/test_milestone10_modules.cpp)
-target_link_libraries(test_milestone10_modules PRIVATE aether_core)
-
-add_executable(test_milestone11_typed_arrays tests/test_milestone11_typed_arrays.cpp)
-target_link_libraries(test_milestone11_typed_arrays PRIVATE aether_core)
-
-add_executable(test_test262_harness tests/test_test262_harness.cpp)
-target_link_libraries(test_test262_harness PRIVATE aether_core)
-target_link_options(test_test262_harness PRIVATE /DEBUG)
-
-add_executable(test_milestone12_modern_syntax tests/test_milestone12_modern_syntax.cpp)
-target_link_libraries(test_milestone12_modern_syntax PRIVATE aether_core)
+target_link_libraries(aether_core PUBLIC Threads::Threads)
+if(MSVC)
+    target_compile_options(aether_core PRIVATE /Zi)
+endif()
 
 add_executable(aether src/main.cpp)
 target_link_libraries(aether PRIVATE aether_core)
 
-add_executable(test_milestone13_iteration_symbols_generators tests/test_milestone13_iteration_symbols_generators.cpp)
-target_link_libraries(test_milestone13_iteration_symbols_generators PRIVATE aether_core)
+enable_testing()
 
-add_executable(test_milestone14_async_await tests/test_milestone14_async_await.cpp)
-target_link_libraries(test_milestone14_async_await PRIVATE aether_core)
-
-add_executable(test_milestone15_proxy_reflect tests/test_milestone15_proxy_reflect.cpp)
-target_link_libraries(test_milestone15_proxy_reflect PRIVATE aether_core)
-
-add_executable(test_milestone16_async_iterators tests/test_milestone16_async_iterators.cpp)
-target_link_libraries(test_milestone16_async_iterators PRIVATE aether_core)
-
-add_executable(test_milestone17_esm tests/test_milestone17_esm.cpp)
-target_link_libraries(test_milestone17_esm PRIVATE aether_core)
-
-add_executable(test_milestone18_intl tests/test_milestone18_intl.cpp)
-target_link_libraries(test_milestone18_intl PRIVATE aether_core)
-
-add_executable(test_milestone19_wasm tests/test_milestone19_wasm.cpp)
-target_link_libraries(test_milestone19_wasm PRIVATE aether_core)
-
-add_executable(test_milestone20_parallel tests/test_milestone20_parallel.cpp)
-target_link_libraries(test_milestone20_parallel PRIVATE aether_core)
-
-add_executable(test_milestone21_advanced_intrinsics tests/test_milestone21_advanced_intrinsics.cpp)
-target_link_libraries(test_milestone21_advanced_intrinsics PRIVATE aether_core)
-
-add_executable(test_issue_regressions tests/test_issue_regressions.cpp)
-target_link_libraries(test_issue_regressions PRIVATE aether_core)
-
-add_executable(test_hardening_gc tests/test_hardening_gc.cpp)
-target_link_libraries(test_hardening_gc PRIVATE aether_core)
-
-add_executable(test_hardening_limits tests/test_hardening_limits.cpp)
-target_link_libraries(test_hardening_limits PRIVATE aether_core)
-
-add_executable(test_hardening_regex tests/test_hardening_regex.cpp)
-target_link_libraries(test_hardening_regex PRIVATE aether_core)
-
-add_executable(test_hardening_execution tests/test_hardening_execution.cpp)
-target_link_libraries(test_hardening_execution PRIVATE aether_core)
-
-add_executable(test_hardening_async tests/test_hardening_async.cpp)
-target_link_libraries(test_hardening_async PRIVATE aether_core)
-
-add_executable(test_genuine_bytecodes_jit tests/test_genuine_bytecodes_jit.cpp)
-target_link_libraries(test_genuine_bytecodes_jit PRIVATE aether_core)
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "tests/test_*.cpp")
+foreach(TEST_SRC ${TEST_SOURCES})
+    get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
+    add_executable(${TEST_NAME} ${TEST_SRC})
+    target_link_libraries(${TEST_NAME} PRIVATE aether_core)
+    if(MSVC)
+        target_link_options(${TEST_NAME} PRIVATE /DEBUG)
+    endif()
+    add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+    set_tests_properties(${TEST_NAME} PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endforeach()

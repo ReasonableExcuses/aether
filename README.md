@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![C++ Standard](https://img.shields.io/badge/C%2B%2B-23-00599C?logo=c%2B%2B)](https://en.wikipedia.org/wiki/C%2B%2B23)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
+[![CI](https://github.com/ReasonableExcuses/aether/actions/workflows/ci.yml/badge.svg)](https://github.com/ReasonableExcuses/aether/actions/workflows/ci.yml)
 
 Aether is an experimental ECMAScript and WebAssembly runtime implemented from scratch in modern C++ (ISO C++23). It is designed as an embeddable, modular virtual machine with a multi-tier JIT compilation pipeline, an Immix-based generational garbage collector, and native concurrency primitives.
 

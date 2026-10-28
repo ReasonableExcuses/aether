@@ -1,0 +1,162 @@
+{
+  "gc1.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 4959.3,
+      "gc_count": 3,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 5057.26,
+      "gc_count": 3,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 6746.12,
+      "gc_count": 3,
+      "error": ""
+    }
+  },
+  "gc2.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 8319.13,
+      "gc_count": 3,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 6418.18,
+      "gc_count": 3,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 6138.3,
+      "gc_count": 3,
+      "error": ""
+    }
+  },
+  "gc3.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 144.11,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 143.53,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 144.03,
+      "gc_count": 0,
+      "error": ""
+    }
+  },
+  "str.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 396.23,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 403.94,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 404.5,
+      "gc_count": 0,
+      "error": ""
+    }
+  },
+  "depth.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 19.49,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 17.33,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 14.98,
+      "gc_count": 0,
+      "error": ""
+    }
+  },
+  "nbody.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 327.95,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 258.42,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 244.12,
+      "gc_count": 0,
+      "error": ""
+    }
+  },
+  "richards.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 398.21,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 400.69,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 391.05,
+      "gc_count": 0,
+      "error": ""
+    }
+  },
+  "deltablue.js": {
+    "interp": {
+      "success": true,
+      "wall_ms": 59.05,
+      "gc_count": 0,
+      "error": ""
+    },
+    "baseline": {
+      "success": true,
+      "wall_ms": 58.68,
+      "gc_count": 0,
+      "error": ""
+    },
+    "opt": {
+      "success": true,
+      "wall_ms": 56.55,
+      "gc_count": 0,
+      "error": ""
+    }
+  }
+}

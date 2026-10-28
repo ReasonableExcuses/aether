@@ -90,6 +90,9 @@ public:
         bool prev = inside_nested_function;
         inside_nested_function = true;
         if (!node->IsArrow()) non_arrow_depth++;
+        for (const auto& d : node->ParamDefaults()) {
+            if (d) d->Accept(this);
+        }
         node->Body()->Accept(this);
         if (!node->IsArrow()) non_arrow_depth--;
         inside_nested_function = prev;
@@ -215,6 +218,9 @@ public:
         bool prev = inside_nested_function;
         inside_nested_function = true;
         non_arrow_depth++;
+        for (const auto& d : node->ParamDefaults()) {
+            if (d) d->Accept(this);
+        }
         node->Body()->Accept(this);
         non_arrow_depth--;
         inside_nested_function = prev;
@@ -223,6 +229,20 @@ public:
         for (const auto& m : node->Methods()) {
             m->Accept(this);
         }
+        for (const auto& f : node->Fields()) {
+            if (f.initializer) f.initializer->Accept(this);
+        }
+    }
+    void VisitClassExpr(ClassExpr* node) override {
+        for (const auto& m : node->Methods()) {
+            m->Accept(this);
+        }
+        for (const auto& f : node->Fields()) {
+            if (f.initializer) f.initializer->Accept(this);
+        }
+    }
+    void VisitLabeled(LabeledStmt* node) override {
+        if (node->Body()) node->Body()->Accept(this);
     }
     void VisitThrow(ThrowStmt* node) override { node->GetExpr()->Accept(this); }
     void VisitTryCatch(TryCatchStmt* node) override {
@@ -342,6 +362,10 @@ void BytecodeEmitter::ScanAndSetupContextSlots(const std::vector<std::string>& p
             self(self, try_s->FinallyBlock());
         } else if (auto* with_s = dynamic_cast<WithStmt*>(s)) {
             self(self, with_s->Body());
+        } else if (auto* lbl_s = dynamic_cast<LabeledStmt*>(s)) {
+            self(self, lbl_s->Body());
+        } else if (auto* exp_s = dynamic_cast<ExportDeclStmt*>(s)) {
+            self(self, exp_s->Declaration());
         }
     };
 
@@ -469,6 +493,12 @@ std::unique_ptr<BytecodeArray> BytecodeEmitter::EmitFunction(FunctionDeclStmt* f
 
     if (func->Body() && HasUseStrictDirective(func->Body()->Statements())) {
         is_strict_ = true;
+    }
+
+    formal_params_ = func->Params();
+    has_complex_params_ = func->HasRest();
+    for (const auto& d : func->ParamDefaults()) {
+        if (d) { has_complex_params_ = true; break; }
     }
 
     uint32_t param_count = static_cast<uint32_t>(func->Params().size());
@@ -668,6 +698,13 @@ void BytecodeEmitter::EmitJump(Opcode jump_op, Label& label) {
         label.forward_jumps.push_back(patch_offset);
         bytecode_->EmitI32(0); // Placeholder
     }
+}
+
+void BytecodeEmitter::EmitTypeError(std::string_view message) {
+    uint16_t msg_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", message)));
+    bytecode_->EmitOpcode(Opcode::LdaConstant);
+    bytecode_->EmitU16(msg_idx);
+    bytecode_->EmitOpcode(Opcode::Throw);
 }
 
 void BytecodeEmitter::VisitLiteral(LiteralExpr* node) {
@@ -886,27 +923,39 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
 
 void BytecodeEmitter::VisitAssign(AssignExpr* node) {
     if (IsConstBinding(node->Target())) {
-        throw std::runtime_error("TypeError: Assignment to constant variable.");
+        node->Value()->Accept(this);
+        EmitTypeError("Assignment to constant variable.");
+        return;
+    }
+    if (IsNFEBinding(node->Target())) {
+        node->Value()->Accept(this);
+        if (is_strict_) {
+            EmitTypeError("Assignment to constant variable.");
+        }
+        return;
     }
     node->Value()->Accept(this);
     auto res = ResolveVariable(node->Target());
     if (res.kind == VarResolution::ImportedBinding) {
         throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Target() + "'");
+        return;
     }
     if (res.kind == VarResolution::LocalReg) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(res.reg);
+        SyncAccumulatorToArguments(node->Target());
         return;
     }
     if (res.kind == VarResolution::ContextSlot) {
         if (res.depth == 0) {
             bytecode_->EmitOpcode(Opcode::StaCurrentContextSlot);
             bytecode_->EmitU16(res.slot);
-            return;
+        } else {
+            bytecode_->EmitOpcode(Opcode::StaContextSlot);
+            bytecode_->EmitU8(res.depth);
+            bytecode_->EmitU16(res.slot);
         }
-        bytecode_->EmitOpcode(Opcode::StaContextSlot);
-        bytecode_->EmitU8(res.depth);
-        bytecode_->EmitU16(res.slot);
+        SyncAccumulatorToArguments(node->Target());
         return;
     }
     if (res.kind == VarResolution::ModuleLocal) {
@@ -953,7 +1002,8 @@ void BytecodeEmitter::VisitArrayDestructureAssign(ArrayDestructureAssignExpr* no
     for (size_t i = 0; i < node->Names().size(); ++i) {
         const std::string& name = node->Names()[i];
         if (IsConstBinding(name)) {
-            throw std::runtime_error("TypeError: Assignment to constant variable.");
+            EmitTypeError("Assignment to constant variable.");
+            return;
         }
         uint8_t idx_reg = AllocateRegister();
         bytecode_->EmitOpcode(Opcode::LdaSmi);
@@ -1009,9 +1059,14 @@ void BytecodeEmitter::VisitArrayDestructureAssign(ArrayDestructureAssignExpr* no
 }
 
 void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
+    if (IsConstBinding(node->Name()) || (is_strict_ && IsNFEBinding(node->Name()))) {
+        EmitTypeError("Assignment to constant variable.");
+        return;
+    }
     auto res = ResolveVariable(node->Name());
     if (res.kind == VarResolution::ImportedBinding) {
         throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Name() + "'");
+        return;
     }
 
     if (res.kind == VarResolution::LocalReg) {
@@ -1095,6 +1150,8 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         bytecode_->EmitOpcode(Opcode::StaGlobal);
         bytecode_->EmitU16(name_idx);
     }
+
+    SyncAccumulatorToArguments(node->Name());
 
     if (!node->IsPrefix()) {
         bytecode_->EmitOpcode(Opcode::Ldar);
@@ -1666,6 +1723,83 @@ void BytecodeEmitter::VisitIndexAssign(IndexAssignExpr* node) {
 
     FreeRegister(key_reg);
     FreeRegister(obj_reg);
+
+    SyncArgumentsToIndex(node->Object(), node->Index());
+}
+
+void BytecodeEmitter::SyncAccumulatorToArguments(std::string_view param_name) {
+    if (is_strict_ || !uses_arguments_ || has_complex_params_) return;
+    for (size_t p_idx = 0; p_idx < formal_params_.size(); ++p_idx) {
+        if (formal_params_[p_idx] == param_name) {
+            uint8_t val_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(val_reg);
+
+            uint8_t args_reg = AllocateRegister();
+            auto arg_reg_it = scope_.find("arguments");
+            if (arg_reg_it != scope_.end()) {
+                bytecode_->EmitOpcode(Opcode::Ldar);
+                bytecode_->EmitU8(arg_reg_it->second);
+            } else {
+                auto cs_it = context_slots_.find("arguments");
+                if (cs_it != context_slots_.end()) {
+                    bytecode_->EmitOpcode(Opcode::LdaCurrentContextSlot);
+                    bytecode_->EmitU16(cs_it->second);
+                }
+            }
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(args_reg);
+
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(std::to_string(p_idx))));
+            uint16_t slot = next_feedback_slot_++;
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(val_reg);
+            bytecode_->EmitOpcode(Opcode::StaNamed);
+            bytecode_->EmitU8(args_reg);
+            bytecode_->EmitU16(name_idx);
+            bytecode_->EmitU16(slot);
+
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(val_reg);
+
+            FreeRegister(args_reg);
+            FreeRegister(val_reg);
+            break;
+        }
+    }
+}
+
+void BytecodeEmitter::SyncArgumentsToIndex(Expr* object, Expr* index) {
+    if (is_strict_ || !uses_arguments_ || has_complex_params_) return;
+    auto* id = dynamic_cast<IdentifierExpr*>(object);
+    if (!id || id->Name() != "arguments") return;
+    int32_t p_idx = -1;
+    if (auto* lit = dynamic_cast<LiteralExpr*>(index)) {
+        if (lit->Value().IsSmi()) {
+            p_idx = lit->Value().AsSmi();
+        } else if (lit->Value().IsHeapObject() && lit->Value().AsHeapObject()->IsString()) {
+            try {
+                p_idx = std::stoi(static_cast<JSString*>(lit->Value().AsHeapObject())->Value());
+            } catch (...) {}
+        }
+    }
+    if (p_idx >= 0 && p_idx < static_cast<int32_t>(formal_params_.size())) {
+        const std::string& param_name = formal_params_[p_idx];
+        auto res = ResolveVariable(param_name);
+        if (res.kind == VarResolution::LocalReg) {
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(res.reg);
+        } else if (res.kind == VarResolution::ContextSlot) {
+            if (res.depth == 0) {
+                bytecode_->EmitOpcode(Opcode::StaCurrentContextSlot);
+                bytecode_->EmitU16(res.slot);
+            } else {
+                bytecode_->EmitOpcode(Opcode::StaContextSlot);
+                bytecode_->EmitU8(res.depth);
+                bytecode_->EmitU16(res.slot);
+            }
+        }
+    }
 }
 
 void BytecodeEmitter::EmitBinaryOp(BinaryOp op, uint8_t rhs_reg) {
@@ -1927,6 +2061,8 @@ void BytecodeEmitter::VisitCompoundIndexAssign(CompoundIndexAssignExpr* node) {
 
     FreeRegister(key_reg);
     FreeRegister(obj_reg);
+
+    SyncArgumentsToIndex(node->Object(), node->Index());
 }
 
 void BytecodeEmitter::VisitConditional(ConditionalExpr* node) {
@@ -2207,6 +2343,16 @@ void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
     if (node->IsConst()) {
         const_bindings_.insert(node->Name());
     }
+    if (node->IsLexical()) {
+        bytecode_->AddLexicalName(node->Name());
+        if (!lexical_scopes_.empty()) {
+            lexical_scopes_.back().names.push_back(node->Name());
+            auto it = scope_.find(node->Name());
+            if (it != scope_.end()) {
+                lexical_scopes_.back().shadowed_registers.push_back({node->Name(), it->second});
+            }
+        }
+    }
     void* mod_ptr = current_module_;
     BytecodeEmitter* cur = this;
     while (!mod_ptr && cur->parent_emitter_) {
@@ -2286,6 +2432,10 @@ void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
 }
 
 void BytecodeEmitter::VisitBlock(BlockStmt* node) {
+    bool is_lex = node->IsLexicalScope();
+    if (is_lex) {
+        lexical_scopes_.push_back(LexicalScope{});
+    }
     for (const auto& stmt : node->Statements()) {
         if (dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
             stmt->Accept(this);
@@ -2294,6 +2444,21 @@ void BytecodeEmitter::VisitBlock(BlockStmt* node) {
     for (const auto& stmt : node->Statements()) {
         if (!dynamic_cast<FunctionDeclStmt*>(stmt.get())) {
             stmt->Accept(this);
+        }
+    }
+    if (is_lex && !lexical_scopes_.empty()) {
+        auto popped = std::move(lexical_scopes_.back());
+        lexical_scopes_.pop_back();
+        for (const auto& name : popped.names) {
+            auto it = scope_.find(name);
+            if (it != scope_.end()) {
+                FreeRegister(it->second);
+                scope_.erase(it);
+            }
+            const_bindings_.erase(name);
+        }
+        for (const auto& [name, old_reg] : popped.shadowed_registers) {
+            scope_[name] = old_reg;
         }
     }
 }
@@ -2317,6 +2482,9 @@ void BytecodeEmitter::VisitIf(IfStmt* node) {
 }
 
 void BytecodeEmitter::VisitWhile(WhileStmt* node) {
+    auto labels = std::move(pending_labels_);
+    pending_labels_.clear();
+
     Label loop_header;
     Label loop_exit;
 
@@ -2324,23 +2492,42 @@ void BytecodeEmitter::VisitWhile(WhileStmt* node) {
     node->Condition()->Accept(this);
     EmitJump(Opcode::JumpIfFalse, loop_exit);
 
-    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &loop_header});
+    for (const auto& lbl : labels) {
+        breakable_scopes_.push_back({BreakableScope::Kind::Loop, lbl, &loop_exit, &loop_header, try_stack_.size()});
+    }
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &loop_header, try_stack_.size()});
+
     node->Body()->Accept(this);
+
     breakable_scopes_.pop_back();
+    for (size_t i = 0; i < labels.size(); ++i) {
+        breakable_scopes_.pop_back();
+    }
 
     EmitJump(Opcode::Jump, loop_header);
     Bind(loop_exit);
 }
 
 void BytecodeEmitter::VisitDoWhile(DoWhileStmt* node) {
+    auto labels = std::move(pending_labels_);
+    pending_labels_.clear();
+
     Label loop_header;
     Label loop_exit;
     Label cond_label;
 
     Bind(loop_header);
-    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &cond_label});
+    for (const auto& lbl : labels) {
+        breakable_scopes_.push_back({BreakableScope::Kind::Loop, lbl, &loop_exit, &cond_label, try_stack_.size()});
+    }
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &cond_label, try_stack_.size()});
+
     node->Body()->Accept(this);
+
     breakable_scopes_.pop_back();
+    for (size_t i = 0; i < labels.size(); ++i) {
+        breakable_scopes_.pop_back();
+    }
 
     Bind(cond_label);
     node->Condition()->Accept(this);
@@ -2349,6 +2536,9 @@ void BytecodeEmitter::VisitDoWhile(DoWhileStmt* node) {
 }
 
 void BytecodeEmitter::VisitFor(ForStmt* node) {
+    auto labels = std::move(pending_labels_);
+    pending_labels_.clear();
+
     if (node->Init()) {
         node->Init()->Accept(this);
     }
@@ -2363,9 +2553,17 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
         EmitJump(Opcode::JumpIfFalse, loop_exit);
     }
 
-    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &continue_label});
+    for (const auto& lbl : labels) {
+        breakable_scopes_.push_back({BreakableScope::Kind::Loop, lbl, &loop_exit, &continue_label, try_stack_.size()});
+    }
+    breakable_scopes_.push_back({BreakableScope::Kind::Loop, "", &loop_exit, &continue_label, try_stack_.size()});
+
     node->Body()->Accept(this);
+
     breakable_scopes_.pop_back();
+    for (size_t i = 0; i < labels.size(); ++i) {
+        breakable_scopes_.pop_back();
+    }
 
     Bind(continue_label);
     if (node->Update()) {
@@ -2376,10 +2574,31 @@ void BytecodeEmitter::VisitFor(ForStmt* node) {
     Bind(loop_exit);
 }
 
+void BytecodeEmitter::UnwindTryStackTo(size_t target_depth) {
+    if (try_stack_.size() <= target_depth) return;
+    auto saved_stack = try_stack_;
+    while (try_stack_.size() > target_depth) {
+        TryContext top = try_stack_.back();
+        try_stack_.pop_back();
+
+        if (top.has_handler) {
+            bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
+        }
+        if (top.finally_block) {
+            top.finally_block->Accept(this);
+            if (!bytecode_->Code().empty() && bytecode_->Code().back() == static_cast<uint8_t>(Opcode::Return)) {
+                break;
+            }
+        }
+    }
+    try_stack_ = std::move(saved_stack);
+}
+
 void BytecodeEmitter::VisitBreak(BreakStmt* node) {
     for (auto it = breakable_scopes_.rbegin(); it != breakable_scopes_.rend(); ++it) {
         if (node->Label().empty() || it->label == node->Label()) {
             if (it->break_label) {
+                UnwindTryStackTo(it->try_depth);
                 EmitJump(Opcode::Jump, *it->break_label);
                 return;
             }
@@ -2392,6 +2611,7 @@ void BytecodeEmitter::VisitContinue(ContinueStmt* node) {
         if (it->kind == BreakableScope::Kind::Loop) {
             if (node->Label().empty() || it->label == node->Label()) {
                 if (it->continue_label) {
+                    UnwindTryStackTo(it->try_depth);
                     EmitJump(Opcode::Jump, *it->continue_label);
                     return;
                 }
@@ -2400,7 +2620,33 @@ void BytecodeEmitter::VisitContinue(ContinueStmt* node) {
     }
 }
 
+void BytecodeEmitter::VisitLabeled(LabeledStmt* node) {
+    pending_labels_.push_back(node->Label());
+    if (dynamic_cast<ForStmt*>(node->Body()) ||
+        dynamic_cast<WhileStmt*>(node->Body()) ||
+        dynamic_cast<DoWhileStmt*>(node->Body()) ||
+        dynamic_cast<SwitchStmt*>(node->Body()) ||
+        dynamic_cast<LabeledStmt*>(node->Body())) {
+        node->Body()->Accept(this);
+    } else {
+        auto labels = std::move(pending_labels_);
+        pending_labels_.clear();
+        Label exit_label;
+        for (const auto& lbl : labels) {
+            breakable_scopes_.push_back({BreakableScope::Kind::Labeled, lbl, &exit_label, nullptr, try_stack_.size()});
+        }
+        node->Body()->Accept(this);
+        for (size_t i = 0; i < labels.size(); ++i) {
+            breakable_scopes_.pop_back();
+        }
+        Bind(exit_label);
+    }
+}
+
 void BytecodeEmitter::VisitSwitch(SwitchStmt* node) {
+    auto labels = std::move(pending_labels_);
+    pending_labels_.clear();
+
     node->Discriminant()->Accept(this);
     uint8_t disc_reg = AllocateRegister();
     bytecode_->EmitOpcode(Opcode::Star);
@@ -2437,7 +2683,10 @@ void BytecodeEmitter::VisitSwitch(SwitchStmt* node) {
         EmitJump(Opcode::Jump, switch_exit);
     }
 
-    breakable_scopes_.push_back({BreakableScope::Kind::Switch, "", &switch_exit, nullptr});
+    for (const auto& lbl : labels) {
+        breakable_scopes_.push_back({BreakableScope::Kind::Switch, lbl, &switch_exit, nullptr, try_stack_.size()});
+    }
+    breakable_scopes_.push_back({BreakableScope::Kind::Switch, "", &switch_exit, nullptr, try_stack_.size()});
 
     for (size_t i = 0; i < cases.size(); ++i) {
         Bind(body_labels[i]);
@@ -2450,6 +2699,9 @@ void BytecodeEmitter::VisitSwitch(SwitchStmt* node) {
     }
 
     breakable_scopes_.pop_back();
+    for (size_t i = 0; i < labels.size(); ++i) {
+        breakable_scopes_.pop_back();
+    }
 
     Bind(switch_exit);
     FreeRegister(disc_reg);
@@ -2562,6 +2814,16 @@ void BytecodeEmitter::VisitFunctionExpr(FunctionExpr* node) {
     BytecodeEmitter sub_emitter;
     sub_emitter.parent_emitter_ = this;
     sub_emitter.is_strict_ = is_strict_ || (node->Body() && HasUseStrictDirective(node->Body()->Statements()));
+    sub_emitter.formal_params_ = node->Params();
+    sub_emitter.has_complex_params_ = node->HasRest();
+    for (const auto& d : node->ParamDefaults()) {
+        if (d) { sub_emitter.has_complex_params_ = true; break; }
+    }
+    if (!node->Name().empty()) {
+        sub_emitter.nfe_name_ = node->Name();
+        sub_emitter.functions_[node->Name()] = fn_obj;
+    }
+
     if (node->IsArrow()) {
         sub_emitter.super_proto_ = LookupSuperProto();
         auto super_fn_it = functions_.find("super");
@@ -2934,13 +3196,10 @@ void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
 
     node->TryBlock()->Accept(this);
     bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
-    try_stack_.back().has_handler = false;
+    try_stack_.pop_back();
 
     if (node->FinallyBlock()) {
-        try_stack_.pop_back();
         node->FinallyBlock()->Accept(this);
-    } else {
-        try_stack_.pop_back();
     }
     EmitJump(Opcode::Jump, end_label);
 
@@ -2952,16 +3211,45 @@ void BytecodeEmitter::VisitTryCatch(TryCatchStmt* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(err_reg);
         }
+
         if (node->FinallyBlock()) {
-            try_stack_.push_back({false, node->FinallyBlock()});
-        }
-        node->CatchBlock()->Accept(this);
-        if (node->FinallyBlock()) {
+            Label catch_err_label;
+
+            try_stack_.push_back({true, node->FinallyBlock()});
+            bytecode_->EmitOpcode(Opcode::PushExceptionHandler);
+            size_t catch_patch_offset = bytecode_->CurrentOffset();
+            catch_err_label.forward_jumps.push_back(catch_patch_offset);
+            bytecode_->EmitI32(0);
+
+            node->CatchBlock()->Accept(this);
+
+            bytecode_->EmitOpcode(Opcode::PopExceptionHandler);
             try_stack_.pop_back();
+
+            node->FinallyBlock()->Accept(this);
+            EmitJump(Opcode::Jump, end_label);
+
+            Bind(catch_err_label);
+            uint8_t rethrow_reg = AllocateRegister();
+            bytecode_->EmitOpcode(Opcode::Star);
+            bytecode_->EmitU8(rethrow_reg);
+            node->FinallyBlock()->Accept(this);
+            bytecode_->EmitOpcode(Opcode::Ldar);
+            bytecode_->EmitU8(rethrow_reg);
+            bytecode_->EmitOpcode(Opcode::Throw);
+            FreeRegister(rethrow_reg);
+        } else {
+            node->CatchBlock()->Accept(this);
         }
-    }
-    if (node->FinallyBlock()) {
+    } else if (node->FinallyBlock()) {
+        uint8_t rethrow_reg = AllocateRegister();
+        bytecode_->EmitOpcode(Opcode::Star);
+        bytecode_->EmitU8(rethrow_reg);
         node->FinallyBlock()->Accept(this);
+        bytecode_->EmitOpcode(Opcode::Ldar);
+        bytecode_->EmitU8(rethrow_reg);
+        bytecode_->EmitOpcode(Opcode::Throw);
+        FreeRegister(rethrow_reg);
     }
 
     Bind(end_label);
@@ -3683,11 +3971,21 @@ void BytecodeEmitter::VisitPrivateAccess(PrivateAccessExpr* node) {
 
 void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
     if (IsConstBinding(node->Target())) {
-        throw std::runtime_error("TypeError: Assignment to constant variable.");
+        EmitTypeError("Assignment to constant variable.");
+        return;
+    }
+    if (IsNFEBinding(node->Target())) {
+        if (is_strict_) {
+            EmitTypeError("Assignment to constant variable.");
+            return;
+        }
+        node->Rhs()->Accept(this);
+        return;
     }
     auto res = ResolveVariable(node->Target());
     if (res.kind == VarResolution::ImportedBinding) {
         throw std::runtime_error("TypeError: Assignment to constant variable or imported binding '" + node->Target() + "'");
+        return;
     }
 
     // 1. Load current value
@@ -3754,6 +4052,7 @@ void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
             bytecode_->EmitOpcode(Opcode::StaGlobal);
             bytecode_->EmitU16(name_idx);
         }
+        SyncAccumulatorToArguments(node->Target());
     };
 
     if (node->Op() == BinaryOp::LogicalAnd) {

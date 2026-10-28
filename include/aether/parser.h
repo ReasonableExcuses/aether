@@ -109,7 +109,9 @@ private:
     void ParsePatternDestructuring(
         const std::string& source_var,
         std::vector<std::unique_ptr<Stmt>>& destructuring_stmts,
-        std::function<void(const std::string&)> add_param_name = nullptr);
+        std::function<void(const std::string&)> add_param_name = nullptr,
+        bool is_const = false,
+        VarDeclStmt::Kind kind = VarDeclStmt::Kind::Var);
 
 
     // Expression parsers

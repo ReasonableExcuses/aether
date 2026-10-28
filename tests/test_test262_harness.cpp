@@ -41,10 +41,17 @@ let x = 10;
     std::cout << "  -> YAML frontmatter parser and flag extraction verified.\n" << std::flush;
 }
 
+static std::string FindTest262Dir() {
+    if (std::filesystem::exists("test/test262")) return "test/test262";
+    if (std::filesystem::exists("../test/test262")) return "../test/test262";
+    if (std::filesystem::exists("../../test/test262")) return "../../test/test262";
+    return "test/test262";
+}
+
 void TestDirectHarnessAssertions() {
     std::cout << "[Test 2] Verifying Native Test262 Harness Assertions and Errors...\n" << std::flush;
 
-    Test262Harness harness("test/test262/harness");
+    Test262Harness harness(FindTest262Dir() + "/harness");
 
     // Positive assertion test
     std::string script1 = R"(
@@ -93,8 +100,8 @@ assert.throws(TypeError, function() {
 void TestCuratedTest262Suite() {
     std::cout << "[Test 3] Verifying Complete Curated Test262 Conformance Suite...\n" << std::flush;
 
-    Test262Harness harness("test/test262/harness");
-    std::filesystem::path suite_dir = "test/test262/test";
+    Test262Harness harness(FindTest262Dir() + "/harness");
+    std::filesystem::path suite_dir = FindTest262Dir() + "/test";
 
     std::vector<Test262Result> results = harness.RunTestDirectory(suite_dir);
     assert(!results.empty());

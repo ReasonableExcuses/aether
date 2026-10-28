@@ -271,11 +271,13 @@ public:
     AETHER_ALWAYS_INLINE bool IsFinalizationRegistry() const noexcept { return type_ == HeapObjectType::JSFinalizationRegistry; }
     AETHER_ALWAYS_INLINE bool IsBigInt() const noexcept { return type_ == HeapObjectType::JSBigInt; }
 
-    static constexpr uint16_t kMarkBit      = 1 << 0;
-    static constexpr uint16_t kForwardedBit = 1 << 1;
-    static constexpr uint16_t kOldGenBit    = 1 << 2;
-    static constexpr uint16_t kAgeShift     = 4;
-    static constexpr uint16_t kAgeMask      = 0x00F0;
+    static constexpr uint16_t kMarkBit        = 1 << 0;
+    static constexpr uint16_t kForwardedBit   = 1 << 1;
+    static constexpr uint16_t kOldGenBit      = 1 << 2;
+    static constexpr uint16_t kRememberedBit  = 1 << 3;
+    static constexpr uint16_t kPinnedBit      = 1 << 4;
+    static constexpr uint16_t kAgeShift       = 5;
+    static constexpr uint16_t kAgeMask        = 0x01E0;
 
     AETHER_ALWAYS_INLINE bool IsMarked() const noexcept { return (gc_metadata_ & kMarkBit) != 0; }
     AETHER_ALWAYS_INLINE void SetMarked(bool m) noexcept {
@@ -311,6 +313,18 @@ public:
     AETHER_ALWAYS_INLINE void SetOld(bool old_gen) noexcept {
         if (old_gen) gc_metadata_ |= kOldGenBit;
         else         gc_metadata_ &= ~kOldGenBit;
+    }
+
+    AETHER_ALWAYS_INLINE bool IsRemembered() const noexcept { return (gc_metadata_ & kRememberedBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetRemembered(bool r) noexcept {
+        if (r) gc_metadata_ |= kRememberedBit;
+        else   gc_metadata_ &= ~kRememberedBit;
+    }
+
+    AETHER_ALWAYS_INLINE bool IsPinned() const noexcept { return (gc_metadata_ & kPinnedBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetPinned(bool p) noexcept {
+        if (p) gc_metadata_ |= kPinnedBit;
+        else   gc_metadata_ &= ~kPinnedBit;
     }
 
     AETHER_ALWAYS_INLINE uint8_t GetAge() const noexcept {

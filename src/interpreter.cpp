@@ -4,6 +4,7 @@
 #include "aether/background_compiler.h"
 #include "aether/runtime.h"
 #include "aether/typed_array.h"
+#include "aether/options.h"
 #include <cmath>
 #include <stdexcept>
 #ifdef _WIN32
@@ -31,7 +32,8 @@ struct NativeStackGuard {
         const auto current = reinterpret_cast<uintptr_t>(marker);
         if (!origin) origin = current;
         const auto consumed = current > origin ? current - origin : origin - current;
-        exhausted = consumed >= 256 * 1024;
+        size_t limit = Options::Get().stack_size_kb > 0 ? (Options::Get().stack_size_kb * 1024) : (256 * 1024);
+        exhausted = consumed >= limit;
 #ifdef _WIN32
         ULONG_PTR low = 0, high = 0;
         GetCurrentThreadStackLimits(&low, &high);
@@ -695,16 +697,42 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
         ~CallDepthGuard() { depth--; }
     } depth_guard(call_depth_);
 
-    // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
-    if (auto t2 = bytecode.GetTier2SharedCode()) {
-        TaggedValue res = BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
-        if (!res.IsEmpty()) return res;
-    }
+    if (!Options::Get().interpreter_only) {
+        // 1. Direct dispatch to Tier 2 Optimizing JIT if already compiled
+        if (auto t2 = bytecode.GetTier2SharedCode()) {
+            TaggedValue res = BaselineJIT::Invoke(*t2, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            if (!res.IsEmpty()) return res;
+        }
 
-    // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled; promote to Tier 2 when hot
-    if (auto t1 = bytecode.GetTier1SharedCode()) {
+        // 2. Direct dispatch to Tier 1 Baseline JIT if already compiled; promote to Tier 2 when hot
+        if (auto t1 = bytecode.GetTier1SharedCode()) {
+            bytecode.IncrementInvocationCount();
+            size_t opt_threshold = Options::Get().always_optimize ? 1 :
+                (Options::Get().tier_threshold > 0 ? static_cast<size_t>(Options::Get().tier_threshold) : OptimizingJIT::kInvocationThreshold);
+            if (bytecode.InvocationCount() >= opt_threshold && OptimizingJIT::CanCompile(bytecode)) {
+                if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
+                    if (bytecode.TryBeginTier2Compilation()) {
+                        auto fb_snap = feedback_.Snapshot();
+                        BackgroundCompiler::Current()->Enqueue(bytecode, fb_snap.get());
+                    }
+                } else {
+                    auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
+                    if (opt_code) {
+                        bytecode.SetTier2Code(std::move(opt_code));
+                        TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+                        if (!res.IsEmpty()) return res;
+                    }
+                }
+            }
+            TaggedValue res = BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+            if (!res.IsEmpty()) return res;
+        }
+
+        // 3. Increment invocation profile counter; promote to Tier 2 if hot enough, or Tier 1
         bytecode.IncrementInvocationCount();
-        if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
+        size_t opt_threshold = Options::Get().always_optimize ? 1 :
+            (Options::Get().tier_threshold > 0 ? static_cast<size_t>(Options::Get().tier_threshold) : OptimizingJIT::kInvocationThreshold);
+        if (bytecode.InvocationCount() >= opt_threshold && OptimizingJIT::CanCompile(bytecode)) {
             if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
                 if (bytecode.TryBeginTier2Compilation()) {
                     auto fb_snap = feedback_.Snapshot();
@@ -719,33 +747,15 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
                 }
             }
         }
-        TaggedValue res = BaselineJIT::Invoke(*t1, args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
-        if (!res.IsEmpty()) return res;
-    }
-
-    // 3. Increment invocation profile counter; promote to Tier 2 if hot enough, or Tier 1
-    bytecode.IncrementInvocationCount();
-    if (bytecode.InvocationCount() >= OptimizingJIT::kInvocationThreshold && OptimizingJIT::CanCompile(bytecode)) {
-        if (BackgroundCompiler::IsEnabled() && BackgroundCompiler::Current()) {
-            if (bytecode.TryBeginTier2Compilation()) {
-                    auto fb_snap = feedback_.Snapshot();
-                    BackgroundCompiler::Current()->Enqueue(bytecode, fb_snap.get());
-            }
-        } else {
-            auto opt_code = OptimizingJIT::Compile(bytecode, &feedback_);
-            if (opt_code) {
-                bytecode.SetTier2Code(std::move(opt_code));
-                TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier2Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
+        size_t baseline_threshold = Options::Get().always_baseline ? 1 :
+            (Options::Get().tier_threshold > 0 ? static_cast<size_t>(Options::Get().tier_threshold) : BaselineJIT::kInvocationThreshold);
+        if (bytecode.InvocationCount() >= baseline_threshold && BaselineJIT::CanCompile(bytecode)) {
+            auto jit_code = BaselineJIT::Compile(bytecode);
+            if (jit_code) {
+                bytecode.SetTier1Code(std::move(jit_code));
+                TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier1Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
                 if (!res.IsEmpty()) return res;
             }
-        }
-    }
-    if (bytecode.InvocationCount() >= BaselineJIT::kInvocationThreshold && BaselineJIT::CanCompile(bytecode)) {
-        auto jit_code = BaselineJIT::Compile(bytecode);
-        if (jit_code) {
-            bytecode.SetTier1Code(std::move(jit_code));
-            TaggedValue res = BaselineJIT::Invoke(*bytecode.GetTier1Code(), args.empty() ? nullptr : args.data(), static_cast<uint32_t>(args.size()));
-            if (!res.IsEmpty()) return res;
         }
     }
 
@@ -1223,7 +1233,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
     while (pc < code_end) {
         try {
         if (!op_roots.Slots().empty()) op_roots.Clear();
-        if (AETHER_UNLIKELY(heap.GCAllowed() && heap.HeapPressure() >= kGCPressureThresholdPct)) {
+        if (AETHER_UNLIKELY(heap.GCAllowed() && (Options::Get().gc_at_safepoints || heap.HeapPressure() >= kGCPressureThresholdPct))) {
             HandleScope safepoint_roots(heap);
             SnapshotState(safepoint_roots, &frame);
             heap.CollectAtSafepoint();
@@ -1305,6 +1315,19 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             case Opcode::Ldar: {
                 uint8_t reg = *pc++;
                 acc_ = frame.GetRegister(reg);
+                if (acc_.IsEmpty()) {
+                    TaggedValue exc = TaggedValue::FromHeapObject(AllocateRuntime<JSError>("ReferenceError", "Cannot access lexical variable before initialization"));
+                    if (frame.HasExceptionHandler()) {
+                        auto h = frame.PopExceptionHandler();
+                        pc = h.target_pc;
+                        frame.SetEnvironment(h.env);
+                        acc_ = exc;
+                    } else {
+                        has_pending_exception_ = true;
+                        pending_exception_ = exc;
+                        return exc;
+                    }
+                }
                 break;
             }
             case Opcode::Star: {
@@ -3742,9 +3765,24 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 const auto& reg_scope = frame.GetBytecode().GetRegisterScope();
                 auto reg_it = reg_scope.find(key_str);
                 if (reg_it != reg_scope.end()) {
+                    TaggedValue reg_val = frame.GetRegister(reg_it->second);
+                    if (reg_val.IsEmpty() && frame.GetBytecode().IsLexicalName(key_str)) {
+                        TaggedValue exc = TaggedValue::FromHeapObject(AllocateRuntime<JSError>("ReferenceError", "Cannot access '" + key_str + "' before initialization"));
+                        if (frame.HasExceptionHandler()) {
+                            auto h = frame.PopExceptionHandler();
+                            pc = h.target_pc;
+                            frame.SetEnvironment(h.env);
+                            acc_ = exc;
+                        } else {
+                            has_pending_exception_ = true;
+                            pending_exception_ = exc;
+                            return exc;
+                        }
+                        break;
+                    }
                     last_lookup_reg_ = reg_it->second;
                     last_lookup_name_ = key_str;
-                    acc_ = frame.GetRegister(reg_it->second);
+                    acc_ = reg_val;
                     break;
                 }
 
@@ -4320,7 +4358,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     while (true) {
                         HandleScope iteration_roots(heap);
                         InstructionRootsGuard iteration_guard(instruction_roots_, iteration_roots);
-                        if (heap.GCAllowed() && heap.HeapPressure() >= kGCPressureThresholdPct) heap.CollectAtSafepoint();
+                        if (heap.GCAllowed() && (Options::Get().gc_at_safepoints || heap.HeapPressure() >= kGCPressureThresholdPct)) heap.CollectAtSafepoint();
                         TaggedValue next_fn;
                         if (iterator.AsHeapObject()->IsProxy()) {
                             next_fn = ProxyGet(static_cast<JSProxy*>(iterator.AsHeapObject()), "next", iterator);

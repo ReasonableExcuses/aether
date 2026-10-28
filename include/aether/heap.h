@@ -6,6 +6,7 @@
 #include "aether/heap_object.h"
 #include "aether/gc.h"
 #include "aether/memory_budget.h"
+#include "aether/options.h"
 #include <deque>
 #include <map>
 #include <thread>
@@ -206,6 +207,7 @@ public:
 
 private:
     friend class NoGCScope;
+    friend class HeapVerifier;
     template <typename A>
     void RootArgument(HandleScope& roots, const A& arg) {
         using U = std::remove_cvref_t<A>;
@@ -232,6 +234,13 @@ private:
             (std::is_arithmetic_v<std::remove_cvref_t<Args>> ||
             std::is_same_v<std::remove_cvref_t<Args>, std::nullptr_t> ||
             std::is_same_v<std::remove_cvref_t<Args>, Shape*>)) && ...);
+        if (Options::Get().gc_stress > 0 && GCAllowed() && !collecting_) {
+            static thread_local int s_alloc_counter = 0;
+            if (++s_alloc_counter >= Options::Get().gc_stress) {
+                s_alloc_counter = 0;
+                MajorGC();
+            }
+        }
         ReserveManaged(bytes);
         void* mem = nullptr;
         T* obj = nullptr;

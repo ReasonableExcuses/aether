@@ -174,7 +174,7 @@ def bundle_test(source, meta, harness_dir):
     parts.append(source)
     return "\n".join(parts)
 
-def run_single_test_file(binary_path, test_path, target_root, harness_dir, timeout_s, worker_id, unsupported_features=None):
+def run_single_test_file(binary_path, test_path, target_root, harness_dir, timeout_s, worker_id, unsupported_features=None, extra_flags=None):
     """Runs a single test file in an isolated temporary file for the worker."""
     try:
         source = test_path.read_text(encoding="utf-8", errors="replace")
@@ -229,10 +229,15 @@ def run_single_test_file(binary_path, test_path, target_root, harness_dir, timeo
     try:
         temp_file.write_text(bundled, encoding="utf-8", errors="replace")
 
+        cmd = [str(binary_path)]
+        if extra_flags:
+            cmd.extend(extra_flags)
+        cmd.append(str(temp_file))
+
         start_time = time.perf_counter()
         try:
             proc = subprocess.run(
-                [str(binary_path), str(temp_file)],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -381,6 +386,11 @@ def main():
     parser.add_argument("--workers", "-j", type=int, default=1, help="Number of concurrent worker threads")
     parser.add_argument("--timeout", type=float, default=5.0, help="Per-test timeout in seconds")
     parser.add_argument("--report", default="", help="Optional JSON report output file path")
+    parser.add_argument("--json", dest="report", default="", help="Optional JSON report output file path (alias for --report)")
+    parser.add_argument("--tier", choices=["interp", "baseline", "opt"], default=None, help="Execution tier: interp, baseline, or opt")
+    parser.add_argument("--gc-stress", nargs="?", const=1, type=int, default=None, help="Enable GC stress (frequency in allocations, default 1)")
+    parser.add_argument("--shard", default="", help="Shard execution in form M/N (e.g. 1/4)")
+    parser.add_argument("--baseline", default="", help="Path to baseline JSON report to compare against")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print detailed failure info")
     parser.add_argument("--unsupported-features", default="tail-call-optimization", help="Comma-separated list of unsupported TC39 features to skip")
     parser.add_argument("--allow-skips", action="store_true", help="Allow unsupported-feature skips without failing the suite")
@@ -405,9 +415,31 @@ def main():
     if args.filter:
         test_files = [f for f in test_files if args.filter.lower() in str(f).lower()]
 
+    if args.shard:
+        try:
+            parts = args.shard.split("/")
+            shard_idx = int(parts[0])
+            total_shards = int(parts[1])
+            if shard_idx < 1 or shard_idx > total_shards:
+                raise ValueError()
+            test_files = [f for idx, f in enumerate(test_files) if idx % total_shards == (shard_idx - 1)]
+        except Exception:
+            print(f"Error: Invalid --shard format '{args.shard}', expected M/N (e.g. 1/4)")
+            sys.exit(1)
+
     if not test_files:
         print("No test files found matching criteria.")
         sys.exit(1)
+
+    extra_flags = []
+    if args.gc_stress is not None:
+        extra_flags.append(f"--gc-stress={args.gc_stress}")
+    if args.tier == "interp":
+        extra_flags.append("--interpreter-only")
+    elif args.tier == "baseline":
+        extra_flags.append("--always-baseline")
+    elif args.tier == "opt":
+        extra_flags.append("--always-optimize")
 
     unsupported_features = set(x.strip() for x in args.unsupported_features.split(",") if x.strip())
 
@@ -418,6 +450,12 @@ def main():
     print(f" Binary Executable: {binary_path}")
     print(f" Harness Dir      : {harness_dir}")
     print(f" Workers          : {args.workers}")
+    if args.tier:
+        print(f" Execution Tier   : {args.tier}")
+    if args.gc_stress is not None:
+        print(f" GC Stress        : {args.gc_stress}")
+    if args.shard:
+        print(f" Shard            : {args.shard}")
     if unsupported_features:
         print(f" Skip Features    : {', '.join(sorted(unsupported_features))}")
         print(f" Allow Skips      : {args.allow_skips}")
@@ -445,7 +483,7 @@ def main():
             except ValueError:
                 pass
 
-            res = run_single_test_file(binary_path, test_file, target_path, harness_dir, args.timeout, 0, unsupported_features)
+            res = run_single_test_file(binary_path, test_file, target_path, harness_dir, args.timeout, 0, unsupported_features, extra_flags)
             res["rel_path"] = str(rel_name)
             results.append(res)
             total_time += res["duration_ms"]
@@ -473,7 +511,7 @@ def main():
             future_to_file = {}
             for i, tf in enumerate(test_files):
                 worker_id = i % args.workers
-                future = executor.submit(run_single_test_file, binary_path, tf, target_path, harness_dir, args.timeout, worker_id, unsupported_features)
+                future = executor.submit(run_single_test_file, binary_path, tf, target_path, harness_dir, args.timeout, worker_id, unsupported_features, extra_flags)
                 future_to_file[future] = tf
 
             completed_count = 0
@@ -552,8 +590,34 @@ def main():
             "results": results
         }
         report_file = Path(args.report).resolve()
+        report_file.parent.mkdir(parents=True, exist_ok=True)
         report_file.write_text(json.dumps(report_data, indent=2), encoding="utf-8")
         print(f" JSON report saved to: {report_file}")
+
+    regression_detected = False
+    if args.baseline:
+        baseline_file = Path(args.baseline).resolve()
+        if baseline_file.is_file():
+            try:
+                base_data = json.loads(baseline_file.read_text(encoding="utf-8"))
+                base_passed = base_data.get("passed", 0)
+                diff = passed - base_passed
+                print("=" * 76)
+                print(f" BASELINE COMPARISON ({baseline_file.name}):")
+                print(f" Pinned Baseline Passes : {base_passed}")
+                print(f" Current Run Passes     : {passed}")
+                print(f" Conformance Delta      : {'+' if diff >= 0 else ''}{diff}")
+                print("=" * 76)
+                if passed < base_passed:
+                    print(" [REGRESSION DETECTED] Pass count dropped below pinned baseline!")
+                    regression_detected = True
+            except Exception as e:
+                print(f"Warning: Failed to parse baseline file '{baseline_file}': {e}")
+        else:
+            print(f"Warning: Baseline file not found: {baseline_file}")
+
+    if regression_detected:
+        sys.exit(1)
 
     # Skips are not conformance. They are only permitted when the caller has
     # explicitly opted into a partial/unsupported-feature run.

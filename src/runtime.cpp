@@ -3470,12 +3470,86 @@ static TaggedValue Object_toString(TaggedValue this_val, const std::vector<Tagge
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>("[object Object]"));
 }
 
+static bool ExtractIterableElements(TaggedValue iterable_val, std::vector<TaggedValue>& out_items, TaggedValue& error_val) {
+    if (!iterable_val.IsHeapObject()) {
+        error_val = TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Argument is not iterable"));
+        return false;
+    }
+    HeapObject* ho = iterable_val.AsHeapObject();
+    if (ho->IsArray()) {
+        auto* arr = static_cast<JSArray*>(ho);
+        size_t len = arr->Length();
+        out_items.reserve(len);
+        for (size_t i = 0; i < len; ++i) {
+            out_items.push_back(arr->GetElement(i));
+        }
+        return true;
+    }
+    TaggedValue iter_fn = GetProperty(iterable_val, "@@iterator");
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+        error_val = Interpreter::Current()->PendingException();
+        Interpreter::Current()->ClearPendingException();
+        return false;
+    }
+    if (iter_fn.IsHeapObject() && (iter_fn.AsHeapObject()->IsFunction() || iter_fn.AsHeapObject()->IsNativeFunction())) {
+        TaggedValue iter = CallFunction(iter_fn, iterable_val, {});
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            error_val = Interpreter::Current()->PendingException();
+            Interpreter::Current()->ClearPendingException();
+            return false;
+        }
+        TaggedValue next_fn = GetProperty(iter, "next");
+        if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+            error_val = Interpreter::Current()->PendingException();
+            Interpreter::Current()->ClearPendingException();
+            return false;
+        }
+        while (true) {
+            TaggedValue next_res = CallFunction(next_fn, iter, {});
+            if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+                error_val = Interpreter::Current()->PendingException();
+                Interpreter::Current()->ClearPendingException();
+                return false;
+            }
+            if (GetProperty(next_res, "done").ToBoolean()) break;
+            out_items.push_back(GetProperty(next_res, "value"));
+        }
+        return true;
+    }
+    error_val = TaggedValue::FromHeapObject(AllocateRuntime<JSError>("TypeError", "Argument is not iterable"));
+    return false;
+}
+
 // Map Intrinsics
 static TaggedValue Map_ctor(const std::vector<TaggedValue>& args) {
-    (void)args;
     auto* m = AllocateRuntime<JSMap>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetMapPrototype()) {
         m->SetPrototype(Realm::Current()->GetMapPrototype());
+    }
+    if (!args.empty() && !args[0].IsNull() && !args[0].IsUndefined()) {
+        std::vector<TaggedValue> items;
+        TaggedValue err = TaggedValue::Undefined();
+        if (ExtractIterableElements(args[0], items, err)) {
+            for (const auto& entry : items) {
+                TaggedValue k = TaggedValue::Undefined();
+                TaggedValue v = TaggedValue::Undefined();
+                if (entry.IsHeapObject() && entry.AsHeapObject()->IsArray()) {
+                    auto* arr = static_cast<JSArray*>(entry.AsHeapObject());
+                    if (arr->Length() > 0) k = arr->GetElement(0);
+                    if (arr->Length() > 1) v = arr->GetElement(1);
+                } else if (entry.IsHeapObject() && entry.AsHeapObject()->IsJSObject()) {
+                    k = GetProperty(entry, "0");
+                    v = GetProperty(entry, "1");
+                } else {
+                    SetTypeException("Iterator value is not an entry object");
+                    return TaggedValue::Undefined();
+                }
+                m->Set(k, v);
+            }
+        } else if (Interpreter::Current() && !err.IsUndefined()) {
+            Interpreter::Current()->SetPendingException(err);
+            return TaggedValue::Undefined();
+        }
     }
     return TaggedValue::FromHeapObject(m);
 }
@@ -3520,10 +3594,21 @@ static TaggedValue Map_clear(TaggedValue this_val, const std::vector<TaggedValue
 
 // Set Intrinsics
 static TaggedValue Set_ctor(const std::vector<TaggedValue>& args) {
-    (void)args;
     auto* s = AllocateRuntime<JSSet>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetSetPrototype()) {
         s->SetPrototype(Realm::Current()->GetSetPrototype());
+    }
+    if (!args.empty() && !args[0].IsNull() && !args[0].IsUndefined()) {
+        std::vector<TaggedValue> items;
+        TaggedValue err = TaggedValue::Undefined();
+        if (ExtractIterableElements(args[0], items, err)) {
+            for (const auto& item : items) {
+                s->Add(item);
+            }
+        } else if (Interpreter::Current() && !err.IsUndefined()) {
+            Interpreter::Current()->SetPendingException(err);
+            return TaggedValue::Undefined();
+        }
     }
     return TaggedValue::FromHeapObject(s);
 }
@@ -3634,21 +3719,33 @@ static TaggedValue Promise_reject(const std::vector<TaggedValue>& args) {
     return TaggedValue::FromHeapObject(p);
 }
 
+
 static TaggedValue Promise_all(const std::vector<TaggedValue>& args) {
     auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
         p->SetPrototype(Realm::Current()->GetPromisePrototype());
     }
 
-    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
-        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+    if (args.empty()) {
+        auto* err = AllocateRuntime<JSError>("TypeError", "Promise.all requires an iterable argument");
+        p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
-    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
-    size_t count = input_arr->Length();
+    std::vector<TaggedValue> items;
+    TaggedValue error_val = TaggedValue::Undefined();
+    if (!ExtractIterableElements(args[0], items, error_val)) {
+        p->Reject(error_val, CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    size_t count = items.size();
     if (count == 0) {
-        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+        auto* res_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            res_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        p->Fulfill(TaggedValue::FromHeapObject(res_arr), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
@@ -3659,7 +3756,7 @@ static TaggedValue Promise_all(const std::vector<TaggedValue>& args) {
 
     auto remaining = std::make_shared<size_t>(count);
     for (size_t i = 0; i < count; ++i) {
-        TaggedValue item = input_arr->GetElement(i);
+        TaggedValue item = items[i];
         if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
             auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
             auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p, results, i, remaining](const std::vector<TaggedValue>& f_args) {
@@ -3694,15 +3791,22 @@ static TaggedValue Promise_race(const std::vector<TaggedValue>& args) {
         p->SetPrototype(Realm::Current()->GetPromisePrototype());
     }
 
-    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
+    if (args.empty()) {
+        auto* err = AllocateRuntime<JSError>("TypeError", "Promise.race requires an iterable argument");
+        p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
-    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
-    size_t count = input_arr->Length();
+    std::vector<TaggedValue> items;
+    TaggedValue error_val = TaggedValue::Undefined();
+    if (!ExtractIterableElements(args[0], items, error_val)) {
+        p->Reject(error_val, CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
 
+    size_t count = items.size();
     for (size_t i = 0; i < count; ++i) {
-        TaggedValue item = input_arr->GetElement(i);
+        TaggedValue item = items[i];
         if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
             auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
             auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p](const std::vector<TaggedValue>& f_args) {
@@ -3729,15 +3833,26 @@ static TaggedValue Promise_allSettled(const std::vector<TaggedValue>& args) {
         p->SetPrototype(Realm::Current()->GetPromisePrototype());
     }
 
-    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
-        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+    if (args.empty()) {
+        auto* err = AllocateRuntime<JSError>("TypeError", "Promise.allSettled requires an iterable argument");
+        p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
-    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
-    size_t count = input_arr->Length();
+    std::vector<TaggedValue> items;
+    TaggedValue error_val = TaggedValue::Undefined();
+    if (!ExtractIterableElements(args[0], items, error_val)) {
+        p->Reject(error_val, CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    size_t count = items.size();
     if (count == 0) {
-        p->Fulfill(TaggedValue::FromHeapObject(AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr)), CurrentMicrotaskQueue());
+        auto* res_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            res_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        p->Fulfill(TaggedValue::FromHeapObject(res_arr), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
@@ -3749,7 +3864,7 @@ static TaggedValue Promise_allSettled(const std::vector<TaggedValue>& args) {
     auto remaining = std::make_shared<size_t>(count);
 
     for (size_t i = 0; i < count; ++i) {
-        TaggedValue item = input_arr->GetElement(i);
+        TaggedValue item = items[i];
         if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
             auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
             auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p, results, i, remaining](const std::vector<TaggedValue>& f_args) {
@@ -3802,15 +3917,29 @@ static TaggedValue Promise_any(const std::vector<TaggedValue>& args) {
         p->SetPrototype(Realm::Current()->GetPromisePrototype());
     }
 
-    if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArray()) {
-        p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+    if (args.empty()) {
+        auto* err = AllocateRuntime<JSError>("TypeError", "Promise.any requires an iterable argument");
+        p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
-    auto* input_arr = static_cast<JSArray*>(args[0].AsHeapObject());
-    size_t count = input_arr->Length();
+    std::vector<TaggedValue> items;
+    TaggedValue error_val = TaggedValue::Undefined();
+    if (!ExtractIterableElements(args[0], items, error_val)) {
+        p->Reject(error_val, CurrentMicrotaskQueue());
+        return TaggedValue::FromHeapObject(p);
+    }
+
+    size_t count = items.size();
     if (count == 0) {
-        p->Reject(TaggedValue::FromHeapObject(AllocateRuntime<JSError>("AggregateError", "All promises were rejected")), CurrentMicrotaskQueue());
+        auto* err = AllocateRuntime<JSError>("AggregateError", "All promises were rejected");
+        auto* empty_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+        if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
+            empty_arr->SetPrototype(Realm::Current()->GetArrayPrototype());
+        }
+        uint32_t sid = 9200;
+        err->SetNamedProperty("errors", TaggedValue::FromHeapObject(empty_arr), sid);
+        p->Reject(TaggedValue::FromHeapObject(err), CurrentMicrotaskQueue());
         return TaggedValue::FromHeapObject(p);
     }
 
@@ -3822,7 +3951,7 @@ static TaggedValue Promise_any(const std::vector<TaggedValue>& args) {
     auto remaining = std::make_shared<size_t>(count);
 
     for (size_t i = 0; i < count; ++i) {
-        TaggedValue item = input_arr->GetElement(i);
+        TaggedValue item = items[i];
         if (item.IsHeapObject() && item.AsHeapObject()->IsPromise()) {
             auto* item_p = static_cast<JSPromise*>(item.AsHeapObject());
             auto on_fulfill = AllocateRuntime<JSNativeFunction>("onFulfill", [p](const std::vector<TaggedValue>& f_args) {
@@ -3919,6 +4048,32 @@ static TaggedValue Promise_finally(TaggedValue this_val, const std::vector<Tagge
 
     p->AddReaction(TaggedValue::FromHeapObject(on_fulfill), TaggedValue::FromHeapObject(on_reject), nullptr, CurrentMicrotaskQueue());
     return TaggedValue::FromHeapObject(downstream);
+}
+
+static TaggedValue Promise_withResolvers(const std::vector<TaggedValue>&) {
+    auto* p = AllocateRuntime<JSPromise>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetPromisePrototype()) {
+        p->SetPrototype(Realm::Current()->GetPromisePrototype());
+    }
+    auto* resolve_fn = AllocateRuntime<JSNativeFunction>("resolve", [p](const std::vector<TaggedValue>& r_args) {
+        TaggedValue val = r_args.empty() ? TaggedValue::Undefined() : r_args[0];
+        p->Fulfill(val, CurrentMicrotaskQueue());
+        return TaggedValue::Undefined();
+    });
+    auto* reject_fn = AllocateRuntime<JSNativeFunction>("reject", [p](const std::vector<TaggedValue>& r_args) {
+        TaggedValue reason = r_args.empty() ? TaggedValue::Undefined() : r_args[0];
+        p->Reject(reason, CurrentMicrotaskQueue());
+        return TaggedValue::Undefined();
+    });
+    auto* res_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
+    if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
+        res_obj->SetPrototype(Realm::Current()->GetObjectPrototype());
+    }
+    uint32_t sid = 9300;
+    res_obj->SetNamedProperty("promise", TaggedValue::FromHeapObject(p), sid);
+    res_obj->SetNamedProperty("resolve", TaggedValue::FromHeapObject(resolve_fn), sid);
+    res_obj->SetNamedProperty("reject", TaggedValue::FromHeapObject(reject_fn), sid);
+    return TaggedValue::FromHeapObject(res_obj);
 }
 
 // RegExp Intrinsics
@@ -4864,283 +5019,290 @@ static TaggedValue TypedArray_toLocaleString(TaggedValue this_val, const std::ve
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res));
 }
 
-// DataView Methods
+// DataView Helpers & Methods
+static JSDataView* ValidateDataView(TaggedValue this_val, std::string_view method_name) {
+    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView()) {
+        SetTypeException(std::string("Method DataView.prototype.") + std::string(method_name) + " called on incompatible receiver");
+        return nullptr;
+    }
+    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+    if (dv->Buffer() && dv->Buffer()->IsDetached()) {
+        SetTypeException("Cannot perform operation on detached ArrayBuffer");
+        return nullptr;
+    }
+    return dv;
+}
+
+static bool DataViewToIndex(TaggedValue val, size_t& out_index) {
+    if (val.IsUndefined()) {
+        out_index = 0;
+        return true;
+    }
+    double d = val.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) {
+        return false;
+    }
+    if (std::isnan(d)) {
+        out_index = 0;
+        return true;
+    }
+    double integer_index = std::trunc(d);
+    if (integer_index < 0.0 || integer_index > 9007199254740991.0) { // 2^53 - 1
+        SetRangeException("Offset is outside the bounds of the DataView");
+        return false;
+    }
+    out_index = static_cast<size_t>(integer_index);
+    return true;
+}
+
 static bool CheckDataViewBounds(JSDataView* dv, size_t offset, size_t size) {
     if (!dv || !dv->CheckBounds(offset, size)) {
-        if (Interpreter::Current()) {
-            Interpreter::Current()->SetPendingException(
-                TaggedValue::FromHeapObject(AllocateRuntime<JSError>("RangeError", "Offset is outside the bounds of the DataView")));
-        }
+        SetRangeException("Offset is outside the bounds of the DataView");
         return false;
     }
     return true;
 }
 
 static TaggedValue DataView_getInt8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args.empty()) return TaggedValue::Undefined();
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 1);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    auto* dv = ValidateDataView(this_val, "getInt8");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     if (!CheckDataViewBounds(dv, offset, 1)) return TaggedValue::Undefined();
     return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetInt8(offset)));
 }
+
 static TaggedValue DataView_setInt8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 1);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    auto* dv = ValidateDataView(this_val, "setInt8");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     if (!CheckDataViewBounds(dv, offset, 1)) return TaggedValue::Undefined();
-    int8_t val = args[1].IsNumber() ? static_cast<int8_t>(args[1].AsNumber()) : 0;
-    dv->SetInt8(offset, val);
+    dv->SetInt8(offset, static_cast<int8_t>(static_cast<int32_t>(num_val)));
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getUint8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 1);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    auto* dv = ValidateDataView(this_val, "getUint8");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     if (!CheckDataViewBounds(dv, offset, 1)) return TaggedValue::Undefined();
     return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetUint8(offset)));
 }
+
 static TaggedValue DataView_setUint8(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 1);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
+    auto* dv = ValidateDataView(this_val, "setUint8");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     if (!CheckDataViewBounds(dv, offset, 1)) return TaggedValue::Undefined();
-    uint8_t val = args[1].IsNumber() ? static_cast<uint8_t>(args[1].AsNumber()) : 0;
-    dv->SetUint8(offset, val);
+    dv->SetUint8(offset, static_cast<uint8_t>(static_cast<uint32_t>(num_val)));
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getInt16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 2);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getInt16");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
     return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetInt16(offset, le)));
 }
+
 static TaggedValue DataView_setInt16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 2);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
-    int16_t val = args[1].IsNumber() ? static_cast<int16_t>(args[1].AsNumber()) : 0;
+    auto* dv = ValidateDataView(this_val, "setInt16");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetInt16(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
+    dv->SetInt16(offset, static_cast<int16_t>(static_cast<int32_t>(num_val)), le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getUint16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 2);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getUint16");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
     return TaggedValue::FromSmi(static_cast<int32_t>(dv->GetUint16(offset, le)));
 }
+
 static TaggedValue DataView_setUint16(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 2);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
-    uint16_t val = args[1].IsNumber() ? static_cast<uint16_t>(args[1].AsNumber()) : 0;
+    auto* dv = ValidateDataView(this_val, "setUint16");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetUint16(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 2)) return TaggedValue::Undefined();
+    dv->SetUint16(offset, static_cast<uint16_t>(static_cast<uint32_t>(num_val)), le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getInt32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getInt32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
     return TaggedValue::FromSmi(dv->GetInt32(offset, le));
 }
+
 static TaggedValue DataView_setInt32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
-    int32_t val = args[1].IsNumber() ? static_cast<int32_t>(args[1].AsNumber()) : 0;
+    auto* dv = ValidateDataView(this_val, "setInt32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetInt32(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    dv->SetInt32(offset, static_cast<int32_t>(num_val), le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getUint32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getUint32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
     uint32_t u = dv->GetUint32(offset, le);
     if (u <= 0x3FFFFFFF) return TaggedValue::FromSmi(static_cast<int32_t>(u));
     return TaggedValue::FromDouble(static_cast<double>(u));
 }
+
 static TaggedValue DataView_setUint32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
-    uint32_t val = args[1].IsNumber() ? static_cast<uint32_t>(args[1].AsNumber()) : 0;
+    auto* dv = ValidateDataView(this_val, "setUint32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetUint32(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    dv->SetUint32(offset, static_cast<uint32_t>(num_val), le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getFloat32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getFloat32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
     return TaggedValue::FromDouble(static_cast<double>(dv->GetFloat32(offset, le)));
 }
+
 static TaggedValue DataView_setFloat32(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 4);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
-    float val = args[1].IsNumber() ? static_cast<float>(args[1].AsNumber()) : 0.0f;
+    auto* dv = ValidateDataView(this_val, "setFloat32");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetFloat32(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 4)) return TaggedValue::Undefined();
+    dv->SetFloat32(offset, static_cast<float>(num_val), le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getFloat64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getFloat64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
     return TaggedValue::FromDouble(dv->GetFloat64(offset, le));
 }
+
 static TaggedValue DataView_setFloat64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
-    double val = args[1].IsNumber() ? args[1].AsNumber() : 0.0;
+    auto* dv = ValidateDataView(this_val, "setFloat64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    double num_val = val_arg.ToDouble();
+    if (Interpreter::Current() && Interpreter::Current()->HasPendingException()) return TaggedValue::Undefined();
     bool le = args.size() > 2 && args[2].ToBoolean();
-    dv->SetFloat64(offset, val, le);
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    dv->SetFloat64(offset, num_val, le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getBigInt64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getBigInt64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
     return TaggedValue::FromHeapObject(JSBigInt::Create(dv->GetBigInt64(offset, le)));
 }
+
 static TaggedValue DataView_setBigInt64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
+    auto* dv = ValidateDataView(this_val, "setBigInt64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    if (val_arg.IsNumber()) {
+        SetTypeException("Cannot convert a Number value to a BigInt");
         return TaggedValue::Undefined();
     }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
-    int64_t val = JSTypedArray::TypedArrayToBigInt64(args[1]);
+    int64_t val = JSTypedArray::TypedArrayToBigInt64(val_arg);
     bool le = args.size() > 2 && args[2].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
     dv->SetBigInt64(offset, val, le);
     return TaggedValue::Undefined();
 }
 
 static TaggedValue DataView_getBigUint64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.empty()) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
-        return TaggedValue::Undefined();
-    }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
+    auto* dv = ValidateDataView(this_val, "getBigUint64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
     bool le = args.size() > 1 && args[1].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
     return TaggedValue::FromHeapObject(JSBigInt::Create(dv->GetBigUint64(offset, le)));
 }
+
 static TaggedValue DataView_setBigUint64(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView() || args.size() < 2) return TaggedValue::Undefined();
-    auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
-    if (args[0].IsNumber() && args[0].AsNumber() < 0) {
-        CheckDataViewBounds(nullptr, 0, 8);
+    auto* dv = ValidateDataView(this_val, "setBigUint64");
+    if (!dv) return TaggedValue::Undefined();
+    size_t offset = 0;
+    if (!DataViewToIndex(args.empty() ? TaggedValue::Undefined() : args[0], offset)) return TaggedValue::Undefined();
+    TaggedValue val_arg = args.size() > 1 ? args[1] : TaggedValue::Undefined();
+    if (val_arg.IsNumber()) {
+        SetTypeException("Cannot convert a Number value to a BigInt");
         return TaggedValue::Undefined();
     }
-    size_t offset = static_cast<size_t>(args[0].AsNumber());
-    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
-    uint64_t val = JSTypedArray::TypedArrayToBigUint64(args[1]);
+    uint64_t val = JSTypedArray::TypedArrayToBigUint64(val_arg);
     bool le = args.size() > 2 && args[2].ToBoolean();
+    if (!CheckDataViewBounds(dv, offset, 8)) return TaggedValue::Undefined();
     dv->SetBigUint64(offset, val, le);
     return TaggedValue::Undefined();
 }
@@ -5900,6 +6062,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     promise_ctor->SetNamedProperty("race", TaggedValue::FromHeapObject(make_native("race", &Promise_race)), next_shape_id_);
     promise_ctor->SetNamedProperty("allSettled", TaggedValue::FromHeapObject(make_native("allSettled", &Promise_allSettled)), next_shape_id_);
     promise_ctor->SetNamedProperty("any", TaggedValue::FromHeapObject(make_native("any", &Promise_any)), next_shape_id_);
+    promise_ctor->SetNamedProperty("withResolvers", TaggedValue::FromHeapObject(make_native("withResolvers", &Promise_withResolvers)), next_shape_id_);
     promise_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(promise_prototype_), next_shape_id_);
     promise_prototype_->SetNamedProperty("constructor", TaggedValue::FromHeapObject(promise_ctor), next_shape_id_);
 
@@ -6865,6 +7028,15 @@ void Realm::InitializeIntrinsics(Heap& heap) {
 
     // ArrayBuffer Prototype & Constructor
     array_buffer_prototype_->SetNamedProperty("slice", TaggedValue::FromHeapObject(make_native("slice", &ArrayBuffer_slice)), next_shape_id_);
+    auto* ab_get_byteLength = make_native("get byteLength", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsArrayBuffer()) {
+            SetTypeException("Method get ArrayBuffer.prototype.byteLength called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        return TaggedValue::FromDouble(static_cast<double>(static_cast<JSArrayBuffer*>(this_val.AsHeapObject())->ByteLength()));
+    });
+    array_buffer_prototype_->SetAccessor("byteLength", TaggedValue::FromHeapObject(ab_get_byteLength), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
     auto* array_buffer_ctor = make_native("ArrayBuffer", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         size_t byte_length = 0;
         if (!args.empty() && args[0].IsNumber()) {
@@ -6881,6 +7053,10 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     array_buffer_ctor->SetNamedProperty("length", TaggedValue::FromSmi(1), next_shape_id_);
     array_buffer_ctor->SetNamedProperty("isView", TaggedValue::FromHeapObject(make_native("isView", &ArrayBuffer_isView, 1)), next_shape_id_);
     array_buffer_ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(array_buffer_prototype_), next_shape_id_);
+    auto* ab_species_get = heap.AllocateOld<JSNativeFunction>("get [Symbol.species]", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        return this_val;
+    }, nullptr, 0);
+    array_buffer_ctor->SetAccessor("@@species", TaggedValue::FromHeapObject(ab_species_get), TaggedValue::Undefined(), PropertyAttributes::Configurable);
     global_object_->SetNamedProperty("ArrayBuffer", TaggedValue::FromHeapObject(array_buffer_ctor), next_shape_id_);
 
     // DataView Prototype & Constructor
@@ -6905,8 +7081,41 @@ void Realm::InitializeIntrinsics(Heap& heap) {
     data_view_prototype_->SetNamedProperty("getBigUint64", TaggedValue::FromHeapObject(make_native("getBigUint64", &DataView_getBigUint64)), next_shape_id_);
     data_view_prototype_->SetNamedProperty("setBigUint64", TaggedValue::FromHeapObject(make_native("setBigUint64", &DataView_setBigUint64)), next_shape_id_);
 
+    auto* dv_get_buffer = make_native("get buffer", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView()) {
+            SetTypeException("Method get DataView.prototype.buffer called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+        return dv->Buffer() ? TaggedValue::FromHeapObject(dv->Buffer()) : TaggedValue::Undefined();
+    });
+    data_view_prototype_->SetAccessor("buffer", TaggedValue::FromHeapObject(dv_get_buffer), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* dv_get_byteLength = make_native("get byteLength", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView()) {
+            SetTypeException("Method get DataView.prototype.byteLength called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+        return TaggedValue::FromDouble(static_cast<double>(dv->ByteLength()));
+    });
+    data_view_prototype_->SetAccessor("byteLength", TaggedValue::FromHeapObject(dv_get_byteLength), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    auto* dv_get_byteOffset = make_native("get byteOffset", [](TaggedValue this_val, const std::vector<TaggedValue>&) -> TaggedValue {
+        if (!this_val.IsHeapObject() || !this_val.AsHeapObject()->IsDataView()) {
+            SetTypeException("Method get DataView.prototype.byteOffset called on incompatible receiver");
+            return TaggedValue::Undefined();
+        }
+        auto* dv = static_cast<JSDataView*>(this_val.AsHeapObject());
+        return TaggedValue::FromDouble(static_cast<double>(dv->ByteOffset()));
+    });
+    data_view_prototype_->SetAccessor("byteOffset", TaggedValue::FromHeapObject(dv_get_byteOffset), TaggedValue::Undefined(), PropertyAttributes::Configurable);
+
+    data_view_prototype_->SetNamedProperty("@@toStringTag", TaggedValue::FromHeapObject(AllocateRuntime<JSString>("DataView")), next_shape_id_);
+
     auto* data_view_ctor = make_native("DataView", [](const std::vector<TaggedValue>& args) -> TaggedValue {
         if (args.empty() || !args[0].IsHeapObject() || !args[0].AsHeapObject()->IsArrayBuffer()) {
+            SetTypeException("First argument to DataView constructor must be an ArrayBuffer");
             return TaggedValue::Undefined();
         }
         auto* ab = static_cast<JSArrayBuffer*>(args[0].AsHeapObject());
@@ -7238,13 +7447,13 @@ void Realm::InitializeIntrinsics(Heap& heap) {
             return TaggedValue::FromHeapObject(ta);
         });
 
-        ctor->SetPrototype(typed_array_ctor);
         ctor->SetIsConstructor(true);
         ctor->SetNamedProperty("length", TaggedValue::FromSmi(3), next_shape_id_);
         ctor->SetNamedProperty("BYTES_PER_ELEMENT", TaggedValue::FromSmi(static_cast<int32_t>(elem_size)), next_shape_id_);
         ctor->SetOwnPropertyAttributes("BYTES_PER_ELEMENT", PropertyAttributes::None);
         ctor->SetNamedProperty("prototype", TaggedValue::FromHeapObject(proto), next_shape_id_);
         ctor->SetOwnPropertyAttributes("prototype", PropertyAttributes::None);
+        ctor->SetPrototype(typed_array_ctor);
         proto->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor), next_shape_id_);
         proto->SetOwnPropertyAttributes("constructor", PropertyAttributes::Writable | PropertyAttributes::Configurable);
         global_object_->SetNamedProperty(name, TaggedValue::FromHeapObject(ctor), next_shape_id_);

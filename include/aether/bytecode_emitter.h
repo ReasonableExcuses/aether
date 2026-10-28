@@ -82,6 +82,7 @@ public:
     void VisitImportDecl(ImportDeclStmt* node) override;
     void VisitExportDecl(ExportDeclStmt* node) override;
     virtual void VisitWith(WithStmt* node) override;
+    void VisitLabeled(LabeledStmt* node) override;
     void VisitThrow(ThrowStmt* node) override;
     void VisitTryCatch(TryCatchStmt* node) override;
     void VisitReturn(ReturnStmt* node) override;
@@ -90,6 +91,7 @@ public:
     // Label and jump handling
     void Bind(Label& label);
     void EmitJump(Opcode jump_op, Label& label);
+    void EmitTypeError(std::string_view message);
 
     // Register allocator
     uint8_t AllocateRegister();
@@ -116,18 +118,26 @@ public:
 
 private:
     struct BreakableScope {
-        enum class Kind { Loop, Switch };
+        enum class Kind { Loop, Switch, Labeled };
         Kind kind;
         std::string label;
         Label* break_label{nullptr};
         Label* continue_label{nullptr};
+        size_t try_depth{0};
     };
 
     std::unique_ptr<BytecodeArray> bytecode_;
     std::unordered_map<std::string, uint8_t> scope_;
+    struct LexicalScope {
+        std::vector<std::string> names;
+        std::vector<std::pair<std::string, uint8_t>> shadowed_registers;
+    };
+    std::vector<LexicalScope> lexical_scopes_;
     std::unordered_map<std::string, uint16_t> context_slots_;
     std::vector<bool> register_in_use_;
     std::vector<BreakableScope> breakable_scopes_;
+    std::vector<std::string> pending_labels_;
+    void UnwindTryStackTo(size_t target_depth);
     struct TryContext {
         bool has_handler{false};
         Stmt* finally_block{nullptr};
@@ -160,6 +170,25 @@ private:
     }
     std::unordered_set<std::string> uninitialized_params_;
     std::unordered_set<std::string> const_bindings_;
+    std::string nfe_name_;
+    std::vector<std::string> formal_params_;
+    bool has_complex_params_{false};
+
+    bool IsNFEBinding(std::string_view name) const {
+        if (!nfe_name_.empty() && nfe_name_ == name) {
+            if (scope_.count(std::string(name)) || context_slots_.count(std::string(name))) return false;
+            return true;
+        }
+        if (parent_emitter_) {
+            if (scope_.count(std::string(name)) || context_slots_.count(std::string(name))) return false;
+            return parent_emitter_->IsNFEBinding(name);
+        }
+        return false;
+    }
+
+    void SyncAccumulatorToArguments(std::string_view param_name);
+    void SyncArgumentsToIndex(Expr* object, Expr* index);
+
     bool IsConstBinding(std::string_view name) const {
         if (const_bindings_.count(std::string(name))) return true;
         if (parent_emitter_) return parent_emitter_->IsConstBinding(name);
