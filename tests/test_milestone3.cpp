@@ -131,6 +131,7 @@ void TestMajorGC() {
     void* old_mem = heap.GetOldGen().Allocate(sizeof(JSObject));
     JSObject* persistent_old = new (old_mem) JSObject(root_shape.get());
     persistent_old->SetOld(true);
+    heap.GetOldGen().RegisterObject(persistent_old);
 
     Handle<JSObject> old_handle = scope.CreateHandle<JSObject>(persistent_old);
 

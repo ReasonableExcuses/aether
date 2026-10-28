@@ -169,12 +169,11 @@ void BackgroundCompiler::WorkerLoop() {
             }
         }
 
-        completed_tasks_.fetch_add(1, std::memory_order_relaxed);
-        size_t remaining_active = active_workers_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-
         {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (queue_.empty() && remaining_active == 0) {
+            completed_tasks_.fetch_add(1, std::memory_order_relaxed);
+            active_workers_.fetch_sub(1, std::memory_order_seq_cst);
+            if (queue_.empty() && active_workers_.load(std::memory_order_seq_cst) == 0) {
                 cv_idle_.notify_all();
             }
         }

@@ -3011,6 +3011,13 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
     }
 
     Shape* proto_shape = Realm::Current() ? Realm::Current()->GetRootShape() : nullptr;
+    if (!proto_shape && Interpreter::Current()) {
+        proto_shape = Interpreter::Current()->GetRootShape();
+    }
+    if (!proto_shape) {
+        static Shape fallback_root(0, nullptr, "", TaggedValue::Null());
+        proto_shape = &fallback_root;
+    }
     auto* proto_obj = AllocateRuntime<JSObject>(proto_shape);
     if (!node->SuperName().empty()) {
         JSFunction* super_fn = LookupFunction(node->SuperName());
