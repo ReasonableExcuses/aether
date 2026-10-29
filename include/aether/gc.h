@@ -25,6 +25,12 @@ inline constexpr size_t kDefaultNurserySemiSpaceSize = 16 * 1024 * 1024; // 16 M
 inline constexpr size_t kImmixBlockSize               = 32 * 1024;        // 32 KB Block
 inline constexpr size_t kImmixLineSize                = 128;              // 128 Byte Line
 inline constexpr size_t kLinesPerBlock                = kImmixBlockSize / kImmixLineSize; // 256 lines
+inline constexpr size_t kHeaderLines                  = 8;                // 8 Lines = 1024 Bytes
+inline constexpr size_t kHeaderSize                   = kHeaderLines * kImmixLineSize; // 1024 Bytes
+inline constexpr size_t kPayloadLines                 = kLinesPerBlock - kHeaderLines; // 248 lines
+inline constexpr size_t kPayloadSize                  = kPayloadLines * kImmixLineSize; // 31744 Bytes
+inline constexpr size_t kObjectStartBitmapSize        = kImmixBlockSize / (8 * 8); // 512 Bytes (4096 bits)
+inline constexpr size_t kLargeObjectThreshold         = 8 * 1024;         // 8 KB
 inline constexpr uint8_t kTenuringAgeThreshold        = 2;                // Tenures after 2 scavenges
 
 /**
@@ -139,28 +145,130 @@ private:
     uintptr_t to_space_limit_{0};
 };
 
+enum class BlockState : uint8_t {
+    Free = 0,
+    Recyclable = 1,
+    Full = 2
+};
+
+struct LargeObjectHeader {
+    LargeObjectHeader* next{nullptr};
+    LargeObjectHeader* prev{nullptr};
+    size_t size{0}; // total allocated size including header
+    bool marked{false};
+    bool constructed{false};
+    bool charged{false};
+
+    HeapObject* Object() noexcept {
+        return reinterpret_cast<HeapObject*>(
+            reinterpret_cast<uint8_t*>(this) + HeaderSize());
+    }
+
+    const HeapObject* Object() const noexcept {
+        return reinterpret_cast<const HeapObject*>(
+            reinterpret_cast<const uint8_t*>(this) + HeaderSize());
+    }
+
+    static const LargeObjectHeader* FromObject(const HeapObject* obj) noexcept {
+        return reinterpret_cast<const LargeObjectHeader*>(
+            reinterpret_cast<const uint8_t*>(obj) - HeaderSize());
+    }
+
+    static LargeObjectHeader* FromObject(HeapObject* obj) noexcept {
+        return reinterpret_cast<LargeObjectHeader*>(
+            reinterpret_cast<uint8_t*>(obj) - HeaderSize());
+    }
+
+    static constexpr size_t HeaderSize() noexcept {
+        return (sizeof(LargeObjectHeader) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+    }
+};
+
 /**
  * @brief Immix 32KB Block Header and Line Metadata.
  */
-struct ImmixBlock {
-    std::bitset<kLinesPerBlock> line_marks;
-    std::bitset<kLinesPerBlock> line_allocated;
-    size_t current_line{0};
-    alignas(kObjectAlignment) uint8_t data[kImmixBlockSize];
+struct alignas(64) ImmixBlock {
+    // 1024-byte Header (Lines 0..7)
+    uint8_t line_marks[kLinesPerBlock];               // 256 bytes (offset 0)
+    uint8_t object_starts[kObjectStartBitmapSize];     // 512 bytes (offset 256)
+    std::bitset<kLinesPerBlock> line_allocated;       // 32 bytes  (offset 768)
+    ImmixBlock* next{nullptr};                        // 8 bytes   (offset 800)
+    ImmixBlock* prev{nullptr};                        // 8 bytes   (offset 808)
+    class ImmixSpace* space{nullptr};                 // 8 bytes   (offset 816)
+    uint32_t cursor_offset{static_cast<uint32_t>(kHeaderSize)}; // 4 bytes (offset 824)
+    uint32_t limit_offset{static_cast<uint32_t>(kHeaderSize)};  // 4 bytes (offset 828)
+    uint16_t flags{0};                                // 2 bytes   (offset 832)
+    BlockState state{BlockState::Free};               // 1 byte    (offset 834)
+    uint8_t live_lines_count{0};                      // 1 byte    (offset 835)
+    uint8_t _padding[kHeaderSize - 836];              // 188 bytes (offset 836..1023)
 
-    ImmixBlock() {
-        line_marks.reset();
-        line_allocated.reset();
+    // 31,744-byte Payload (Lines 8..255)
+    alignas(kObjectAlignment) uint8_t payload[kPayloadSize];
+
+    ImmixBlock();
+
+    static ImmixBlock* BlockFor(const void* ptr) noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        return reinterpret_cast<ImmixBlock*>(addr & ~(kImmixBlockSize - 1));
+    }
+
+    bool Contains(const void* ptr) const noexcept {
+        return BlockFor(ptr) == this && state != BlockState::Free;
+    }
+
+    bool ContainsPayload(const void* ptr) const noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t start = reinterpret_cast<uintptr_t>(payload);
+        return addr >= start && addr < start + kPayloadSize;
+    }
+
+    size_t LineFor(const void* ptr) const noexcept {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t base = reinterpret_cast<uintptr_t>(this);
+        return (addr - base) / kImmixLineSize;
+    }
+
+    uint8_t* AddressForLine(size_t line) const noexcept {
+        return const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(this)) + line * kImmixLineSize;
+    }
+
+    void SetObjectStart(const void* ptr) noexcept {
+        size_t bit_index = (reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(this)) >> 3;
+        object_starts[bit_index >> 3] |= static_cast<uint8_t>(1 << (bit_index & 7));
+    }
+
+    void ClearObjectStart(const void* ptr) noexcept {
+        size_t bit_index = (reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(this)) >> 3;
+        object_starts[bit_index >> 3] &= static_cast<uint8_t>(~(1 << (bit_index & 7)));
+    }
+
+    bool IsObjectStart(const void* ptr) const noexcept {
+        size_t bit_index = (reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(this)) >> 3;
+        return (object_starts[bit_index >> 3] & (1 << (bit_index & 7))) != 0;
     }
 
     void* Allocate(size_t bytes);
     void Sweep() noexcept;
-    bool Contains(const void* ptr) const noexcept {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t start = reinterpret_cast<uintptr_t>(data);
-        return addr >= start && addr < start + kImmixBlockSize;
+
+    template <typename F>
+    void ForEachObject(F&& cb) {
+        for (size_t b = (kHeaderSize >> 6); b < kObjectStartBitmapSize; ++b) {
+            uint8_t byte = object_starts[b];
+            if (!byte) continue;
+            for (size_t bit = 0; bit < 8; ++bit) {
+                if (byte & (1 << bit)) {
+                    size_t offset = (b * 8 + bit) * 8;
+                    HeapObject* obj = reinterpret_cast<HeapObject*>(
+                        reinterpret_cast<uint8_t*>(this) + offset);
+                    cb(obj);
+                }
+            }
+        }
     }
 };
+
+static_assert(sizeof(ImmixBlock) == kImmixBlockSize, "ImmixBlock must be exactly 32 KB");
+static_assert(offsetof(ImmixBlock, payload) == kHeaderSize, "Payload must start at offset 1024 (Line 8)");
 
 /**
  * @brief Immix Line-and-Block Region Allocator for Old Generation Space.
@@ -170,10 +278,7 @@ public:
     ImmixSpace() = default;
     ~ImmixSpace();
 
-    void SetReservation(uint8_t* reservation_start, size_t max_size) {
-        reservation_start_ = reservation_start;
-        max_size_ = max_size;
-    }
+    void SetReservation(uint8_t* reservation_start, size_t max_size);
 
     void* Allocate(size_t bytes);
     void Sweep();
@@ -190,24 +295,32 @@ public:
     bool Contains(const void* ptr) const noexcept;
     void MarkObject(HeapObject* obj, size_t allocation_size = 0);
 
-    size_t BlockCount() const noexcept { return blocks_.size(); }
+    bool IsValidObjectStart(const void* ptr) const noexcept;
+    size_t BlockCount() const noexcept { return all_blocks_.size(); }
     std::mutex& GetMarkMutex() const noexcept { return mark_mutex_; }
 
 private:
     bool AllocateBlock();
+    void* AllocateLarge(size_t bytes, bool charged = false);
+    void FreeLarge(LargeObjectHeader* header) noexcept;
+    bool IsLargeObject(const void* ptr) const noexcept;
+    bool ContainsBlock(const ImmixBlock* block) const noexcept;
 
     uint8_t* reservation_start_{nullptr};
     size_t max_size_{0};
-    struct Allocation {
-        size_t bytes;
-        bool large;
-        bool constructed{false};
-        bool charged{false};
-    };
-    std::map<void*, Allocation> allocations_;
+    size_t reservation_padding_{0};
+
     std::shared_ptr<MemoryBudgetState> budget_;
-    std::vector<ImmixBlock*> blocks_;
+    std::vector<ImmixBlock*> all_blocks_;
+    std::vector<ImmixBlock*> standalone_blocks_;
     size_t active_block_index_{0};
+
+    LargeObjectHeader* large_objects_head_{nullptr};
+    size_t large_object_count_{0};
+
+    void* last_allocation_ptr_{nullptr};
+    size_t last_allocation_bytes_{0};
+
     mutable std::mutex mark_mutex_;
 };
 

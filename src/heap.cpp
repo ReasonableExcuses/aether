@@ -79,11 +79,13 @@ IsolateHeap::~IsolateHeap() {
         concurrent_marker_->Stop();
     }
     collecting_ = true;
-    for (auto& [obj, bytes] : young_) {
+    for (auto* obj : young_objects_) {
         obj->~HeapObject();
-        budget_->ReleaseManaged(bytes);
+        if (obj->IsCharged() && budget_) {
+            budget_->ReleaseManaged(obj->GetAllocatedSize());
+        }
     }
-    young_.clear();
+    young_objects_.clear();
     old_gen_.DestroyAll();
     if (s_current_heap_ == this) {
         s_current_heap_ = previous_current_heap_;
@@ -116,7 +118,7 @@ void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
 
 std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& roots) {
     old_gen_.ClearMarks();
-    for (auto& [obj, bytes] : young_) obj->SetMarked(false);
+    for (auto* obj : young_objects_) obj->SetMarked(false);
     std::unordered_set<HeapObject*> seen;
     std::vector<HeapObject*> live;
     auto mark = [&](HeapObject* obj) {
@@ -183,15 +185,17 @@ void IsolateHeap::MinorGC() {
 
     struct Move { HeapObject* source; HeapObject* destination; bool old; };
     std::vector<Move> moves;
-    moves.reserve(young_.size());
-    std::map<HeapObject*, HeapObject*> forwarding;
-    std::map<HeapObject*, size_t> survivors;
+    moves.reserve(young_objects_.size());
+    std::unordered_map<HeapObject*, HeapObject*> forwarding;
+    std::vector<HeapObject*> survivors;
+    survivors.reserve(young_objects_.size());
     uintptr_t bump = nursery_.ToSpaceStart();
     // Reserve all destinations and metadata before the first move. OS OOM
     // leaves the original graph intact. RelocateTo must be a nonthrowing move.
     try {
-        for (auto& [obj, bytes] : young_) {
+        for (auto* obj : young_objects_) {
             if (!alive.contains(obj)) continue;
+            size_t bytes = obj->GetAllocatedSize();
             bool old = obj->GetAge() + 1 >= kTenuringAgeThreshold;
             auto* destination = old ? static_cast<HeapObject*>(old_gen_.Allocate(bytes))
                 : reinterpret_cast<HeapObject*>(bump);
@@ -200,7 +204,7 @@ void IsolateHeap::MinorGC() {
             if (!old) {
                 assert(bytes <= nursery_.ToSpaceLimit() - bump);
                 bump += bytes;
-                survivors.emplace(destination, bytes);
+                survivors.push_back(destination);
             }
         }
     } catch (...) {
@@ -223,9 +227,11 @@ void IsolateHeap::MinorGC() {
         for (auto& move : moves) {
             HeapObject* moved = move.source->RelocateTo(move.destination);
             assert(moved == move.destination);
+            moved->SetAllocatedSize(move.source->GetAllocatedSize());
+            moved->SetCharged(move.source->IsCharged());
             moved->IncrementAge();
             moved->SetOld(move.old);
-            if (move.old) old_gen_.RegisterObject(moved, true);
+            if (move.old) old_gen_.RegisterObject(moved, moved->IsCharged());
         }
         VisitRoots(relocate);
         for (auto*& obj : live) obj = resolve(obj);
@@ -244,17 +250,19 @@ void IsolateHeap::MinorGC() {
     } catch (...) {
         std::terminate();
     }
-    for (auto& [obj, bytes] : young_) {
+    for (auto* obj : young_objects_) {
+        size_t bytes = obj->GetAllocatedSize();
+        bool was_charged = obj->IsCharged();
         obj->~HeapObject(); // also destroys the moved-from C++ object
-        if (!forwarding.contains(obj)) budget_->ReleaseManaged(bytes);
+        if (!forwarding.contains(obj) && was_charged && budget_) budget_->ReleaseManaged(bytes);
     }
-    young_.swap(survivors);
+    young_objects_.swap(survivors);
     nursery_.Flip(bump);
     card_table_.Clear();
     ++minor_gc_count_;
     HeapVerifier::VerifyAfterGC(*this);
     if (Options::Get().trace_gc) {
-        std::cout << "[GC] MinorGC #" << minor_gc_count_ << ": live young=" << survivors.size() << std::endl;
+        std::cout << "[GC] MinorGC #" << minor_gc_count_ << ": live young=" << young_objects_.size() << std::endl;
     }
 }
 
@@ -294,16 +302,21 @@ void IsolateHeap::MajorGC() {
         return alive.contains(obj) ? obj : nullptr;
     });
     WasmRegistryPruneDead([&](JSObject* obj) { return alive.contains(obj); });
-    for (auto it = young_.begin(); it != young_.end(); ) {
-        if (alive.contains(it->first)) { ++it; continue; }
-        HeapObject* obj = it->first;
-        size_t bytes = it->second;
+    std::vector<HeapObject*> surviving_young;
+    surviving_young.reserve(young_objects_.size());
+    for (auto* obj : young_objects_) {
+        if (alive.contains(obj)) {
+            surviving_young.push_back(obj);
+            continue;
+        }
+        size_t bytes = obj->GetAllocatedSize();
+        bool was_charged = obj->IsCharged();
         obj->~HeapObject();
         std::memset(static_cast<void*>(obj), kNurseryPoisonByte, bytes);
-        budget_->ReleaseManaged(bytes);
-        it = young_.erase(it);
+        if (was_charged && budget_) budget_->ReleaseManaged(bytes);
     }
-    if (young_.empty()) nursery_.ResetBumpPointer();
+    young_objects_.swap(surviving_young);
+    if (young_objects_.empty()) nursery_.ResetBumpPointer();
     old_gen_.Sweep();
     card_table_.Clear();
     ++major_gc_count_;

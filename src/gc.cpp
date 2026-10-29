@@ -97,240 +97,553 @@ void NurserySpace::Flip(uintptr_t live_bump) noexcept {
     bump_ptr_ = live_bump;
 }
 
-void* ImmixBlock::Allocate(size_t bytes) {
-    if (bytes == 0 || bytes > kImmixBlockSize) return nullptr;
-    size_t lines_needed = (bytes + kImmixLineSize - 1) / kImmixLineSize;
-    if (lines_needed > kLinesPerBlock) return nullptr;
+ImmixBlock::ImmixBlock() {
+    std::memset(line_marks, 0, sizeof(line_marks));
+    std::memset(object_starts, 0, sizeof(object_starts));
+    line_allocated.reset();
+    for (size_t l = 0; l < kHeaderLines; ++l) {
+        line_allocated.set(l);
+    }
+    state = BlockState::Free;
+    live_lines_count = 0;
+    flags = 0;
+    cursor_offset = static_cast<uint32_t>(kHeaderSize);
+    limit_offset = static_cast<uint32_t>(kHeaderSize);
+    next = nullptr;
+    prev = nullptr;
+    space = nullptr;
+    std::memset(_padding, 0, sizeof(_padding));
+}
 
-    for (size_t i = current_line; i + lines_needed <= kLinesPerBlock; ++i) {
-        bool free = true;
-        for (size_t j = 0; j < lines_needed; ++j) {
-            if (line_allocated.test(i + j)) {
-                free = false;
-                i += j;
-                break;
-            }
+void* ImmixBlock::Allocate(size_t bytes) {
+    if (bytes == 0 || bytes > kPayloadSize) return nullptr;
+    bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+
+    // Fast path: bump allocation within current hole
+    if (cursor_offset + bytes <= limit_offset) {
+        state = BlockState::Recyclable;
+        uint8_t* mem = reinterpret_cast<uint8_t*>(this) + cursor_offset;
+        cursor_offset += static_cast<uint32_t>(bytes);
+        size_t start_line = LineFor(mem);
+        size_t end_line = LineFor(mem + bytes - 1);
+        for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+            line_allocated.set(l);
         }
-        if (free) {
-            for (size_t j = 0; j < lines_needed; ++j) {
-                line_allocated.set(i + j);
+        return mem;
+    }
+
+    // Slow path: scan forward for next available hole
+    size_t search_line = LineFor(reinterpret_cast<uint8_t*>(this) + limit_offset);
+    if (search_line < kHeaderLines) search_line = kHeaderLines;
+
+    while (search_line < kLinesPerBlock) {
+        while (search_line < kLinesPerBlock && line_allocated.test(search_line)) {
+            ++search_line;
+        }
+        if (search_line >= kLinesPerBlock) break;
+
+        size_t hole_start = search_line;
+        while (search_line < kLinesPerBlock && !line_allocated.test(search_line)) {
+            ++search_line;
+        }
+        size_t hole_end = search_line;
+        size_t hole_bytes = (hole_end - hole_start) * kImmixLineSize;
+
+        if (hole_bytes >= bytes) {
+            state = BlockState::Recyclable;
+            cursor_offset = static_cast<uint32_t>(hole_start * kImmixLineSize);
+            limit_offset = static_cast<uint32_t>(hole_end * kImmixLineSize);
+
+            uint8_t* mem = reinterpret_cast<uint8_t*>(this) + cursor_offset;
+            cursor_offset += static_cast<uint32_t>(bytes);
+            size_t start_line = LineFor(mem);
+            size_t end_line = LineFor(mem + bytes - 1);
+            for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+                line_allocated.set(l);
             }
-            current_line = i + lines_needed;
-            return data + (i * kImmixLineSize);
+            return mem;
         }
     }
+
+    state = BlockState::Full;
     return nullptr;
 }
 
 void ImmixBlock::Sweep() noexcept {
-    // Poison freed lines: any line that was allocated but NOT marked alive is dead.
-    // Fill with 0xCD so stale old-gen pointers trigger visible corruption.
-    for (size_t i = 0; i < kLinesPerBlock; ++i) {
-        if (line_allocated.test(i) && !line_marks.test(i)) {
-            std::memset(data + (i * kImmixLineSize), kOldGenPoisonByte, kImmixLineSize);
+    live_lines_count = 0;
+    for (size_t i = kHeaderLines; i < kLinesPerBlock; ++i) {
+        if (line_allocated.test(i)) {
+            if (line_marks[i]) {
+                ++live_lines_count;
+            } else {
+                std::memset(AddressForLine(i), kOldGenPoisonByte, kImmixLineSize);
+                line_allocated.reset(i);
+                object_starts[i * 2] = 0;
+                object_starts[i * 2 + 1] = 0;
+            }
         }
     }
-    line_allocated = line_marks;
-    line_marks.reset();
-    current_line = 0;
+
+    std::memset(line_marks, 0, sizeof(line_marks));
+
+    if (live_lines_count == 0) {
+        state = BlockState::Free;
+        cursor_offset = static_cast<uint32_t>(kHeaderSize);
+        limit_offset = static_cast<uint32_t>(kImmixBlockSize);
+    } else if (live_lines_count == kPayloadLines) {
+        state = BlockState::Full;
+        cursor_offset = static_cast<uint32_t>(kImmixBlockSize);
+        limit_offset = static_cast<uint32_t>(kImmixBlockSize);
+    } else {
+        state = BlockState::Recyclable;
+        cursor_offset = static_cast<uint32_t>(kHeaderSize);
+        limit_offset = static_cast<uint32_t>(kHeaderSize);
+    }
 }
 
 ImmixSpace::~ImmixSpace() {
     DestroyAll();
-    for (auto* block : blocks_) {
+    for (auto* block : all_blocks_) {
         uintptr_t address = reinterpret_cast<uintptr_t>(block);
         uintptr_t start = reinterpret_cast<uintptr_t>(reservation_start_);
         if (reservation_start_ && address >= start && address - start < max_size_) {
             block->~ImmixBlock();
-        } else {
-            delete block;
         }
     }
+    for (auto* block : standalone_blocks_) {
+        block->~ImmixBlock();
+#ifdef _WIN32
+        VirtualFree(block, 0, MEM_RELEASE);
+#else
+        free(block);
+#endif
+    }
+    all_blocks_.clear();
+    standalone_blocks_.clear();
+}
+
+void ImmixSpace::SetReservation(uint8_t* reservation_start, size_t max_size) {
+    reservation_start_ = reservation_start;
+    max_size_ = max_size;
+    uintptr_t raw = reinterpret_cast<uintptr_t>(reservation_start);
+    reservation_padding_ = (kImmixBlockSize - (raw % kImmixBlockSize)) % kImmixBlockSize;
 }
 
 bool ImmixSpace::AllocateBlock() {
-    blocks_.reserve(blocks_.size() + 1);
+    all_blocks_.reserve(all_blocks_.size() + 1);
     if (reservation_start_) {
-        // Each commitment must start on an OS page boundary (mprotect requires
-        // this; sizeof(ImmixBlock) includes non-page-aligned metadata).
+        if (reservation_padding_ > max_size_) throw std::bad_alloc();
+        size_t available_blocks = (max_size_ - reservation_padding_) / kImmixBlockSize;
+        if (all_blocks_.size() >= available_blocks) throw std::bad_alloc();
+
+        size_t offset = reservation_padding_ + all_blocks_.size() * kImmixBlockSize;
+        uint8_t* block_addr = reservation_start_ + offset;
+
 #ifdef _WIN32
-        SYSTEM_INFO info;
-        GetSystemInfo(&info);
-        const size_t page = info.dwPageSize;
-#else
-        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-#endif
-        const size_t stride = (sizeof(ImmixBlock) + page - 1) / page * page;
-        const uintptr_t raw = reinterpret_cast<uintptr_t>(reservation_start_);
-        const size_t padding = (page - raw % page) % page;
-        if (padding <= max_size_ && blocks_.size() < (max_size_ - padding) / stride) {
-            const size_t offset = padding + blocks_.size() * stride;
-            uint8_t* block_addr = reservation_start_ + offset;
-#ifdef _WIN32
-            if (!VirtualAlloc(block_addr, stride, MEM_COMMIT, PAGE_READWRITE)) throw std::bad_alloc();
-#else
-            if (mprotect(block_addr, stride, PROT_READ | PROT_WRITE) != 0) throw std::bad_alloc();
-#endif
-            auto* block = new (block_addr) ImmixBlock();
-            blocks_.push_back(block);
-            return true;
+        if (!VirtualAlloc(block_addr, kImmixBlockSize, MEM_COMMIT, PAGE_READWRITE)) {
+            throw std::bad_alloc();
         }
-        throw std::bad_alloc();
+#else
+        if (mprotect(block_addr, kImmixBlockSize, PROT_READ | PROT_WRITE) != 0) {
+            throw std::bad_alloc();
+        }
+#endif
+        auto* block = new (block_addr) ImmixBlock();
+        block->space = this;
+        block->state = BlockState::Recyclable;
+        all_blocks_.push_back(block);
+        return true;
     }
-    blocks_.push_back(new ImmixBlock());
+
+    void* mem = nullptr;
+#ifdef _WIN32
+    mem = VirtualAlloc(nullptr, kImmixBlockSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    if (posix_memalign(&mem, kImmixBlockSize, kImmixBlockSize) != 0) {
+        mem = nullptr;
+    }
+#endif
+    if (!mem) throw std::bad_alloc();
+
+    auto* block = new (mem) ImmixBlock();
+    block->space = this;
+    block->state = BlockState::Recyclable;
+    all_blocks_.push_back(block);
+    standalone_blocks_.push_back(block);
     return true;
 }
 
-void* ImmixSpace::Allocate(size_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - kImmixLineSize) throw std::bad_alloc();
-    // Allocate bookkeeping first. Installing the extracted node after taking
-    // storage cannot fail and strand untracked occupied lines on native OOM.
-    auto node = allocations_.extract(allocations_.emplace(nullptr, Allocation{bytes, bytes > kImmixBlockSize}).first);
-    auto record = [&](void* mem) {
-        node.key() = mem;
-        allocations_.insert(std::move(node));
-        return mem;
-    };
-    if (bytes > kImmixBlockSize) {
-        return record(::operator new(bytes));
-    }
-    if (blocks_.empty()) {
-        AllocateBlock();
-        active_block_index_ = 0;
-    }
+void* ImmixSpace::AllocateLarge(size_t bytes, bool charged) {
+    size_t header_size = LargeObjectHeader::HeaderSize();
+    size_t total = header_size + bytes;
+#ifdef _WIN32
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    size_t page = info.dwPageSize;
+#else
+    size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+    total = (total + page - 1) / page * page;
 
-    void* mem = blocks_[active_block_index_]->Allocate(bytes);
-    if (mem) return record(mem);
+#ifdef _WIN32
+    void* mem = VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) mem = nullptr;
+#endif
+    if (!mem) throw std::bad_alloc();
 
-    // Search recyclable blocks for hole-filling
-    for (size_t i = 0; i < blocks_.size(); ++i) {
-        if (i == active_block_index_) continue;
-        mem = blocks_[i]->Allocate(bytes);
-        if (mem) {
-            active_block_index_ = i;
-            return record(mem);
-        }
+    auto* header = new (mem) LargeObjectHeader();
+    header->size = total;
+    header->constructed = false;
+    header->charged = charged;
+    header->marked = false;
+
+    header->next = large_objects_head_;
+    header->prev = nullptr;
+    if (large_objects_head_) {
+        large_objects_head_->prev = header;
     }
+    large_objects_head_ = header;
+    ++large_object_count_;
 
-    // Allocate fresh block
-    AllocateBlock();
-    active_block_index_ = blocks_.size() - 1;
-    mem = blocks_[active_block_index_]->Allocate(bytes);
-    return record(mem);
+    return header->Object();
 }
 
-void ImmixSpace::Sweep() {
-    for (auto it = allocations_.begin(); it != allocations_.end(); ) {
-        auto* obj = static_cast<HeapObject*>(it->first);
-        const Allocation allocation = it->second;
-        // Raw placement-new storage is owned by its caller until registered.
-        // It is retained by line marks if the caller has rooted it.
-        bool live = allocation.constructed && obj->IsMarked();
-        if (!allocation.constructed && !allocation.large) {
-            for (auto* block : blocks_) {
-                if (block->Contains(obj)) {
-                    size_t line = (reinterpret_cast<uintptr_t>(obj) - reinterpret_cast<uintptr_t>(block->data)) / kImmixLineSize;
-                    live = block->line_marks.test(line);
-                    break;
-                }
-            }
-        }
-        if (live) {
-            if (allocation.constructed) MarkObject(obj, allocation.bytes);
-            ++it;
-            continue;
-        }
-        if (allocation.constructed) obj->~HeapObject();
-        if (allocation.charged && budget_) budget_->ReleaseManaged(allocation.bytes);
-        if (allocation.large) ::operator delete(obj);
-        it = allocations_.erase(it);
-    }
-    for (auto& block : blocks_) {
-        block->Sweep();
-    }
+void ImmixSpace::FreeLarge(LargeObjectHeader* header) noexcept {
+    if (!header) return;
+    if (header->prev) header->prev->next = header->next;
+    else large_objects_head_ = header->next;
+    if (header->next) header->next->prev = header->prev;
+    --large_object_count_;
+
+    size_t total = header->size;
+    (void)total;
+#ifdef _WIN32
+    VirtualFree(header, 0, MEM_RELEASE);
+#else
+    munmap(header, total);
+#endif
 }
 
-bool ImmixSpace::Contains(const void* ptr) const noexcept {
-    if (allocations_.find(const_cast<void*>(ptr)) != allocations_.end()) return true;
-    for (const auto& block : blocks_) {
-        if (block->Contains(ptr)) return true;
+bool ImmixSpace::IsLargeObject(const void* ptr) const noexcept {
+    if (!large_objects_head_ || !ptr) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    for (auto* curr = large_objects_head_; curr; curr = curr->next) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(curr->Object());
+        if (addr >= start && addr < reinterpret_cast<uintptr_t>(curr) + curr->size) {
+            return true;
+        }
     }
     return false;
 }
 
-void ImmixSpace::MarkObject(HeapObject* obj, size_t allocation_size) {
-    uintptr_t addr = reinterpret_cast<uintptr_t>(obj);
-    size_t size = allocation_size ? allocation_size : AllocationSize(obj);
-    if (size == 0) return;
-
-    std::lock_guard<std::mutex> lock(mark_mutex_);
-    for (auto& block : blocks_) {
-        if (block->Contains(obj)) {
-            uintptr_t block_start = reinterpret_cast<uintptr_t>(block->data);
-            size_t start_line = (addr - block_start) / kImmixLineSize;
-            size_t end_line = (addr + size - 1 - block_start) / kImmixLineSize;
-            for (size_t line = start_line; line <= end_line && line < kLinesPerBlock; ++line) {
-                block->line_marks.set(line);
-            }
-            break;
+bool ImmixSpace::ContainsBlock(const ImmixBlock* block) const noexcept {
+    if (!block) return false;
+    if (reservation_start_) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(block);
+        uintptr_t start = reinterpret_cast<uintptr_t>(reservation_start_) + reservation_padding_;
+        size_t total_span = all_blocks_.size() * kImmixBlockSize;
+        if (addr >= start && addr < start + total_span) {
+            return (addr - start) % kImmixBlockSize == 0;
         }
     }
+    for (const auto* s : standalone_blocks_) {
+        if (s == block) return true;
+    }
+    return false;
+}
+
+void* ImmixSpace::Allocate(size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - kImmixLineSize) {
+        throw std::bad_alloc();
+    }
+    bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+
+    if (bytes > kLargeObjectThreshold) {
+        void* mem = AllocateLarge(bytes);
+        last_allocation_ptr_ = mem;
+        last_allocation_bytes_ = bytes;
+        return mem;
+    }
+
+    if (all_blocks_.empty()) {
+        AllocateBlock();
+        active_block_index_ = 0;
+    }
+
+    void* mem = all_blocks_[active_block_index_]->Allocate(bytes);
+    if (mem) {
+        last_allocation_ptr_ = mem;
+        last_allocation_bytes_ = bytes;
+        return mem;
+    }
+
+    for (size_t i = 0; i < all_blocks_.size(); ++i) {
+        if (i == active_block_index_) continue;
+        if (all_blocks_[i]->state == BlockState::Recyclable || all_blocks_[i]->state == BlockState::Free) {
+            mem = all_blocks_[i]->Allocate(bytes);
+            if (mem) {
+                active_block_index_ = i;
+                last_allocation_ptr_ = mem;
+                last_allocation_bytes_ = bytes;
+                return mem;
+            }
+        }
+    }
+
+    AllocateBlock();
+    active_block_index_ = all_blocks_.size() - 1;
+    mem = all_blocks_[active_block_index_]->Allocate(bytes);
+    if (!mem) throw std::bad_alloc();
+    last_allocation_ptr_ = mem;
+    last_allocation_bytes_ = bytes;
+    return mem;
 }
 
 void ImmixSpace::RegisterObject(HeapObject* obj, bool charged) {
-    auto it = allocations_.find(obj);
-    if (it == allocations_.end()) throw std::logic_error("Unowned Immix object");
-    it->second.constructed = true;
-    it->second.charged = charged;
+    if (!obj) throw std::logic_error("Registering null object");
+    if (IsLargeObject(obj)) {
+        LargeObjectHeader* header = LargeObjectHeader::FromObject(obj);
+        header->constructed = true;
+        header->charged = charged;
+        if (obj->GetAllocatedSize() == 0) {
+            obj->SetAllocatedSize(static_cast<uint32_t>(header->size - LargeObjectHeader::HeaderSize()));
+        }
+        obj->SetCharged(charged);
+        obj->SetOld(true);
+        if (obj == last_allocation_ptr_) {
+            last_allocation_ptr_ = nullptr;
+            last_allocation_bytes_ = 0;
+        }
+        return;
+    }
+
+    ImmixBlock* block = ImmixBlock::BlockFor(obj);
+    if (!ContainsBlock(block)) {
+        throw std::logic_error("Unowned Immix object");
+    }
+
+    block->state = BlockState::Recyclable;
+    block->SetObjectStart(obj);
+    if (obj->GetAllocatedSize() == 0) {
+        if (obj == last_allocation_ptr_) {
+            obj->SetAllocatedSize(static_cast<uint32_t>(last_allocation_bytes_));
+        } else {
+            obj->SetAllocatedSize(static_cast<uint32_t>(obj->ObjectSize()));
+        }
+    }
+    obj->SetCharged(charged);
+    obj->SetOld(true);
+
+    size_t bytes = obj->GetAllocatedSize();
+    if (bytes == 0) bytes = sizeof(HeapObject);
+    size_t start_line = block->LineFor(obj);
+    size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + bytes - 1);
+    for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+        block->line_allocated.set(l);
+    }
+
+    if (obj == last_allocation_ptr_) {
+        last_allocation_ptr_ = nullptr;
+        last_allocation_bytes_ = 0;
+    }
 }
 
 void ImmixSpace::DiscardAllocation(void* ptr) noexcept {
-    auto it = allocations_.find(ptr);
-    if (it == allocations_.end()) return;
-    if (it->second.large) ::operator delete(ptr);
-    else {
-        for (auto* block : blocks_) if (block->Contains(ptr)) {
-            size_t first = (reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(block->data)) / kImmixLineSize;
-            size_t count = (it->second.bytes + kImmixLineSize - 1) / kImmixLineSize;
-            for (size_t i = first; i < first + count; ++i) {
-                block->line_allocated.reset(i);
-                block->line_marks.reset(i);
+    if (!ptr) return;
+    if (IsLargeObject(ptr)) {
+        FreeLarge(LargeObjectHeader::FromObject(static_cast<HeapObject*>(ptr)));
+        if (ptr == last_allocation_ptr_) {
+            last_allocation_ptr_ = nullptr;
+            last_allocation_bytes_ = 0;
+        }
+        return;
+    }
+    ImmixBlock* block = ImmixBlock::BlockFor(ptr);
+    if (ContainsBlock(block)) {
+        block->ClearObjectStart(ptr);
+        if (ptr == last_allocation_ptr_) {
+            uint8_t* cursor_addr = reinterpret_cast<uint8_t*>(block) + block->cursor_offset;
+            if (static_cast<uint8_t*>(ptr) + last_allocation_bytes_ == cursor_addr) {
+                block->cursor_offset -= static_cast<uint32_t>(last_allocation_bytes_);
             }
-            block->current_line = 0;
-            break;
+            last_allocation_ptr_ = nullptr;
+            last_allocation_bytes_ = 0;
         }
     }
-    allocations_.erase(it);
+}
+
+void ImmixSpace::Sweep() {
+    std::lock_guard<std::mutex> lock(mark_mutex_);
+
+    // 1. Destruct dead objects in Immix blocks
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Free) continue;
+
+        block->ForEachObject([&](HeapObject* obj) {
+            if (!obj->IsMarked()) {
+                size_t bytes = obj->GetAllocatedSize();
+                obj->~HeapObject();
+                if (obj->IsCharged() && budget_) {
+                    budget_->ReleaseManaged(bytes);
+                }
+                block->ClearObjectStart(obj);
+            } else {
+                size_t bytes = obj->GetAllocatedSize();
+                if (bytes == 0) bytes = sizeof(HeapObject);
+                size_t start_line = block->LineFor(obj);
+                size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + bytes - 1);
+                for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+                    block->line_marks[l] = 1;
+                }
+            }
+        });
+    }
+
+    // 2. Sweep each block's lines
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Free) continue;
+        block->Sweep();
+    }
+
+    // 3. Sweep Large Objects
+    LargeObjectHeader** curr = &large_objects_head_;
+    while (*curr) {
+        LargeObjectHeader* header = *curr;
+        HeapObject* obj = header->Object();
+        if (header->constructed && !obj->IsMarked() && !header->marked) {
+            *curr = header->next;
+            if (header->next) header->next->prev = header->prev;
+            obj->~HeapObject();
+            if (header->charged && budget_) {
+                budget_->ReleaseManaged(header->size - LargeObjectHeader::HeaderSize());
+            }
+            FreeLarge(header);
+        } else {
+            curr = &header->next;
+        }
+    }
 }
 
 void ImmixSpace::DestroyAll() noexcept {
-    for (auto& [ptr, allocation] : allocations_) {
-        if (allocation.constructed) static_cast<HeapObject*>(ptr)->~HeapObject();
-        if (allocation.charged && budget_) budget_->ReleaseManaged(allocation.bytes);
-        if (allocation.large) ::operator delete(ptr);
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Free) continue;
+        block->ForEachObject([&](HeapObject* obj) {
+            size_t bytes = obj->GetAllocatedSize();
+            obj->~HeapObject();
+            if (obj->IsCharged() && budget_) budget_->ReleaseManaged(bytes);
+            block->ClearObjectStart(obj);
+        });
+        block->state = BlockState::Free;
     }
-    allocations_.clear();
+    while (large_objects_head_) {
+        auto* curr = large_objects_head_;
+        large_objects_head_ = curr->next;
+        if (curr->constructed) {
+            curr->Object()->~HeapObject();
+        }
+        if (curr->charged && budget_) {
+            budget_->ReleaseManaged(curr->size - LargeObjectHeader::HeaderSize());
+        }
+        FreeLarge(curr);
+    }
 }
 
 std::vector<HeapObject*> ImmixSpace::Objects() const {
     std::vector<HeapObject*> result;
-    result.reserve(allocations_.size());
-    for (auto& [ptr, allocation] : allocations_) {
-        if (allocation.constructed) result.push_back(static_cast<HeapObject*>(ptr));
+    for (const auto* block : all_blocks_) {
+        if (block->state == BlockState::Free) continue;
+        const_cast<ImmixBlock*>(block)->ForEachObject([&](HeapObject* obj) {
+            result.push_back(obj);
+        });
+    }
+    for (auto* lobj = large_objects_head_; lobj; lobj = lobj->next) {
+        if (lobj->constructed) {
+            result.push_back(lobj->Object());
+        }
     }
     return result;
 }
 
 size_t ImmixSpace::AllocationSize(const void* obj) const noexcept {
-    auto it = allocations_.find(const_cast<void*>(obj));
-    return it == allocations_.end() ? 0 : it->second.bytes;
+    if (!obj) return 0;
+    if (IsLargeObject(obj)) {
+        return LargeObjectHeader::FromObject(static_cast<const HeapObject*>(obj))->size - LargeObjectHeader::HeaderSize();
+    }
+    return static_cast<const HeapObject*>(obj)->GetAllocatedSize();
 }
 
 void ImmixSpace::ClearMarks() noexcept {
-    for (auto* block : blocks_) block->line_marks.reset();
-    for (auto& [ptr, allocation] : allocations_) {
-        if (allocation.constructed) static_cast<HeapObject*>(ptr)->SetMarked(false);
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Free) continue;
+        std::memset(block->line_marks, 0, sizeof(block->line_marks));
+        block->ForEachObject([](HeapObject* obj) {
+            obj->SetMarked(false);
+        });
     }
+    for (auto* lobj = large_objects_head_; lobj; lobj = lobj->next) {
+        lobj->Object()->SetMarked(false);
+        lobj->marked = false;
+    }
+}
+
+bool ImmixSpace::Contains(const void* ptr) const noexcept {
+    if (!ptr) return false;
+    if (reservation_start_) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t start = reinterpret_cast<uintptr_t>(reservation_start_) + reservation_padding_;
+        size_t total_span = all_blocks_.size() * kImmixBlockSize;
+        if (addr >= start && addr < start + total_span) {
+            ImmixBlock* block = ImmixBlock::BlockFor(ptr);
+            return block->ContainsPayload(ptr);
+        }
+    }
+    for (const auto* s : standalone_blocks_) {
+        if (s->ContainsPayload(ptr)) return true;
+    }
+    return IsLargeObject(ptr);
+}
+
+void ImmixSpace::MarkObject(HeapObject* obj, size_t allocation_size) {
+    if (!obj) return;
+    if (large_objects_head_ && (allocation_size > kLargeObjectThreshold || obj->GetAllocatedSize() > kLargeObjectThreshold)) {
+        if (IsLargeObject(obj)) {
+            LargeObjectHeader* header = LargeObjectHeader::FromObject(obj);
+            header->marked = true;
+            return;
+        }
+    }
+
+    ImmixBlock* block = ImmixBlock::BlockFor(obj);
+    if (!ContainsBlock(block)) return;
+
+    size_t size = allocation_size ? allocation_size : obj->GetAllocatedSize();
+    if (size == 0) size = sizeof(HeapObject);
+
+    std::lock_guard<std::mutex> lock(mark_mutex_);
+    size_t start_line = block->LineFor(obj);
+    size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + size - 1);
+    for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+        block->line_marks[l] = 1;
+    }
+}
+
+bool ImmixSpace::IsValidObjectStart(const void* ptr) const noexcept {
+    if (!ptr) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if ((addr & (kObjectAlignment - 1)) != 0) return false;
+
+    if (Contains(ptr)) {
+        if (IsLargeObject(ptr)) {
+            return true;
+        }
+        ImmixBlock* block = ImmixBlock::BlockFor(ptr);
+        if (block && block->ContainsPayload(ptr)) {
+            return block->IsObjectStart(ptr);
+        }
+    }
+    return false;
 }
 
 } // namespace aether

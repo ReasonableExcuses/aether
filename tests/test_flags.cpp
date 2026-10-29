@@ -184,7 +184,7 @@ void TestHeapVerifierCatchesUnrememberedPointer() {
 
 void TestObjectHeaderLayout() {
     std::cout << "[Test] Object Header Layout (T1.1)..." << std::endl;
-    Assert(sizeof(HeapObject) == 24, "sizeof(HeapObject) must be 24 bytes (8B vptr + 8B shape + 2B type + 2B gc_metadata + 4B pad)");
+    Assert(sizeof(HeapObject) == 24, "sizeof(HeapObject) must be 24 bytes (8B vptr + 8B shape + 2B type + 2B gc_metadata + 4B size)");
 
     Agent agent;
     HandleScope scope(agent.GetHeap());
@@ -193,7 +193,9 @@ void TestObjectHeaderLayout() {
     // Initial state
     Assert(!obj->IsRemembered(), "Object initially not remembered");
     Assert(!obj->IsPinned(), "Object initially not pinned");
+    Assert(obj->IsCharged(), "Initial young object marked through isolate heap");
     Assert(obj->GetAge() == 0, "Object initially age 0");
+    Assert(obj->GetAllocatedSize() >= sizeof(JSObject), "Allocated size should cover sizeof(JSObject)");
 
     // Remembered bit
     obj->SetRemembered(true);
@@ -207,15 +209,66 @@ void TestObjectHeaderLayout() {
     obj->SetPinned(false);
     Assert(!obj->IsPinned(), "Object not pinned after SetPinned(false)");
 
-    // Age increments without corrupting remembered or pinned flags
+    // Charged bit
+    obj->SetCharged(true);
+    Assert(obj->IsCharged(), "Object is charged after SetCharged(true)");
+    obj->SetCharged(false);
+    Assert(!obj->IsCharged(), "Object not charged after SetCharged(false)");
+
+    // Age increments without corrupting remembered, pinned, or charged flags
     obj->SetRemembered(true);
     obj->SetPinned(true);
+    obj->SetCharged(true);
     for (int i = 0; i < 20; ++i) {
         obj->IncrementAge();
     }
     Assert(obj->GetAge() == 15, "Max age should cap at 15");
     Assert(obj->IsRemembered(), "Remembered flag must remain intact during age increments");
     Assert(obj->IsPinned(), "Pinned flag must remain intact during age increments");
+    Assert(obj->IsCharged(), "Charged flag must remain intact during age increments");
+}
+
+void TestImmixBlockAllocatorLayout() {
+    std::cout << "[Test] Immix 32KB-Aligned Block Allocator Layout (T1.2)..." << std::endl;
+    Assert(sizeof(ImmixBlock) == kImmixBlockSize, "sizeof(ImmixBlock) must be exactly 32 KB");
+    Assert(offsetof(ImmixBlock, payload) == kHeaderSize, "Payload must start at offset 1024 (Line 8)");
+
+    Agent agent;
+    auto& heap = agent.GetHeap();
+    auto& old_gen = heap.GetOldGen();
+
+    // Allocate an object in old gen
+    auto* old_obj = heap.AllocateOld<JSObject>(nullptr);
+    Assert(old_obj != nullptr, "old_obj allocation must succeed");
+    Assert(old_gen.Contains(old_obj), "old_gen must contain old_obj");
+
+    // Verify 32KB alignment and BlockFor
+    ImmixBlock* block = ImmixBlock::BlockFor(old_obj);
+    Assert(block != nullptr, "BlockFor must not be null");
+    Assert((reinterpret_cast<uintptr_t>(block) & (kImmixBlockSize - 1)) == 0, "Block must be 32 KB aligned");
+    Assert(block->Contains(old_obj), "Block must contain old_obj");
+    Assert(block->ContainsPayload(old_obj), "Block payload must contain old_obj");
+
+    // Verify Object-Start Bitmap
+    Assert(block->IsObjectStart(old_obj), "Object-start bit must be set for old_obj");
+    Assert(old_gen.IsValidObjectStart(old_obj), "IsValidObjectStart must return true for old_obj");
+
+    // Interior pointer should not be a valid object start
+    void* interior_ptr = reinterpret_cast<uint8_t*>(old_obj) + 8;
+    Assert(!block->IsObjectStart(interior_ptr), "Interior pointer must not be marked as object start");
+    Assert(!old_gen.IsValidObjectStart(interior_ptr), "IsValidObjectStart must return false for interior pointer");
+
+    // Verify ForEachObject visits old_obj
+    bool found = false;
+    block->ForEachObject([&](HeapObject* o) {
+        if (o == old_obj) found = true;
+    });
+    Assert(found, "ForEachObject must find old_obj");
+
+    // Verify O(1) line calculation
+    size_t line = block->LineFor(old_obj);
+    Assert(line >= kHeaderLines && line < kLinesPerBlock, "Object line must be in payload lines");
+    Assert(block->line_allocated.test(line), "Object's line must be marked allocated");
 }
 
 int main() {
@@ -227,6 +280,7 @@ int main() {
         TestHeapVerifierCatchesPoison();
         TestHeapVerifierCatchesUnrememberedPointer();
         TestObjectHeaderLayout();
+        TestImmixBlockAllocatorLayout();
         std::cout << "All flag, heap verifier, and object header tests passed successfully!\n";
         return 0;
     } catch (const std::exception& e) {

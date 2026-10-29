@@ -262,9 +262,11 @@ private:
             try { obj = new (mem) T(std::forward<Args>(args)...); }
             catch (...) { SetCurrent(previous); throw; }
             SetCurrent(previous);
+            obj->SetAllocatedSize(static_cast<uint32_t>(bytes));
+            obj->SetCharged(true);
             obj->SetOld(old);
             if (old) old_gen_.RegisterObject(obj, true);
-            else young_.emplace(obj, bytes);
+            else young_objects_.push_back(obj);
             return obj;
         } catch (...) {
             if (obj) static_cast<HeapObject*>(obj)->~HeapObject();
@@ -288,7 +290,7 @@ private:
 
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;
-    std::map<HeapObject*, size_t> young_;
+    std::vector<HeapObject*> young_objects_;
     struct Finalization { TaggedValue callback; TaggedValue held_value; };
     std::deque<Finalization> finalizers_;
 

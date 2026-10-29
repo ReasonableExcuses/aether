@@ -41,3 +41,4 @@ Aether's original Immix implementation relied on heap-allocated `std::map<void*,
 - Peak RSS on high-allocation benchmarks (`gc2.js 300000`) decreases by $\ge 60\%$.
 - Enables $O(1)$ conservative stack root disambiguation via the object-start bitmap.
 - Passes all 30 CTest suites, matrix validation, and memory leak checks under ASan/LSan.
+

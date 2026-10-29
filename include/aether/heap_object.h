@@ -217,7 +217,7 @@ enum class HeapObjectType : uint16_t {
 class HeapObject {
 public:
     HeapObject(HeapObjectType type, Shape* shape)
-        : shape_(shape), type_(type), gc_metadata_(0) {}
+        : shape_(shape), type_(type), gc_metadata_(0), allocated_size_(0) {}
     virtual ~HeapObject() = default;
 
     AETHER_ALWAYS_INLINE Shape* GetShape() const noexcept { return shape_; }
@@ -276,8 +276,9 @@ public:
     static constexpr uint16_t kOldGenBit      = 1 << 2;
     static constexpr uint16_t kRememberedBit  = 1 << 3;
     static constexpr uint16_t kPinnedBit      = 1 << 4;
-    static constexpr uint16_t kAgeShift       = 5;
-    static constexpr uint16_t kAgeMask        = 0x01E0;
+    static constexpr uint16_t kChargedBit     = 1 << 5;
+    static constexpr uint16_t kAgeShift       = 6;
+    static constexpr uint16_t kAgeMask        = 0x03C0; // 4 bits: 6..9 (0..15)
 
     AETHER_ALWAYS_INLINE bool IsMarked() const noexcept { return (gc_metadata_ & kMarkBit) != 0; }
     AETHER_ALWAYS_INLINE void SetMarked(bool m) noexcept {
@@ -327,6 +328,12 @@ public:
         else   gc_metadata_ &= ~kPinnedBit;
     }
 
+    AETHER_ALWAYS_INLINE bool IsCharged() const noexcept { return (gc_metadata_ & kChargedBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetCharged(bool c) noexcept {
+        if (c) gc_metadata_ |= kChargedBit;
+        else   gc_metadata_ &= ~kChargedBit;
+    }
+
     AETHER_ALWAYS_INLINE uint8_t GetAge() const noexcept {
         return static_cast<uint8_t>((gc_metadata_ & kAgeMask) >> kAgeShift);
     }
@@ -338,10 +345,14 @@ public:
         }
     }
 
+    AETHER_ALWAYS_INLINE uint32_t GetAllocatedSize() const noexcept { return allocated_size_; }
+    AETHER_ALWAYS_INLINE void SetAllocatedSize(uint32_t s) noexcept { allocated_size_ = s; }
+
     HeapObject(HeapObject&& other) noexcept
         : shape_(other.shape_),
           type_(other.type_),
-          gc_metadata_(other.gc_metadata_) {}
+          gc_metadata_(other.gc_metadata_),
+          allocated_size_(other.allocated_size_) {}
 
     virtual size_t ObjectSize() const { return sizeof(*this); }
     virtual void IteratePointers(const std::function<void(TaggedValue&)>& visitor) { (void)visitor; }
@@ -351,7 +362,10 @@ private:
     Shape* shape_{nullptr};
     HeapObjectType type_;
     uint16_t gc_metadata_{0};
+    uint32_t allocated_size_{0};
 };
+
+static_assert(sizeof(HeapObject) == 24, "sizeof(HeapObject) must be 24 bytes (8B vptr + 8B shape + 2B type + 2B gc_metadata + 4B allocated_size)");
 
 /**
  * @brief Managed JavaScript String object on the heap.
