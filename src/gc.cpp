@@ -595,10 +595,12 @@ void ImmixSpace::ClearMarks() noexcept {
         std::memset(block->line_marks, 0, sizeof(block->line_marks));
         block->ForEachObject([](HeapObject* obj) {
             obj->SetMarked(false);
+            obj->SetPinned(false);
         });
     }
     for (auto* lobj = large_objects_head_; lobj; lobj = lobj->next) {
         lobj->Object()->SetMarked(false);
+        lobj->Object()->SetPinned(false);
         lobj->marked = false;
     }
 }
@@ -639,7 +641,10 @@ bool ImmixSpace::IsValidObjectStart(const void* ptr) const noexcept {
 
     if (Contains(ptr)) {
         if (IsLargeObject(ptr)) {
-            return true;
+            for (auto* curr = large_objects_head_; curr; curr = curr->next) {
+                if (curr->Object() == ptr) return true;
+            }
+            return false;
         }
         ImmixBlock* block = ImmixBlock::BlockFor(ptr);
         if (block && block->ContainsPayload(ptr)) {

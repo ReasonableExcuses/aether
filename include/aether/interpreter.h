@@ -75,6 +75,9 @@ public:
     JSGeneratorObject* GetGenerator() const noexcept { return generator_; }
     void SetGenerator(JSGeneratorObject* gen) noexcept { generator_ = gen; }
 
+    ExecutionFrame* GetPrevFrame() const noexcept { return prev_frame_; }
+    void SetPrevFrame(ExecutionFrame* prev) noexcept { prev_frame_ = prev; }
+
 private:
     const BytecodeArray& bytecode_;
     TaggedValue this_value_{TaggedValue::Undefined()};
@@ -83,6 +86,7 @@ private:
     std::vector<ExceptionHandler> handlers_;
     const std::vector<TaggedValue>& args_;
     JSGeneratorObject* generator_{nullptr};
+    ExecutionFrame* prev_frame_{nullptr};
 };
 
 /**
@@ -170,6 +174,8 @@ public:
     void PushWith(JSObject* obj) { with_stack_.push_back(obj); }
     void PopWith() { if (!with_stack_.empty()) with_stack_.pop_back(); }
     void PopWithToDepth(size_t depth) { if (depth < with_stack_.size()) with_stack_.resize(depth); }
+    ExecutionFrame* GetCurrentFrame() const noexcept { return current_frame_; }
+    void IterateRoots(SlotVisitor* visitor);
 
 private:
     static inline thread_local Interpreter* s_current_interpreter_{nullptr};
@@ -205,6 +211,7 @@ private:
     TaggedValue ExecuteImpl(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env);
     TaggedValue ResumeGeneratorImpl(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection, bool* out_is_await);
     ExecutionFrame* top_level_frame_{nullptr};
+    ExecutionFrame* current_frame_{nullptr};
     TaggedValue RunExecutionLoop(ExecutionFrame& frame, const uint8_t* start_pc, bool* out_yielded = nullptr, bool* out_is_await = nullptr);
 };
 

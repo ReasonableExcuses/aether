@@ -43,3 +43,4 @@ Prior to this architectural change, Aether's garbage collector marking phase suf
 - Memory churn during GC drops to near-zero as `unordered_set` allocations are completely eliminated.
 - Ephemeron resolution, `WeakRef`, and `FinalizationRegistry` semantics are strictly preserved.
 - Passes all 30 test suites, full tier $\times$ GC stress matrix validation, and sanitizers.
+

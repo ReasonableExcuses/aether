@@ -1,5 +1,25 @@
 #include "aether/heap.h"
+#include "aether/interpreter.h"
 #include "aether/concurrent_marker.h"
+#include <algorithm>
+#include <setjmp.h>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#elif defined(__linux__)
+#if !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+#include <pthread.h>
+#endif
 #include "aether/advanced_intrinsics.h"
 #include "aether/wasm.h"
 #include "aether/heap_verifier.h"
@@ -9,6 +29,33 @@
 #include <stdexcept>
 
 namespace aether {
+
+#if defined(_WIN32)
+static void* DetectThreadStackBase() {
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    return tib ? tib->StackBase : nullptr;
+}
+#elif defined(__APPLE__)
+static void* DetectThreadStackBase() {
+    return pthread_get_stackaddr_np(pthread_self());
+}
+#elif defined(__linux__)
+static void* DetectThreadStackBase() {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        void* stack_addr = nullptr;
+        size_t stack_size = 0;
+        pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+        pthread_attr_destroy(&attr);
+        return reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(stack_addr) + stack_size);
+    }
+    return nullptr;
+}
+#else
+static void* DetectThreadStackBase() {
+    return nullptr;
+}
+#endif
 
 static thread_local IsolateHeap* s_current_heap_{nullptr};
 
@@ -70,6 +117,7 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     if (Options::Get().max_heap_mb > 0) {
         budget_->SetTotalLimit(Options::Get().max_heap_mb * 1024 * 1024);
     }
+    stack_base_ = nullptr;
     previous_current_heap_ = s_current_heap_;
     s_current_heap_ = this;
 }
@@ -115,6 +163,9 @@ void IsolateHeap::VisitRoots(SlotVisitor* visitor) {
         visitor->Visit(&entry.callback);
         visitor->Visit(&entry.held_value);
     }
+    if (auto* interp = Interpreter::Current()) {
+        interp->IterateRoots(visitor);
+    }
 }
 
 void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
@@ -127,12 +178,19 @@ void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
         visitor(entry.callback);
         visitor(entry.held_value);
     }
+    if (auto* interp = Interpreter::Current()) {
+        LambdaSlotVisitor slot_visitor(visitor);
+        interp->IterateRoots(&slot_visitor);
+    }
 }
 
 std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& roots) {
     auto mark_start = std::chrono::steady_clock::now();
     old_gen_.ClearMarks();
-    for (auto* obj : young_objects_) obj->SetMarked(false);
+    for (auto* obj : young_objects_) {
+        obj->SetMarked(false);
+        obj->SetPinned(false);
+    }
 
     mark_stack_.clear();
     std::vector<HeapObject*> live;
@@ -190,7 +248,24 @@ std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& root
         }
     }
 
-    // 2. Drain mark stack (DFS order)
+    // 2. Conservative native stack scan (D2)
+    ScanStack([&](HeapObject* obj) {
+        if (!obj) return;
+        obj->SetPinned(true);
+        if (!obj->IsMarked()) {
+            obj->SetMarked(true);
+            if (obj->IsOld()) {
+                old_gen_.MarkObject(obj);
+            }
+            mark_stack_.push_back(obj);
+            live.push_back(obj);
+            if (obj->IsWeakMap()) {
+                weak_maps.push_back(static_cast<JSWeakMap*>(obj));
+            }
+        }
+    });
+
+    // 3. Drain mark stack (DFS order)
     while (!mark_stack_.empty()) {
         HeapObject* obj = mark_stack_.back();
         mark_stack_.pop_back();
@@ -440,6 +515,77 @@ bool IsolateHeap::Contains(const void* ptr) const noexcept {
         return true;
     }
     return old_gen_.Contains(ptr);
+}
+
+bool IsolateHeap::IsValidObjectStart(const void* ptr) const noexcept {
+    if (!ptr) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if ((addr & (kObjectAlignment - 1)) != 0) return false;
+
+    if (nursery_.Contains(ptr)) {
+        return std::binary_search(young_objects_.begin(), young_objects_.end(), static_cast<const HeapObject*>(ptr));
+    }
+    return old_gen_.IsValidObjectStart(ptr);
+}
+
+AETHER_NOINLINE
+static void CaptureRegisters(jmp_buf env) {
+    setjmp(env);
+}
+
+AETHER_NOINLINE
+AETHER_NO_SANITIZE_ADDRESS
+void IsolateHeap::ScanStack(const std::function<void(HeapObject*)>& on_root) {
+    AssertOwnerThread();
+    if (!stack_base_) return;
+    void* base_ptr = stack_base_;
+
+    jmp_buf jmp_buffer;
+    CaptureRegisters(jmp_buffer);
+
+#if defined(_WIN32) && defined(_M_X64)
+    CONTEXT win_context;
+    RtlCaptureContext(&win_context);
+#endif
+
+    volatile uintptr_t sp_marker = 0;
+    uintptr_t sp = reinterpret_cast<uintptr_t>(&sp_marker) & ~(sizeof(void*) - 1);
+    uintptr_t base = reinterpret_cast<uintptr_t>(base_ptr);
+    if (sp > base) {
+        std::swap(sp, base);
+    }
+
+    constexpr size_t kMaxScanWords = (8 * 1024 * 1024) / sizeof(uintptr_t);
+    if ((base - sp) / sizeof(uintptr_t) > kMaxScanWords) {
+        base = sp + kMaxScanWords * sizeof(uintptr_t);
+    }
+
+    auto* current = reinterpret_cast<uintptr_t*>(sp);
+    auto* limit   = reinterpret_cast<uintptr_t*>(base);
+
+    while (current < limit) {
+        uintptr_t word = *current++;
+
+        // 1. Check if word is a raw pointer to a valid HeapObject start
+        if (word != 0 && (word & (kObjectAlignment - 1)) == 0) {
+            void* raw_ptr = reinterpret_cast<void*>(word);
+            if (IsValidObjectStart(raw_ptr)) {
+                on_root(static_cast<HeapObject*>(raw_ptr));
+                continue;
+            }
+        }
+
+        // 2. Check if word is a TaggedValue holding a HeapObject
+        if ((word & TaggedValue::kTagMask) == TaggedValue::kTagHeapObject) {
+            uintptr_t payload = word & TaggedValue::kPayloadMask;
+            if (payload != 0 && (payload & (kObjectAlignment - 1)) == 0) {
+                void* tagged_ptr = reinterpret_cast<void*>(payload);
+                if (IsValidObjectStart(tagged_ptr)) {
+                    on_root(static_cast<HeapObject*>(tagged_ptr));
+                }
+            }
+        }
+    }
 }
 
 size_t IsolateHeap::DrainFinalizationQueue(const std::function<void(TaggedValue, TaggedValue)>& sink) {

@@ -197,6 +197,61 @@ TaggedValue RaiseResourceError(std::string_view message) noexcept {
     return TaggedValue::Undefined();
 }
 
+void Interpreter::IterateRoots(SlotVisitor* visitor) {
+    if (!visitor) return;
+    visitor->Visit(&acc_);
+    visitor->Visit(&current_new_target_);
+    visitor->Visit(&pending_exception_);
+    visitor->Visit(&last_environment_root_);
+    visitor->Visit(&resource_exception_);
+    visitor->Visit(&stack_exception_);
+    visitor->Visit(&last_result_);
+    if (last_lookup_base_) {
+        TaggedValue base_val = TaggedValue::FromHeapObject(last_lookup_base_);
+        visitor->Visit(&base_val);
+        if (base_val.IsHeapObject()) last_lookup_base_ = static_cast<JSObject*>(base_val.AsHeapObject());
+    }
+    for (auto*& obj : with_stack_) {
+        if (obj) {
+            TaggedValue val = TaggedValue::FromHeapObject(obj);
+            visitor->Visit(&val);
+            if (val.IsHeapObject()) obj = static_cast<JSObject*>(val.AsHeapObject());
+        }
+    }
+    for (ExecutionFrame* frame = current_frame_; frame; frame = frame->GetPrevFrame()) {
+        TaggedValue this_val = frame->GetThis();
+        visitor->Visit(&this_val);
+        frame->SetThis(this_val);
+
+        if (frame->GetEnvironment()) {
+            TaggedValue env_val = TaggedValue::FromHeapObject(frame->GetEnvironment());
+            visitor->Visit(&env_val);
+            if (env_val.IsHeapObject()) frame->SetEnvironment(env_val.As<LexicalEnvironment>());
+        }
+
+        if (frame->GetGenerator()) {
+            TaggedValue gen_val = TaggedValue::FromHeapObject(frame->GetGenerator());
+            visitor->Visit(&gen_val);
+            if (gen_val.IsHeapObject()) frame->SetGenerator(static_cast<JSGeneratorObject*>(gen_val.AsHeapObject()));
+        }
+
+        for (auto& reg : frame->GetRegisters()) {
+            visitor->Visit(&reg);
+        }
+        for (const auto& arg : frame->Args()) {
+            TaggedValue arg_copy = arg;
+            visitor->Visit(&arg_copy);
+        }
+        for (auto& handler : frame->Handlers()) {
+            if (handler.env) {
+                TaggedValue h_env = TaggedValue::FromHeapObject(handler.env);
+                visitor->Visit(&h_env);
+                if (h_env.IsHeapObject()) handler.env = h_env.As<LexicalEnvironment>();
+            }
+        }
+    }
+}
+
 void Interpreter::SnapshotState(HandleScope& roots, const ExecutionFrame* frame) {
     roots.CreateHandle(acc_);
     roots.CreateHandle(current_new_target_);
@@ -214,12 +269,6 @@ void Interpreter::SnapshotState(HandleScope& roots, const ExecutionFrame* frame)
 }
 
 TaggedValue Interpreter::PublishResult(TaggedValue result) {
-    // A coercion/getter can call JS twice in one opcode. Keep the first result
-    // alive through the second call, until the caller's next instruction.
-    if (instruction_roots_) {
-        instruction_roots_->CreateHandle(result);
-        instruction_roots_->CreateHandle(last_environment_root_);
-    }
     last_result_ = result;
     return result;
 }
@@ -727,6 +776,16 @@ bool Interpreter::IsLooselyEqual(TaggedValue x, TaggedValue y) {
 TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env) {
     char stack_marker;
     NativeStackGuard stack_guard(&stack_marker);
+    struct StackScope {
+        IsolateHeap& heap;
+        void* prev;
+        StackScope(IsolateHeap& h, void* marker) : heap(h), prev(h.GetStackBase()) {
+            if (!prev) heap.SetStackBase(marker);
+        }
+        ~StackScope() {
+            if (!prev) heap.SetStackBase(nullptr);
+        }
+    } stack_scope(ExecutionHeap(), &stack_marker);
     try {
         InitializeResourceExceptions();
         if (stack_guard.exhausted || call_depth_ >= kMaxCallDepth) {
@@ -855,6 +914,15 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
     }
 
     ExecutionFrame frame(bytecode, args, effective_this, env);
+    ExecutionFrame* prev_active = current_frame_;
+    current_frame_ = &frame;
+    struct ActiveFrameGuard {
+        Interpreter* interp;
+        ExecutionFrame* prev;
+        ~ActiveFrameGuard() { interp->current_frame_ = prev; }
+    } active_frame_guard{this, prev_active};
+    frame.SetPrevFrame(prev_active);
+
     bool is_outermost = (top_level_frame_ == nullptr);
     if (is_outermost) {
         top_level_frame_ = &frame;
@@ -874,6 +942,16 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
 TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection, bool* out_is_await) {
     char stack_marker;
     NativeStackGuard stack_guard(&stack_marker);
+    struct StackScope {
+        IsolateHeap& heap;
+        void* prev;
+        StackScope(IsolateHeap& h, void* marker) : heap(h), prev(h.GetStackBase()) {
+            if (!prev) heap.SetStackBase(marker);
+        }
+        ~StackScope() {
+            if (!prev) heap.SetStackBase(nullptr);
+        }
+    } stack_scope(ExecutionHeap(), &stack_marker);
     try {
         InitializeResourceExceptions();
         if (stack_guard.exhausted || call_depth_ >= kMaxCallDepth) {
@@ -931,6 +1009,14 @@ TaggedValue Interpreter::ResumeGeneratorImpl(JSGeneratorObject* gen, TaggedValue
     gen->SetState(JSGeneratorObject::State::Executing);
     const BytecodeArray& bytecode = *gen->Function()->GetBytecode();
     ExecutionFrame frame(bytecode, gen->Args(), gen->ThisVal(), gen->Environment());
+    ExecutionFrame* prev_active_gen = current_frame_;
+    current_frame_ = &frame;
+    struct ActiveGenFrameGuard {
+        Interpreter* interp;
+        ExecutionFrame* prev;
+        ~ActiveGenFrameGuard() { interp->current_frame_ = prev; }
+    } active_gen_frame_guard{this, prev_active_gen};
+    frame.SetPrevFrame(prev_active_gen);
     frame.SetGenerator(gen);
 
     const uint8_t* code_start = bytecode.Code().data();
@@ -1314,10 +1400,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
     while (pc < code_end) {
         try {
-        if (!op_roots.Slots().empty()) op_roots.Clear();
         if (AETHER_UNLIKELY(heap.GCAllowed() && (Options::Get().gc_at_safepoints || heap.HeapPressure() >= kGCPressureThresholdPct))) {
-            HandleScope safepoint_roots(heap);
-            SnapshotState(safepoint_roots, &frame);
             heap.CollectAtSafepoint();
         }
         Opcode op = static_cast<Opcode>(*pc++);

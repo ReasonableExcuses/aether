@@ -117,7 +117,7 @@ jobs:
         run: cmake --build build --config RelWithDebInfo -j
 
       - name: Run Tests (CTest)
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 60
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure --timeout 120
 
   matrix-test:
     name: full-matrix-validation

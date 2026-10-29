@@ -62,6 +62,10 @@ private:
 
 /**
  * @brief RAII HandleScope registering root variables for precise garbage collection.
+ *
+ * NOTE: With conservative native stack scanning (D2), HandleScope is OPTIONAL
+ * for embedders; raw HeapObject* and TaggedValue references on the native stack
+ * are automatically pinned and traced during garbage collection.
  */
 class HandleScope {
 public:
@@ -206,6 +210,10 @@ public:
     size_t MarkFromRoots(const std::vector<HeapObject*>& roots, bool process_weak = false);
 
     bool Contains(const void* ptr) const noexcept;
+    bool IsValidObjectStart(const void* ptr) const noexcept;
+    void ScanStack(const std::function<void(HeapObject*)>& on_root);
+    void* GetStackBase() const noexcept { return stack_base_; }
+    void SetStackBase(void* base) noexcept { stack_base_ = base; }
 
 private:
     friend class NoGCScope;
@@ -254,7 +262,14 @@ private:
                     mem = nursery_.Allocate(bytes);
                 }
             }
-            if (!mem) { old = true; mem = old_gen_.Allocate(bytes); }
+            if (!mem) {
+                old = true;
+                mem = old_gen_.Allocate(bytes);
+                if (!mem && GCAllowed() && !collecting_) {
+                    MajorGC();
+                    mem = old_gen_.Allocate(bytes);
+                }
+            }
             if (!mem) throw std::bad_alloc();
             NoGCScope construction(*this);
             // Member MemoryCharges must capture THIS heap even when callers
@@ -303,6 +318,7 @@ private:
     size_t no_gc_depth_{0};
     bool collecting_{false};
     bool draining_finalizers_{false};
+    void* stack_base_{nullptr};
     const std::thread::id owner_thread_{std::this_thread::get_id()};
 };
 
@@ -342,10 +358,9 @@ using Heap = IsolateHeap;
 /**
  * @brief Enterprise-grade allocation facade.
  *
- * Stable, owned runtime allocation. Never collects inside this operation, since
- * native expressions can hold unpublished raw pointers. Objects are NOT roots:
- * install handles/extra roots and call CollectAtSafepoint at a safe boundary.
- * Long-lived native captures need explicit roots for as long as they are used.
+ * Stable, owned runtime allocation. With conservative native stack scanning (D2),
+ * native stack frames and registers are scanned as pinned roots, allowing safe
+ * collection at allocation boundaries.
  */
 template <typename T, typename... Args>
 inline T* AllocateRuntime(Args&&... args) {

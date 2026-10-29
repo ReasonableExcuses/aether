@@ -336,6 +336,62 @@ void TestMarkingEngine() {
     Assert(elapsed_ms < 500.0, "Mark time for 200K objects must be under 500ms");
 }
 
+void TestConservativeStackScanning() {
+    std::cout << "[Test] Conservative Stack Scanning (D2 / T1.4)..." << std::endl;
+    Agent agent;
+    auto& heap = agent.GetHeap();
+    uint32_t shape_id = 1;
+
+    // 1. Verify IsValidObjectStart
+    auto* obj1 = heap.AllocateOld<JSObject>(nullptr);
+    Assert(heap.IsValidObjectStart(obj1), "heap.IsValidObjectStart must return true for valid object start");
+    void* interior = reinterpret_cast<uint8_t*>(obj1) + 8;
+    Assert(!heap.IsValidObjectStart(interior), "heap.IsValidObjectStart must return false for interior pointer");
+    Assert(!heap.IsValidObjectStart(nullptr), "heap.IsValidObjectStart must return false for nullptr");
+    Assert(!heap.IsValidObjectStart(reinterpret_cast<void*>(0x12345)), "heap.IsValidObjectStart must return false for random address");
+
+    // 2. Set stack base to current frame marker to enable conservative stack scan
+    volatile int stack_marker = 0;
+    heap.SetStackBase(const_cast<int*>(&stack_marker));
+
+    // Allocate an object in C++ local variable without any HandleScope or extra roots
+    JSObject* raw_local_obj = heap.AllocateOld<JSObject>(nullptr);
+    raw_local_obj->SetNamedProperty("magic_val", TaggedValue::FromSmi(1234), shape_id);
+
+    // Trigger Major GC
+    heap.MajorGC();
+
+    // Verify raw_local_obj was pinned and marked by the conservative stack scan
+    Assert(raw_local_obj->IsPinned(), "raw_local_obj on the stack must be pinned by conservative stack scan");
+    Assert(raw_local_obj->IsMarked(), "raw_local_obj on the stack must be marked");
+    Assert(heap.GetOldGen().Contains(raw_local_obj), "raw_local_obj must be retained in old gen");
+    Assert(raw_local_obj->GetNamedProperty("magic_val").AsSmi() == 1234, "Property value must be preserved");
+
+    // 3. Test unrooted TaggedValue on the native stack
+    JSObject* raw_local_obj2 = heap.AllocateOld<JSObject>(nullptr);
+    TaggedValue tagged_stack_val = TaggedValue::FromHeapObject(raw_local_obj2);
+
+    heap.MajorGC();
+
+    Assert(raw_local_obj2->IsPinned(), "Object referenced by TaggedValue on stack must be pinned");
+    Assert(raw_local_obj2->IsMarked(), "Object referenced by TaggedValue on stack must be marked");
+    Assert(heap.GetOldGen().Contains(raw_local_obj2), "Object referenced by TaggedValue must survive");
+
+    // 4. Verify Interpreter execution works without op_roots.Clear() or safepoint SnapshotState
+    TaggedValue res = agent.EvaluateScript(R"(
+        var sum = 0;
+        for (var i = 0; i < 500; i = i + 1) {
+            var temp = "iteration-" + i;
+            sum = sum + i;
+        }
+        sum;
+    )");
+    Assert(res.IsSmi() && res.AsSmi() == 124750, "Script with safepoints and temporary strings must produce 124750");
+
+    heap.SetStackBase(nullptr);
+    std::cout << "  -> Conservative stack scanning, raw stack rooting, and dispatch loop verified." << std::endl;
+}
+
 int main() {
     try {
         TestFlagParsing();
@@ -347,6 +403,7 @@ int main() {
         TestObjectHeaderLayout();
         TestImmixBlockAllocatorLayout();
         TestMarkingEngine();
+        TestConservativeStackScanning();
         std::cout << "All flag, heap verifier, and object header tests passed successfully!\n";
         return 0;
     } catch (const std::exception& e) {

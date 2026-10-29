@@ -38,14 +38,24 @@ inline constexpr size_t kHeapReservationSize = 4ULL * 1024ULL * 1024ULL * 1024UL
 #define AETHER_LIKELY(x) __builtin_expect(!!(x), 1)
 #define AETHER_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define AETHER_ALWAYS_INLINE [[gnu::always_inline]] inline
+#define AETHER_NOINLINE __attribute__((noinline))
+#define AETHER_NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address, no_sanitize("thread", "undefined")))
 #elif defined(_MSC_VER)
 #define AETHER_LIKELY(x) (x)
 #define AETHER_UNLIKELY(x) (x)
 #define AETHER_ALWAYS_INLINE __forceinline
+#define AETHER_NOINLINE __declspec(noinline)
+#if defined(__SANITIZE_ADDRESS__)
+#define AETHER_NO_SANITIZE_ADDRESS __declspec(no_sanitize_address)
+#else
+#define AETHER_NO_SANITIZE_ADDRESS
+#endif
 #else
 #define AETHER_LIKELY(x) (x)
 #define AETHER_UNLIKELY(x) (x)
 #define AETHER_ALWAYS_INLINE inline
+#define AETHER_NOINLINE
+#define AETHER_NO_SANITIZE_ADDRESS
 #endif
 
 // Compiler tail-call optimization attribute for direct-threaded dispatch

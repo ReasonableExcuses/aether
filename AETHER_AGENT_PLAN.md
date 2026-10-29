@@ -191,7 +191,7 @@ Implements D1, D2, D3. **Order matters.**
 - Delete `ImmixSpace::MarkObject`'s block scan; line marks computed O(1) from the block header.
 - **Acceptance:** full-heap mark time on a 200K-object heap ≥ 10× faster than baseline (use `--trace-gc`).
 
-### T1.4 Conservative stack scanning (D2)
+### [x] T1.4 Conservative stack scanning (D2)
 - Capture registers (`setjmp`/`getcontext`/`RtlCaptureContext`) and scan `[sp, stack_base)` of the owning thread; each word that points at a valid object start (bitmap) pins that object.
 - Make `AllocateRuntime` collectable at allocation (remove the "never collects" restriction). Remove per-opcode `op_roots.Clear()` and `SnapshotState` from the safepoint check once stress runs clean.
 - Keep `HandleScope` working for embedders; mark it "optional" in docs.
