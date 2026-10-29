@@ -97,7 +97,7 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSArrayBuffer); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
     }
 
@@ -269,11 +269,11 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSTypedArray); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         if (buffer_ != nullptr) {
             TaggedValue buf_val = TaggedValue::FromHeapObject(buffer_);
-            visitor(buf_val);
+            visitor->Visit(&buf_val);
             if (buf_val.IsHeapObject()) {
                 buffer_ = buf_val.As<JSArrayBuffer>();
             }
@@ -598,11 +598,11 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSDataView); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         if (buffer_ != nullptr) {
             TaggedValue buf_val = TaggedValue::FromHeapObject(buffer_);
-            visitor(buf_val);
+            visitor->Visit(&buf_val);
             if (buf_val.IsHeapObject()) {
                 buffer_ = buf_val.As<JSArrayBuffer>();
             }

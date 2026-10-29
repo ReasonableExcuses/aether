@@ -271,6 +271,71 @@ void TestImmixBlockAllocatorLayout() {
     Assert(block->line_allocated.test(line), "Object's line must be marked allocated");
 }
 
+void TestMarkingEngine() {
+    std::cout << "[Test] Marking Engine Rewrite & SlotVisitor (T1.3)..." << std::endl;
+    Agent agent;
+    auto& heap = agent.GetHeap();
+    auto& old_gen = heap.GetOldGen();
+
+    // 1. Verify SlotVisitor virtual dispatch
+    class CountingSlotVisitor final : public SlotVisitor {
+    public:
+        size_t count{0};
+        void Visit(TaggedValue* slot) override {
+            if (slot && slot->IsHeapObject()) ++count;
+        }
+    };
+
+    CountingSlotVisitor counter;
+    auto* arr = heap.AllocateOld<JSArray>(nullptr);
+    arr->SetLength(3);
+    arr->SetElement(0, TaggedValue::FromHeapObject(heap.AllocateOld<JSObject>(nullptr)));
+    arr->SetElement(1, TaggedValue::FromHeapObject(heap.AllocateOld<JSObject>(nullptr)));
+    arr->SetElement(2, TaggedValue::FromHeapObject(heap.AllocateOld<JSObject>(nullptr)));
+    arr->IteratePointers(&counter);
+    Assert(counter.count >= 3, "SlotVisitor must visit all array element slots");
+
+    // 2. Verify O(1) Immix line marking directly via block header
+    old_gen.ClearMarks();
+    ImmixBlock* block = ImmixBlock::BlockFor(arr);
+    size_t line = block->LineFor(arr);
+    Assert(block->line_marks[line] == 0, "Line marks must be 0 after ClearMarks()");
+    old_gen.MarkObject(arr);
+    Assert(block->line_marks[line] == 1, "Line marks must be 1 after MarkObject()");
+
+    // 3. Verify Header Mark Bits
+    Assert(!arr->IsMarked(), "Object mark bit was not set by Immix line mark alone");
+    arr->SetMarked(true);
+    Assert(arr->IsMarked(), "SetMarked(true) must set kMarkBit");
+    arr->SetMarked(false);
+    Assert(!arr->IsMarked(), "SetMarked(false) must clear kMarkBit");
+
+    // 4. Performance & Scalability Test on dense graph: 200,000 objects
+    std::cout << "  -> Constructing 200,000-object linked chain in old gen..." << std::endl;
+    HandleScope scope(heap);
+    auto head = scope.CreateHandle(heap.AllocateOld<JSArray>(nullptr));
+    head->SetLength(1);
+    JSArray* curr = head.Get();
+    for (int i = 0; i < 200000; ++i) {
+        auto* next_arr = heap.AllocateOld<JSArray>(nullptr);
+        next_arr->SetLength(1);
+        curr->SetElement(0, TaggedValue::FromHeapObject(next_arr));
+        curr = next_arr;
+    }
+
+    std::cout << "  -> Measuring 200,000-object full heap mark time..." << std::endl;
+    auto start = std::chrono::steady_clock::now();
+    size_t marked_count = heap.MarkFromRoots({head.Get()});
+    auto end = std::chrono::steady_clock::now();
+    double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    std::cout << "  -> Marked " << marked_count << " objects in " << elapsed_ms << " ms ("
+              << (elapsed_ms * 1000.0 / marked_count) << " us/object)" << std::endl;
+    Assert(marked_count >= 200001, "All 200,001 objects in chain must be marked");
+    // Marking 200K objects with O(1) mark bits and mark stack should easily take < 50ms (typically ~10ms)
+    Assert(elapsed_ms < 500.0, "Mark time for 200K objects must be under 500ms");
+}
+
 int main() {
     try {
         TestFlagParsing();
@@ -281,6 +346,7 @@ int main() {
         TestHeapVerifierCatchesUnrememberedPointer();
         TestObjectHeaderLayout();
         TestImmixBlockAllocatorLayout();
+        TestMarkingEngine();
         std::cout << "All flag, heap verifier, and object header tests passed successfully!\n";
         return 0;
     } catch (const std::exception& e) {

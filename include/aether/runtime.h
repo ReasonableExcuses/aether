@@ -100,9 +100,9 @@ public:
     }
 
     size_t ObjectSize() const override { return sizeof(JSNativeFunction); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        for (auto& root : captured_roots_) visitor(root);
+        for (auto& root : captured_roots_) visitor->Visit(&root);
     }
 
     HeapObject* RelocateTo(void* dst) override {

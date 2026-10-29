@@ -1,4 +1,5 @@
 #include "aether/bytecode.h"
+#include "aether/heap_object.h"
 #include <iomanip>
 #include <sstream>
 
@@ -526,6 +527,24 @@ std::string BytecodeArray::Disassemble() const {
         ss << "\n";
     }
     return ss.str();
+}
+
+void BytecodeArray::IterateConstants(SlotVisitor* visitor) {
+    if (!visitor) return;
+    for (auto& c : constants_) {
+        if (c.IsHeapObject()) {
+            visitor->Visit(&c);
+        }
+    }
+}
+
+void BytecodeArray::IterateConstants(const std::function<void(TaggedValue&)>& visitor) {
+    if (!visitor) return;
+    for (auto& c : constants_) {
+        if (c.IsHeapObject()) {
+            visitor(c);
+        }
+    }
 }
 
 } // namespace aether

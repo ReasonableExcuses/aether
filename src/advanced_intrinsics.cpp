@@ -51,9 +51,9 @@ public:
     AsyncWaitPromise(AsyncWaitPromise&&) noexcept = default;
     size_t ObjectSize() const override { return sizeof(AsyncWaitPromise); }
     HeapObject* RelocateTo(void* dst) override { return new (dst) AsyncWaitPromise(std::move(*this)); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSPromise::IteratePointers(visitor);
-        visitor(buffer_);
+        visitor->Visit(&buffer_);
     }
     TaggedValue BufferRoot() const { return buffer_; }
     void ReleaseBuffer() { buffer_ = TaggedValue::Undefined(); }

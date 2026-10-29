@@ -74,14 +74,19 @@ public:
         return sizeof(JSWeakMap);
     }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         // Both halves of an ephemeron are handled by the collector's fixed
         // point pass: a value is strong only once its key is known to be live.
     }
 
-    void TraceEphemerons(const std::function<bool(HeapObject*)>& is_alive,
-                         const std::function<void(TaggedValue&)>& visitor) {
+    template <typename AlivePredicate>
+    void TraceEphemerons(AlivePredicate&& is_alive, SlotVisitor* visitor) {
+        for (auto& [key, value] : *entries_) if (is_alive(key)) visitor->Visit(&value);
+    }
+
+    template <typename AlivePredicate>
+    void TraceEphemerons(AlivePredicate&& is_alive, const std::function<void(TaggedValue&)>& visitor) {
         for (auto& [key, value] : *entries_) if (is_alive(key)) visitor(value);
     }
 
@@ -163,7 +168,7 @@ public:
         return sizeof(JSWeakSet);
     }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         // Elements are held weakly; not visited.
     }
@@ -225,7 +230,7 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSWeakRef); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         // Target is held weakly; not visited.
     }
@@ -316,11 +321,11 @@ public:
         return sizeof(JSFinalizationRegistry);
     }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        if (!cleanup_callback_.IsEmpty()) visitor(cleanup_callback_);
+        if (!cleanup_callback_.IsEmpty()) visitor->Visit(&cleanup_callback_);
         for (auto& r : registrations_) {
-            if (!r.held_value.IsEmpty()) visitor(r.held_value);
+            if (!r.held_value.IsEmpty()) visitor->Visit(&r.held_value);
         }
     }
 

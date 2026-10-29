@@ -205,6 +205,8 @@ public:
     // Mark-only STW entry used by the compatibility ConcurrentMarker facade.
     size_t MarkFromRoots(const std::vector<HeapObject*>& roots, bool process_weak = false);
 
+    bool Contains(const void* ptr) const noexcept;
+
 private:
     friend class NoGCScope;
     friend class HeapVerifier;
@@ -276,6 +278,7 @@ private:
         }
     }
     void ReserveManaged(size_t bytes);
+    void VisitRoots(SlotVisitor* visitor);
     void VisitRoots(const std::function<void(TaggedValue&)>& visitor);
     std::vector<HeapObject*> Trace(const std::vector<HeapObject*>& roots);
     void ProcessWeak(const std::vector<HeapObject*>& live,
@@ -291,6 +294,7 @@ private:
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;
     std::vector<HeapObject*> young_objects_;
+    std::vector<HeapObject*> mark_stack_;
     struct Finalization { TaggedValue callback; TaggedValue held_value; };
     std::deque<Finalization> finalizers_;
 

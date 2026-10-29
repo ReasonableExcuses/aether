@@ -39,9 +39,9 @@ public:
     Probe(Probe&&) noexcept = default;
     HeapObject* RelocateTo(void* dst) override { return new (dst) Probe(std::move(*this)); }
     size_t ObjectSize() const override { return sizeof(Probe) + 1024 * 1024; }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         Check(owner == std::this_thread::get_id(), "off-thread graph traversal");
-        visitor(child);
+        visitor->Visit(&child);
     }
     TaggedValue child{TaggedValue::Undefined()};
     const std::thread::id owner{std::this_thread::get_id()};
@@ -62,7 +62,7 @@ public:
     }
     ConstructorProbe(ConstructorProbe&&) noexcept = default;
     HeapObject* RelocateTo(void* dst) override { return new (dst) ConstructorProbe(std::move(*this)); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { visitor(child); }
+    void IteratePointers(SlotVisitor* visitor) override { visitor->Visit(&child); }
     TaggedValue child;
 };
 

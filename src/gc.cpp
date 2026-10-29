@@ -348,10 +348,25 @@ bool ImmixSpace::ContainsBlock(const ImmixBlock* block) const noexcept {
             return (addr - start) % kImmixBlockSize == 0;
         }
     }
-    for (const auto* s : standalone_blocks_) {
-        if (s == block) return true;
+    return block->space == this;
+}
+
+ImmixBlock* ImmixSpace::BlockForPointer(const void* ptr) const noexcept {
+    if (!ptr) return nullptr;
+    if (reservation_start_) {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        uintptr_t start = reinterpret_cast<uintptr_t>(reservation_start_) + reservation_padding_;
+        size_t total_span = all_blocks_.size() * kImmixBlockSize;
+        if (addr >= start && addr < start + total_span) {
+            return ImmixBlock::BlockFor(ptr);
+        }
+        return nullptr;
     }
-    return false;
+    ImmixBlock* block = ImmixBlock::BlockFor(ptr);
+    for (const auto* s : standalone_blocks_) {
+        if (s == block) return block;
+    }
+    return nullptr;
 }
 
 void* ImmixSpace::Allocate(size_t bytes) {
@@ -590,24 +605,15 @@ void ImmixSpace::ClearMarks() noexcept {
 
 bool ImmixSpace::Contains(const void* ptr) const noexcept {
     if (!ptr) return false;
-    if (reservation_start_) {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t start = reinterpret_cast<uintptr_t>(reservation_start_) + reservation_padding_;
-        size_t total_span = all_blocks_.size() * kImmixBlockSize;
-        if (addr >= start && addr < start + total_span) {
-            ImmixBlock* block = ImmixBlock::BlockFor(ptr);
-            return block->ContainsPayload(ptr);
-        }
-    }
-    for (const auto* s : standalone_blocks_) {
-        if (s->ContainsPayload(ptr)) return true;
-    }
+    ImmixBlock* block = BlockForPointer(ptr);
+    if (block) return block->ContainsPayload(ptr);
     return IsLargeObject(ptr);
 }
 
 void ImmixSpace::MarkObject(HeapObject* obj, size_t allocation_size) {
     if (!obj) return;
-    if (large_objects_head_ && (allocation_size > kLargeObjectThreshold || obj->GetAllocatedSize() > kLargeObjectThreshold)) {
+    size_t size = allocation_size ? allocation_size : obj->GetAllocatedSize();
+    if (large_objects_head_ && (size > kLargeObjectThreshold || obj->GetAllocatedSize() > kLargeObjectThreshold)) {
         if (IsLargeObject(obj)) {
             LargeObjectHeader* header = LargeObjectHeader::FromObject(obj);
             header->marked = true;
@@ -615,13 +621,10 @@ void ImmixSpace::MarkObject(HeapObject* obj, size_t allocation_size) {
         }
     }
 
-    ImmixBlock* block = ImmixBlock::BlockFor(obj);
-    if (!ContainsBlock(block)) return;
+    ImmixBlock* block = BlockForPointer(obj);
+    if (!block) return;
 
-    size_t size = allocation_size ? allocation_size : obj->GetAllocatedSize();
     if (size == 0) size = sizeof(HeapObject);
-
-    std::lock_guard<std::mutex> lock(mark_mutex_);
     size_t start_line = block->LineFor(obj);
     size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + size - 1);
     for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {

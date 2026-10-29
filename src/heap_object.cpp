@@ -910,20 +910,20 @@ bool JSRegExp::Test(std::string_view str) const {
     return RegexSearch(Pattern(), Flags(), str).has_value();
 }
 
-void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visitor) {
+void JSFunction::IteratePointers(SlotVisitor* visitor) {
     JSObject::IteratePointers(visitor);
     if (!ctor_prototype_.IsEmpty()) {
-        visitor(ctor_prototype_);
+        visitor->Visit(&ctor_prototype_);
     }
     if (lexical_this_.IsHeapObject()) {
-        visitor(lexical_this_);
+        visitor->Visit(&lexical_this_);
     }
     if (lexical_new_target_.IsHeapObject()) {
-        visitor(lexical_new_target_);
+        visitor->Visit(&lexical_new_target_);
     }
     if (environment_ != nullptr) {
         TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
-        visitor(env_val);
+        visitor->Visit(&env_val);
         if (env_val.IsHeapObject()) {
             environment_ = env_val.As<LexicalEnvironment>();
         }
@@ -934,7 +934,7 @@ void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visito
     for (auto*& obj : with_stack_) {
         if (obj) {
             TaggedValue obj_val = TaggedValue::FromHeapObject(obj);
-            visitor(obj_val);
+            visitor->Visit(&obj_val);
             if (obj_val.IsHeapObject() && obj_val.AsHeapObject()->IsJSObject()) {
                 obj = static_cast<JSObject*>(obj_val.AsHeapObject());
             }
@@ -942,7 +942,7 @@ void JSFunction::IteratePointers(const std::function<void(TaggedValue&)>& visito
     }
     for (auto& f : instance_fields_) {
         if (f.initial_value.IsHeapObject()) {
-            visitor(f.initial_value);
+            visitor->Visit(&f.initial_value);
         }
     }
 }

@@ -105,7 +105,20 @@ void IsolateHeap::ReserveManaged(size_t bytes) {
     throw std::length_error("Aether managed heap budget exceeded");
 }
 
+void IsolateHeap::VisitRoots(SlotVisitor* visitor) {
+    if (!visitor) return;
+    for (HandleScope* scope = top_scope_; scope; scope = scope->PrevScope()) {
+        for (auto& value : scope->Slots()) visitor->Visit(&value);
+    }
+    for (auto* root : extra_roots_) if (root) visitor->Visit(root);
+    for (auto& entry : finalizers_) {
+        visitor->Visit(&entry.callback);
+        visitor->Visit(&entry.held_value);
+    }
+}
+
 void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
+    if (!visitor) return;
     for (HandleScope* scope = top_scope_; scope; scope = scope->PrevScope()) {
         for (auto& value : scope->Slots()) visitor(value);
     }
@@ -117,37 +130,95 @@ void IsolateHeap::VisitRoots(const std::function<void(TaggedValue&)>& visitor) {
 }
 
 std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& roots) {
+    auto mark_start = std::chrono::steady_clock::now();
     old_gen_.ClearMarks();
     for (auto* obj : young_objects_) obj->SetMarked(false);
-    std::unordered_set<HeapObject*> seen;
+
+    mark_stack_.clear();
     std::vector<HeapObject*> live;
-    auto mark = [&](HeapObject* obj) {
-        if (obj && seen.insert(obj).second) {
-            live.push_back(obj);
-            obj->SetMarked(true);
-        }
-    };
-    auto visit = [&](TaggedValue& slot) { if (slot.IsHeapObject()) mark(slot.AsHeapObject()); };
-    VisitRoots(visit);
-    for (auto* root : roots) mark(root);
-    size_t scanned = 0;
-    for (;;) {
-        while (scanned < live.size()) {
-            HeapObject* obj = live[scanned++];
-            old_gen_.MarkObject(obj);
-            obj->IteratePointers(visit);
-        }
-        const size_t before = live.size();
-        // Repeat until no ephemeron adds a strong edge, including newly
-        // discovered maps and chains whose keys become reachable via values.
-        for (size_t i = 0; i < live.size(); ++i) {
-            if (live[i]->IsWeakMap()) {
-                static_cast<JSWeakMap*>(live[i])->TraceEphemerons(
-                    [&](HeapObject* key) { return seen.contains(key); }, visit);
+    std::vector<JSWeakMap*> weak_maps;
+
+    class MarkVisitor final : public SlotVisitor {
+    public:
+        MarkVisitor(std::vector<HeapObject*>& mark_stack,
+                    std::vector<HeapObject*>& live,
+                    std::vector<JSWeakMap*>& weak_maps,
+                    ImmixSpace& old_gen)
+            : mark_stack_(mark_stack), live_(live), weak_maps_(weak_maps), old_gen_(old_gen) {}
+
+        void Visit(TaggedValue* slot) override {
+            if (!slot) return;
+            TaggedValue val = *slot;
+            if (val.IsHeapObject()) {
+                HeapObject* obj = val.AsHeapObject();
+                if (obj && !obj->IsMarked()) {
+                    obj->SetMarked(true);
+                    if (obj->IsOld()) {
+                        old_gen_.MarkObject(obj);
+                    }
+                    mark_stack_.push_back(obj);
+                    live_.push_back(obj);
+                    if (obj->IsWeakMap()) {
+                        weak_maps_.push_back(static_cast<JSWeakMap*>(obj));
+                    }
+                }
             }
+        }
+
+    private:
+        std::vector<HeapObject*>& mark_stack_;
+        std::vector<HeapObject*>& live_;
+        std::vector<JSWeakMap*>& weak_maps_;
+        ImmixSpace& old_gen_;
+    };
+
+    MarkVisitor mark_visitor(mark_stack_, live, weak_maps, old_gen_);
+
+    // 1. Visit roots
+    VisitRoots(&mark_visitor);
+    for (auto* root : roots) {
+        if (root && !root->IsMarked()) {
+            root->SetMarked(true);
+            if (root->IsOld()) {
+                old_gen_.MarkObject(root);
+            }
+            mark_stack_.push_back(root);
+            live.push_back(root);
+            if (root->IsWeakMap()) {
+                weak_maps.push_back(static_cast<JSWeakMap*>(root));
+            }
+        }
+    }
+
+    // 2. Drain mark stack (DFS order)
+    while (!mark_stack_.empty()) {
+        HeapObject* obj = mark_stack_.back();
+        mark_stack_.pop_back();
+        obj->IteratePointers(&mark_visitor);
+    }
+
+    // 3. Ephemeron fixpoint loop
+    for (;;) {
+        const size_t before = live.size();
+        for (auto* wm : weak_maps) {
+            wm->TraceEphemerons(
+                [](HeapObject* key) { return key && key->IsMarked(); },
+                &mark_visitor);
+        }
+        while (!mark_stack_.empty()) {
+            HeapObject* obj = mark_stack_.back();
+            mark_stack_.pop_back();
+            obj->IteratePointers(&mark_visitor);
         }
         if (live.size() == before) break;
     }
+
+    if (Options::Get().trace_gc) {
+        auto mark_end = std::chrono::steady_clock::now();
+        double mark_ms = std::chrono::duration<double, std::milli>(mark_end - mark_start).count();
+        std::cout << "[GC] Mark completed in " << mark_ms << "ms: " << live.size() << " live objects\n";
+    }
+
     return live;
 }
 
@@ -178,9 +249,8 @@ void IsolateHeap::MinorGC() {
     // Until every mutation path has a complete barrier, scan all tenured
     // objects. This is conservative for a minor cycle, not permanent rooting.
     auto live = Trace(old_gen_.Objects());
-    std::unordered_set<HeapObject*> alive(live.begin(), live.end());
     ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
-        return alive.contains(obj) ? obj : nullptr;
+        return (obj && obj->IsMarked()) ? obj : nullptr;
     });
 
     struct Move { HeapObject* source; HeapObject* destination; bool old; };
@@ -194,7 +264,7 @@ void IsolateHeap::MinorGC() {
     // leaves the original graph intact. RelocateTo must be a nonthrowing move.
     try {
         for (auto* obj : young_objects_) {
-            if (!alive.contains(obj)) continue;
+            if (!obj->IsMarked()) continue;
             size_t bytes = obj->GetAllocatedSize();
             bool old = obj->GetAge() + 1 >= kTenuringAgeThreshold;
             auto* destination = old ? static_cast<HeapObject*>(old_gen_.Allocate(bytes))
@@ -215,9 +285,25 @@ void IsolateHeap::MinorGC() {
         auto it = forwarding.find(obj);
         return it == forwarding.end() ? obj : it->second;
     };
-    std::function<void(TaggedValue&)> relocate = [&](TaggedValue& slot) {
-        if (slot.IsHeapObject()) slot = TaggedValue::FromHeapObject(resolve(slot.AsHeapObject()));
+    class RelocateVisitor final : public SlotVisitor {
+    public:
+        explicit RelocateVisitor(const std::unordered_map<HeapObject*, HeapObject*>& forwarding)
+            : forwarding_(forwarding) {}
+
+        void Visit(TaggedValue* slot) override {
+            if (!slot) return;
+            TaggedValue val = *slot;
+            if (val.IsHeapObject()) {
+                auto it = forwarding_.find(val.AsHeapObject());
+                if (it != forwarding_.end()) {
+                    *slot = TaggedValue::FromHeapObject(it->second);
+                }
+            }
+        }
+    private:
+        const std::unordered_map<HeapObject*, HeapObject*>& forwarding_;
     };
+    RelocateVisitor relocate(forwarding);
     std::function<HeapObject*(HeapObject*)> resolve_weak = resolve;
     std::function<bool(HeapObject*)> all_keys_live = [](HeapObject*) { return true; };
     // All core nursery RelocateTo implementations move noexcept C++ members.
@@ -233,20 +319,20 @@ void IsolateHeap::MinorGC() {
             moved->SetOld(move.old);
             if (move.old) old_gen_.RegisterObject(moved, moved->IsCharged());
         }
-        VisitRoots(relocate);
+        VisitRoots(&relocate);
         for (auto*& obj : live) obj = resolve(obj);
         for (auto* obj : live) {
             // Includes promoted survivors: their children must be relocated.
-            obj->IteratePointers(relocate);
+            obj->IteratePointers(&relocate);
             if (obj->IsWeakMap()) {
-                static_cast<JSWeakMap*>(obj)->TraceEphemerons(all_keys_live, relocate);
+                static_cast<JSWeakMap*>(obj)->TraceEphemerons(all_keys_live, &relocate);
             }
         }
         ProcessWeak(live, resolve_weak);
         WasmRegistryRelocate([&](JSObject* obj) -> JSObject* {
             return static_cast<JSObject*>(resolve(obj));
         });
-        WasmRegistryPruneDead([&](JSObject* obj) { return alive.contains(obj); });
+        WasmRegistryPruneDead([&](JSObject* obj) { return obj && Contains(obj) && obj->IsMarked(); });
     } catch (...) {
         std::terminate();
     }
@@ -295,17 +381,15 @@ void IsolateHeap::MajorGC() {
     HeapVerifier::VerifyBeforeGC(*this);
     CollectionScope collecting(collecting_);
     auto live = Trace({});
-    std::unordered_set<HeapObject*> alive(live.begin(), live.end());
-    // Membership, not poisoned mark bits, decides weak liveness. All weak
-    // processing and cleanup queue allocation precedes any reclamation.
+    // Liveness is tracked directly in object mark bits.
     ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
-        return alive.contains(obj) ? obj : nullptr;
+        return (obj && obj->IsMarked()) ? obj : nullptr;
     });
-    WasmRegistryPruneDead([&](JSObject* obj) { return alive.contains(obj); });
+    WasmRegistryPruneDead([&](JSObject* obj) { return obj && Contains(obj) && obj->IsMarked(); });
     std::vector<HeapObject*> surviving_young;
     surviving_young.reserve(young_objects_.size());
     for (auto* obj : young_objects_) {
-        if (alive.contains(obj)) {
+        if (obj->IsMarked()) {
             surviving_young.push_back(obj);
             continue;
         }
@@ -339,12 +423,23 @@ size_t IsolateHeap::MarkFromRoots(const std::vector<HeapObject*>& roots, bool pr
     CollectionScope collecting(collecting_);
     auto live = Trace(roots);
     if (process_weak) {
-        std::unordered_set<HeapObject*> alive(live.begin(), live.end());
         ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
-            return alive.contains(obj) ? obj : nullptr;
+            return (obj && obj->IsMarked()) ? obj : nullptr;
         });
     }
     return live.size();
+}
+
+bool IsolateHeap::Contains(const void* ptr) const noexcept {
+    if (!ptr) return false;
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    if (addr >= nursery_.FromSpaceStart() && addr < nursery_.FromSpaceLimit()) {
+        return true;
+    }
+    if (addr >= nursery_.ToSpaceStart() && addr < nursery_.ToSpaceLimit()) {
+        return true;
+    }
+    return old_gen_.Contains(ptr);
 }
 
 size_t IsolateHeap::DrainFinalizationQueue(const std::function<void(TaggedValue, TaggedValue)>& sink) {

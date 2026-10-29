@@ -27,13 +27,13 @@ public:
     RootAnchor(RootAnchor&&) noexcept = default;
     size_t ObjectSize() const override { return sizeof(RootAnchor); }
     HeapObject* RelocateTo(void* dst) override { return new (dst) RootAnchor(std::move(*this)); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         std::lock_guard<std::mutex> lock(state_->mutex);
         for (auto* entries : {&state_->pending, &state_->ready}) {
             for (auto& entry : *entries) {
                 if (!entry->cancelled.load(std::memory_order_acquire)) {
-                    for (auto& root : entry->roots) visitor(root);
+                    for (auto& root : entry->roots) visitor->Visit(&root);
                 }
             }
         }

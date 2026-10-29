@@ -14,6 +14,7 @@
 namespace aether {
 
 class ExecutableMemory;
+class SlotVisitor;
 
 /**
  * @brief Opcode enumerations for AetherVM Accumulator-Register Bytecode ISA.
@@ -395,13 +396,8 @@ public:
 
     uint16_t AddConstant(TaggedValue val);
 
-    void IterateConstants(const std::function<void(TaggedValue&)>& visitor) {
-        for (auto& c : constants_) {
-            if (c.IsHeapObject()) {
-                visitor(c);
-            }
-        }
-    }
+    void IterateConstants(SlotVisitor* visitor);
+    void IterateConstants(const std::function<void(TaggedValue&)>& visitor);
 
     // Disassembly for verification and debugging
     std::string Disassemble() const;

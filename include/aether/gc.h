@@ -295,6 +295,7 @@ public:
     bool Contains(const void* ptr) const noexcept;
     void MarkObject(HeapObject* obj, size_t allocation_size = 0);
 
+    ImmixBlock* BlockForPointer(const void* ptr) const noexcept;
     bool IsValidObjectStart(const void* ptr) const noexcept;
     size_t BlockCount() const noexcept { return all_blocks_.size(); }
     std::mutex& GetMarkMutex() const noexcept { return mark_mutex_; }

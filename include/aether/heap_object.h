@@ -22,6 +22,36 @@ namespace aether {
 class HeapObject;
 void RecordWriteBarrier(HeapObject* source, TaggedValue value);
 
+class SlotVisitor {
+public:
+    virtual ~SlotVisitor() = default;
+    virtual void Visit(TaggedValue* slot) = 0;
+    AETHER_ALWAYS_INLINE void Visit(TaggedValue& slot) { Visit(&slot); }
+};
+
+template <typename F>
+class LambdaSlotVisitor final : public SlotVisitor {
+public:
+    explicit LambdaSlotVisitor(F fn) : fn_(std::move(fn)) {}
+
+    void Visit(TaggedValue* slot) override {
+        if (!slot) return;
+        if constexpr (std::is_invocable_v<F, TaggedValue*>) {
+            fn_(slot);
+        } else {
+            fn_(*slot);
+        }
+    }
+
+private:
+    F fn_;
+};
+
+template <typename F>
+inline LambdaSlotVisitor<std::decay_t<F>> MakeSlotVisitor(F&& fn) {
+    return LambdaSlotVisitor<std::decay_t<F>>(std::forward<F>(fn));
+}
+
 namespace detail {
 
 inline size_t StringStorageBytes(const std::string& value) noexcept {
@@ -355,7 +385,12 @@ public:
           allocated_size_(other.allocated_size_) {}
 
     virtual size_t ObjectSize() const { return sizeof(*this); }
-    virtual void IteratePointers(const std::function<void(TaggedValue&)>& visitor) { (void)visitor; }
+    virtual void IteratePointers(SlotVisitor* visitor) { (void)visitor; }
+    template <typename F, typename = std::enable_if_t<!std::is_convertible_v<std::decay_t<F>, SlotVisitor*>>>
+    void IteratePointers(F&& fn) {
+        auto visitor = MakeSlotVisitor(std::forward<F>(fn));
+        IteratePointers(static_cast<SlotVisitor*>(&visitor));
+    }
     virtual HeapObject* RelocateTo(void* dst) = 0;
 
 private:
@@ -386,7 +421,7 @@ public:
     uint32_t Hash() const noexcept { return hash_; }
 
     size_t ObjectSize() const override { return sizeof(JSString); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+    void IteratePointers(SlotVisitor* visitor) override { (void)visitor; }
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSString(std::move(*this));
@@ -437,7 +472,7 @@ public:
     uint32_t Id() const noexcept { return id_; }
 
     size_t ObjectSize() const override { return sizeof(JSSymbol); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override { (void)visitor; }
+    void IteratePointers(SlotVisitor* visitor) override { (void)visitor; }
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSSymbol(std::move(*this));
@@ -656,27 +691,27 @@ public:
     }
 
     size_t ObjectSize() const override { return sizeof(JSObject); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         if (prototype_ != nullptr) {
             TaggedValue proto_val = TaggedValue::FromHeapObject(prototype_);
-            visitor(proto_val);
+            visitor->Visit(&proto_val);
             if (proto_val.IsHeapObject()) {
                 prototype_ = proto_val.As<JSObject>();
             }
         }
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
             if (!in_object_slots_[i].IsEmpty()) {
-                visitor(in_object_slots_[i]);
+                visitor->Visit(&in_object_slots_[i]);
             }
         }
         for (auto& slot : out_of_line_slots_) {
             if (!slot.IsEmpty()) {
-                visitor(slot);
+                visitor->Visit(&slot);
             }
         }
         for (auto& [k, acc] : accessors_) {
-            if (!acc.getter.IsEmpty()) visitor(acc.getter);
-            if (!acc.setter.IsEmpty()) visitor(acc.setter);
+            if (!acc.getter.IsEmpty()) visitor->Visit(&acc.getter);
+            if (!acc.setter.IsEmpty()) visitor->Visit(&acc.setter);
         }
     }
 
@@ -811,10 +846,10 @@ public:
         return sizeof(JSArray);
     }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         for (auto& el : elements_) {
-            if (!el.IsEmpty()) visitor(el);
+            if (!el.IsEmpty()) visitor->Visit(&el);
         }
     }
 
@@ -879,11 +914,11 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSMap); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         for (auto& [k, v] : entries_) {
-            if (!k.IsEmpty()) visitor(k);
-            if (!v.IsEmpty()) visitor(v);
+            if (!k.IsEmpty()) visitor->Visit(&k);
+            if (!v.IsEmpty()) visitor->Visit(&v);
         }
     }
 
@@ -923,10 +958,10 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSSet); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         for (auto& v : values_) {
-            if (!v.IsEmpty()) visitor(v);
+            if (!v.IsEmpty()) visitor->Visit(&v);
         }
     }
 
@@ -979,12 +1014,12 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSPromise); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        if (!result_.IsEmpty()) visitor(result_);
+        if (!result_.IsEmpty()) visitor->Visit(&result_);
         for (auto& r : reactions_) {
-            if (!r.on_fulfilled.IsEmpty()) visitor(r.on_fulfilled);
-            if (!r.on_rejected.IsEmpty()) visitor(r.on_rejected);
+            if (!r.on_fulfilled.IsEmpty()) visitor->Visit(&r.on_fulfilled);
+            if (!r.on_rejected.IsEmpty()) visitor->Visit(&r.on_rejected);
         }
     }
 
@@ -1022,7 +1057,7 @@ public:
     bool Test(std::string_view str) const;
 
     size_t ObjectSize() const override { return sizeof(JSRegExp); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
     }
 
@@ -1089,16 +1124,16 @@ public:
     LexicalEnvironment(LexicalEnvironment&& other) noexcept = default;
 
     size_t ObjectSize() const override { return sizeof(LexicalEnvironment); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         if (outer_ != nullptr) {
             TaggedValue outer_val = TaggedValue::FromHeapObject(outer_);
-            visitor(outer_val);
+            visitor->Visit(&outer_val);
             if (outer_val.IsHeapObject()) {
                 outer_ = outer_val.As<LexicalEnvironment>();
             }
         }
         for (auto& s : slots_) {
-            if (!s.IsEmpty()) visitor(s);
+            if (!s.IsEmpty()) visitor->Visit(&s);
         }
     }
 
@@ -1213,7 +1248,7 @@ public:
     bool HasWithStack() const noexcept { return !with_stack_.empty(); }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override;
+    void IteratePointers(SlotVisitor* visitor) override;
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSFunction(std::move(*this));
@@ -1301,44 +1336,44 @@ public:
 
     size_t ObjectSize() const override { return sizeof(JSGeneratorObject); }
 
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         if (function_ != nullptr) {
             TaggedValue fn_val = TaggedValue::FromHeapObject(function_);
-            visitor(fn_val);
+            visitor->Visit(&fn_val);
             if (fn_val.IsHeapObject()) function_ = static_cast<JSFunction*>(fn_val.AsHeapObject());
         }
         if (environment_ != nullptr) {
             TaggedValue env_val = TaggedValue::FromHeapObject(environment_);
-            visitor(env_val);
+            visitor->Visit(&env_val);
             if (env_val.IsHeapObject()) environment_ = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
         }
         if (async_promise_ != nullptr) {
             TaggedValue prom_val = TaggedValue::FromHeapObject(async_promise_);
-            visitor(prom_val);
+            visitor->Visit(&prom_val);
             if (prom_val.IsHeapObject()) async_promise_ = static_cast<JSPromise*>(prom_val.AsHeapObject());
         }
         for (auto& sh : saved_handlers_) {
             if (sh.env != nullptr) {
                 TaggedValue env_val = TaggedValue::FromHeapObject(sh.env);
-                visitor(env_val);
+                visitor->Visit(&env_val);
                 if (env_val.IsHeapObject()) sh.env = static_cast<LexicalEnvironment*>(env_val.AsHeapObject());
             }
         }
         for (auto& req : async_queue_) {
-            if (!req.value.IsEmpty()) visitor(req.value);
+            if (!req.value.IsEmpty()) visitor->Visit(&req.value);
             if (req.promise != nullptr) {
                 TaggedValue prom_val = TaggedValue::FromHeapObject(req.promise);
-                visitor(prom_val);
+                visitor->Visit(&prom_val);
                 if (prom_val.IsHeapObject()) req.promise = static_cast<JSPromise*>(prom_val.AsHeapObject());
             }
         }
-        if (!this_val_.IsEmpty()) visitor(this_val_);
+        if (!this_val_.IsEmpty()) visitor->Visit(&this_val_);
         for (auto& r : saved_registers_) {
-            if (!r.IsEmpty()) visitor(r);
+            if (!r.IsEmpty()) visitor->Visit(&r);
         }
         for (auto& a : args_) {
-            if (!a.IsEmpty()) visitor(a);
+            if (!a.IsEmpty()) visitor->Visit(&a);
         }
     }
 
@@ -1373,7 +1408,7 @@ public:
     const std::string& Message() const noexcept { return message_; }
 
     size_t ObjectSize() const override { return sizeof(JSError); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
     }
 
@@ -1425,10 +1460,10 @@ public:
     }
 
     size_t ObjectSize() const override { return sizeof(JSProxy); }
-    void IteratePointers(const std::function<void(TaggedValue&)>& visitor) override {
+    void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        if (!target_.IsEmpty()) visitor(target_);
-        if (!handler_.IsEmpty()) visitor(handler_);
+        if (!target_.IsEmpty()) visitor->Visit(&target_);
+        if (!handler_.IsEmpty()) visitor->Visit(&handler_);
     }
 
     HeapObject* RelocateTo(void* dst) override {
@@ -1959,7 +1994,7 @@ public:
     }
 
     size_t ObjectSize() const override { return sizeof(JSBigInt); }
-    void IteratePointers(const std::function<void(TaggedValue&)>&) override {}
+    void IteratePointers(SlotVisitor*) override {}
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSBigInt(std::move(*this));
     }
