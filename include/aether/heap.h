@@ -102,7 +102,7 @@ private:
  */
 class IsolateHeap {
 public:
-    explicit IsolateHeap(size_t nursery_size = kDefaultNurserySemiSpaceSize);
+    explicit IsolateHeap(size_t nursery_size = 0);
     ~IsolateHeap();
 
     // Precise managed allocation. Root all live values across allocation. For
@@ -130,8 +130,15 @@ public:
     AETHER_ALWAYS_INLINE void WriteBarrier(HeapObject* source, TaggedValue value) noexcept {
         if (source != nullptr && source->IsOld() && value.IsHeapObject()) {
             HeapObject* target = value.AsHeapObject();
-            if (target->IsYoung()) {
+            if (target && target->IsYoung()) {
+                if (!source->IsRemembered()) {
+                    source->SetRemembered(true);
+                    remembered_set_.push_back(source);
+                }
                 card_table_.MarkCard(source);
+                if (nursery_.FromSpaceStart() == 0) {
+                    nursery_.SetFromSpaceStart(card_table_.HeapBase());
+                }
             }
         }
         NotifyConcurrentWrite(source, value);
@@ -186,6 +193,9 @@ public:
     NurserySpace& GetNursery() noexcept { return nursery_; }
     ImmixSpace& GetOldGen() noexcept { return old_gen_; }
     CardTable& GetCardTable() noexcept { return card_table_; }
+    const std::vector<HeapObject*>& GetRememberedSet() const noexcept { return remembered_set_; }
+    std::vector<HeapObject*>& GetRememberedSet() noexcept { return remembered_set_; }
+    void VerifyBarrierInvariant();
     ConcurrentMarker* GetConcurrentMarker() noexcept;
 
     size_t MinorGCCount() const noexcept { return minor_gc_count_; }
@@ -239,33 +249,40 @@ private:
         HandleScope argument_roots(*this);
         (RootArgument(argument_roots, args), ...);
         constexpr size_t bytes = (sizeof(T) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
-        // Even a scalar lvalue can refer into a rooted object that moves.
-        constexpr bool movable_args = ((!std::is_lvalue_reference_v<Args> &&
-            (std::is_arithmetic_v<std::remove_cvref_t<Args>> ||
-            std::is_same_v<std::remove_cvref_t<Args>, std::nullptr_t> ||
-            std::is_same_v<std::remove_cvref_t<Args>, Shape*>)) && ...);
         if (Options::Get().gc_stress > 0 && GCAllowed() && !collecting_) {
             static thread_local int s_alloc_counter = 0;
             if (++s_alloc_counter >= Options::Get().gc_stress) {
                 s_alloc_counter = 0;
-                MajorGC();
+                if (!old && !young_objects_.empty()) {
+                    MinorGC();
+                    if (minor_gc_count_ > 0 && (minor_gc_count_ % 5) == 0) {
+                        MajorGC();
+                    }
+                } else {
+                    MajorGC();
+                }
+            }
+        }
+        if (!old && GCAllowed() && !collecting_) {
+            young_bytes_allocated_ += bytes;
+            if (young_bytes_allocated_ >= young_budget_) {
+                MinorGC();
+                if (minor_gc_count_ > 0 && (minor_gc_count_ % 20) == 0) {
+                    MajorGC();
+                }
             }
         }
         ReserveManaged(bytes);
         void* mem = nullptr;
         T* obj = nullptr;
         try {
-            if (!old) {
-                mem = nursery_.Allocate(bytes);
-                if (!mem && GCAllowed() && movable_args) {
+            mem = old_gen_.Allocate(bytes);
+            if (!mem && GCAllowed() && !collecting_) {
+                if (!young_objects_.empty()) {
                     MinorGC();
-                    mem = nursery_.Allocate(bytes);
+                    mem = old_gen_.Allocate(bytes);
                 }
-            }
-            if (!mem) {
-                old = true;
-                mem = old_gen_.Allocate(bytes);
-                if (!mem && GCAllowed() && !collecting_) {
+                if (!mem) {
                     MajorGC();
                     mem = old_gen_.Allocate(bytes);
                 }
@@ -282,12 +299,31 @@ private:
             obj->SetAllocatedSize(static_cast<uint32_t>(bytes));
             obj->SetCharged(true);
             obj->SetOld(old);
-            if (old) old_gen_.RegisterObject(obj, true);
-            else young_objects_.push_back(obj);
+            if (old) {
+                old_gen_.RegisterObject(obj, true, true);
+                bool points_to_young = false;
+                LambdaSlotVisitor visitor([&](TaggedValue* slot) {
+                    if (slot && slot->IsHeapObject() && slot->AsHeapObject()->IsYoung()) {
+                        points_to_young = true;
+                    }
+                });
+                obj->IteratePointers(&visitor);
+                if (points_to_young && !obj->IsRemembered()) {
+                    obj->SetRemembered(true);
+                    remembered_set_.push_back(obj);
+                    card_table_.MarkCard(obj);
+                }
+            } else {
+                old_gen_.RegisterObject(obj, true, false);
+                young_objects_.push_back(obj);
+            }
+            if (obj->IsWeakRef() || obj->IsWeakMap() || obj->IsWeakSet() || obj->IsFinalizationRegistry()) {
+                weak_containers_.push_back(obj);
+            }
             return obj;
         } catch (...) {
             if (obj) static_cast<HeapObject*>(obj)->~HeapObject();
-            if (old && mem) old_gen_.DiscardAllocation(mem);
+            if (mem) old_gen_.DiscardAllocation(mem);
             budget_->ReleaseManaged(bytes);
             throw;
         }
@@ -304,11 +340,15 @@ private:
     NurserySpace nursery_;
     ImmixSpace old_gen_;
     CardTable card_table_;
+    std::vector<HeapObject*> remembered_set_;
+    size_t young_budget_{8 * 1024 * 1024};
+    size_t young_bytes_allocated_{0};
     std::unique_ptr<ConcurrentMarker> concurrent_marker_;
 
     HandleScope* top_scope_{nullptr};
     std::vector<TaggedValue*> extra_roots_;
     std::vector<HeapObject*> young_objects_;
+    std::vector<HeapObject*> weak_containers_;
     std::vector<HeapObject*> mark_stack_;
     struct Finalization { TaggedValue callback; TaggedValue held_value; };
     std::deque<Finalization> finalizers_;
@@ -365,9 +405,9 @@ using Heap = IsolateHeap;
 template <typename T, typename... Args>
 inline T* AllocateRuntime(Args&&... args) {
     if (IsolateHeap* h = IsolateHeap::Current()) {
-        return h->AllocateStable<T>(std::forward<Args>(args)...);
+        return h->Allocate<T>(std::forward<Args>(args)...);
     }
-    return IsolateHeap::RuntimeFallbackHeap().AllocateStable<T>(std::forward<Args>(args)...);
+    return IsolateHeap::RuntimeFallbackHeap().Allocate<T>(std::forward<Args>(args)...);
 }
 
 } // namespace aether

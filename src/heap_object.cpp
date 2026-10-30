@@ -842,6 +842,9 @@ void JSPromise::Fulfill(TaggedValue val, MicrotaskQueue& queue) {
     if (state_ != PromiseState::Pending) return;
     state_ = PromiseState::Fulfilled;
     result_ = val;
+    if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+        RecordWriteBarrier(this, val);
+    }
 
     for (const auto& reaction : reactions_) {
         auto on_fulfilled = reaction.on_fulfilled;
@@ -862,6 +865,9 @@ void JSPromise::Reject(TaggedValue reason, MicrotaskQueue& queue) {
     if (state_ != PromiseState::Pending) return;
     state_ = PromiseState::Rejected;
     result_ = reason;
+    if (AETHER_UNLIKELY(IsOld() && reason.IsHeapObject())) {
+        RecordWriteBarrier(this, reason);
+    }
 
     for (const auto& reaction : reactions_) {
         auto on_rejected = reaction.on_rejected;
@@ -902,6 +908,11 @@ void JSPromise::AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, J
     } else {
         detail::ReserveStorage(reactions_, reactions_storage_, reactions_.size() + 1);
         reactions_.push_back({on_fulfilled, on_rejected, downstream});
+        if (AETHER_UNLIKELY(IsOld())) {
+            if (on_fulfilled.IsHeapObject()) RecordWriteBarrier(this, on_fulfilled);
+            if (on_rejected.IsHeapObject()) RecordWriteBarrier(this, on_rejected);
+            if (downstream) RecordWriteBarrier(this, TaggedValue::FromHeapObject(downstream));
+        }
     }
 }
 

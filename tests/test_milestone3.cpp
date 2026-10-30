@@ -54,12 +54,13 @@ void TestCardTableWriteBarrier() {
     uintptr_t addr = reinterpret_cast<uintptr_t>(old_obj);
     size_t card_idx = (addr - base) >> kCardShift;
 
+    assert(old_obj->IsRemembered());
     assert(heap.GetCardTable().IsDirty(card_idx));
-    std::cout << "  -> Write barrier accurately marked Card #" << card_idx << " for Old-to-Young store.\n" << std::flush;
+    std::cout << "  -> Write barrier accurately marked Card #" << card_idx << " and remembered set for Old-to-Young store.\n" << std::flush;
 }
 
 void TestMinorGCScavenge() {
-    std::cout << "[Test 3] Verifying Minor GC (Cheney Copying Scavenger)...\n" << std::flush;
+    std::cout << "[Test 3] Verifying Minor GC (Sticky Generational Immix Collector)...\n" << std::flush;
 
     IsolateHeap heap(32 * 1024); // 32KB nursery
     auto root_shape = std::make_unique<Shape>(0, nullptr, "", TaggedValue::Null());
@@ -83,14 +84,14 @@ void TestMinorGCScavenge() {
 
         uintptr_t new_addr = reinterpret_cast<uintptr_t>(live_handle.Get());
         assert(live_handle.Get() != nullptr);
-        // Address has moved due to evacuation into To-space
-        assert(new_addr != old_addr);
+        // Address is preserved at stable non-moving location (D1)
+        assert(new_addr == old_addr);
         assert(heap.GetNursery().Contains(live_handle.Get()));
         (void)old_addr;
         (void)new_addr;
     }
 
-    std::cout << "  -> Scavenger evacuated live rooted object and updated Handle successfully.\n" << std::flush;
+    std::cout << "  -> Sticky generational collector preserved live rooted object and reclaimed unrooted garbage.\n" << std::flush;
 }
 
 void TestObjectTenuring() {
@@ -187,20 +188,21 @@ void TestOldToYoungRememberedSetSurvival() {
     old_handle->SetPrototype(young_child);
     assert(old_handle->GetPrototype() == young_child);
 
-    // Verify card is marked dirty
+    // Verify card is marked dirty and remembered
     uintptr_t base = heap.GetNursery().FromSpaceStart();
     uintptr_t addr = reinterpret_cast<uintptr_t>(old_obj);
     size_t card_index = (addr - base) >> kCardShift;
+    assert(old_obj->IsRemembered());
     assert(heap.GetCardTable().IsDirty(card_index));
 
     // 4. Trigger first Minor GC: young_child is ONLY reachable through old_obj!
     heap.MinorGC();
     assert(heap.MinorGCCount() == 1);
 
-    // The young child must have been evacuated to ToSpace, and old_handle's prototype slot updated!
+    // The young child survived via remembered set at stable address!
     JSObject* evacuated_child = old_handle->GetPrototype();
     assert(evacuated_child != nullptr);
-    assert(evacuated_child != initial_young_addr); // Pointer was updated to new nursery location
+    assert(evacuated_child == initial_young_addr); // Non-moving sticky Immix
     assert(evacuated_child->IsJSObject());
     assert(evacuated_child->GetAge() == 1);
 

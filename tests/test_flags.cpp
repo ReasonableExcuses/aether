@@ -163,7 +163,8 @@ void TestHeapVerifierCatchesUnrememberedPointer() {
     uint32_t sid = 1;
     old_obj->SetNamedProperty("leak", TaggedValue::FromHeapObject(young_obj), sid);
 
-    // Manually clear the card to simulate a missing write barrier
+    // Manually clear the card and remembered status to simulate a missing write barrier
+    old_obj->SetRemembered(false);
     agent.GetHeap().GetCardTable().ClearCard(old_obj);
 
     bool caught = false;

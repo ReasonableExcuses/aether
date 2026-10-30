@@ -160,6 +160,7 @@ public:
     PendingTask Prepare(std::function<void()> task, std::vector<TaggedValue> roots = {});
     void PerformMicrotaskCheckpoint();
     void Clear(); // owner thread, after stopping/joining associated producers
+    void Teardown();
     size_t Size() const noexcept; // ready tasks only
     bool Empty() const noexcept { return Size() == 0; }
     bool HasPendingWork() const noexcept; // includes unpublished worker tasks

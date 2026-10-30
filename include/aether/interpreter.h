@@ -99,6 +99,8 @@ public:
     Interpreter(const Interpreter&) = delete;
     Interpreter& operator=(const Interpreter&) = delete;
 
+    void UnregisterRoots() noexcept;
+
     // Call at Agent startup, with its isolate current, before imposing a small
     // budget. Execute also initializes lazily for standalone interpreters.
     void InitializeResourceExceptions();

@@ -1194,7 +1194,10 @@ public:
     std::shared_ptr<const BytecodeArray> GetSharedBytecode() const noexcept { return bytecode_shared_; }
 
     LexicalEnvironment* GetEnvironment() const noexcept { return environment_; }
-    void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
+    void SetEnvironment(LexicalEnvironment* env) noexcept {
+        environment_ = env;
+        if (env) RecordWriteBarrier(this, TaggedValue::FromHeapObject(env));
+    }
 
     bool IsGenerator() const noexcept { return is_generator_; }
     void SetGenerator(bool g) noexcept { is_generator_ = g; }
@@ -1211,13 +1214,22 @@ public:
     void SetIsMethod(bool m) noexcept { is_method_ = m; }
 
     TaggedValue GetLexicalThis() const noexcept { return lexical_this_; }
-    void SetLexicalThis(TaggedValue t) noexcept { lexical_this_ = t; }
+    void SetLexicalThis(TaggedValue t) noexcept {
+        lexical_this_ = t;
+        if (t.IsHeapObject()) RecordWriteBarrier(this, t);
+    }
 
     TaggedValue GetLexicalNewTarget() const noexcept { return lexical_new_target_; }
-    void SetLexicalNewTarget(TaggedValue nt) noexcept { lexical_new_target_ = nt; }
+    void SetLexicalNewTarget(TaggedValue nt) noexcept {
+        lexical_new_target_ = nt;
+        if (nt.IsHeapObject()) RecordWriteBarrier(this, nt);
+    }
 
     TaggedValue GetConstructorPrototype() const noexcept { return ctor_prototype_; }
-    void SetConstructorPrototype(TaggedValue proto) noexcept { ctor_prototype_ = proto; }
+    void SetConstructorPrototype(TaggedValue proto) noexcept {
+        ctor_prototype_ = proto;
+        if (proto.IsHeapObject()) RecordWriteBarrier(this, proto);
+    }
     JSObject* GetOrCreateConstructorPrototype();
     struct InstanceField {
         MemoryCharge name_storage;
@@ -1314,22 +1326,43 @@ public:
     uint32_t PCOffset() const noexcept { return pc_offset_; }
     void SetPCOffset(uint32_t pc) noexcept { pc_offset_ = pc; }
     std::vector<TaggedValue>& SavedRegisters() noexcept { return saved_registers_; }
+    void SaveRegisters(const std::vector<TaggedValue>& regs) {
+        saved_registers_ = regs;
+        if (IsOld()) {
+            for (const auto& r : saved_registers_) {
+                if (r.IsHeapObject()) RecordWriteBarrier(this, r);
+            }
+        }
+    }
     const std::vector<TaggedValue>& Args() const noexcept { return args_; }
     TaggedValue ThisVal() const noexcept { return this_val_; }
     LexicalEnvironment* Environment() const noexcept { return environment_; }
-    void SetEnvironment(LexicalEnvironment* env) noexcept { environment_ = env; }
+    void SetEnvironment(LexicalEnvironment* env) noexcept {
+        environment_ = env;
+        if (env) RecordWriteBarrier(this, TaggedValue::FromHeapObject(env));
+    }
 
     bool IsAsync() const noexcept { return function_ && function_->IsAsync(); }
     bool IsGenerator() const noexcept { return function_ && function_->IsGenerator(); }
     bool IsAsyncGenerator() const noexcept { return function_ && function_->IsAsync() && function_->IsGenerator(); }
 
     JSPromise* AsyncPromise() const noexcept { return async_promise_; }
-    void SetAsyncPromise(JSPromise* p) noexcept { async_promise_ = p; }
+    void SetAsyncPromise(JSPromise* p) noexcept {
+        async_promise_ = p;
+        if (p) RecordWriteBarrier(this, TaggedValue::FromHeapObject(p));
+    }
     std::vector<SavedHandler>& SavedHandlers() noexcept { return saved_handlers_; }
     const std::vector<SavedHandler>& SavedHandlers() const noexcept { return saved_handlers_; }
 
     std::vector<AsyncRequest>& AsyncQueue() noexcept { return async_queue_; }
     const std::vector<AsyncRequest>& AsyncQueue() const noexcept { return async_queue_; }
+    void EnqueueAsyncRequest(AsyncRequest::Type type, TaggedValue val, JSPromise* p) {
+        async_queue_.push_back({type, val, p});
+        if (IsOld()) {
+            if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+            if (p) RecordWriteBarrier(this, TaggedValue::FromHeapObject(p));
+        }
+    }
 
     bool IsRunningAsync() const noexcept { return is_running_async_; }
     void SetRunningAsync(bool r) noexcept { is_running_async_ = r; }
@@ -1446,10 +1479,16 @@ public:
     JSProxy(JSProxy&& other) noexcept = default;
 
     AETHER_ALWAYS_INLINE TaggedValue GetTarget() const noexcept { return target_; }
-    AETHER_ALWAYS_INLINE void SetTarget(TaggedValue t) noexcept { target_ = t; }
+    AETHER_ALWAYS_INLINE void SetTarget(TaggedValue t) noexcept {
+        target_ = t;
+        if (t.IsHeapObject()) RecordWriteBarrier(this, t);
+    }
 
     AETHER_ALWAYS_INLINE TaggedValue GetHandler() const noexcept { return handler_; }
-    AETHER_ALWAYS_INLINE void SetHandler(TaggedValue h) noexcept { handler_ = h; }
+    AETHER_ALWAYS_INLINE void SetHandler(TaggedValue h) noexcept {
+        handler_ = h;
+        if (h.IsHeapObject()) RecordWriteBarrier(this, h);
+    }
 
     AETHER_ALWAYS_INLINE bool IsRevoked() const noexcept { return is_revoked_; }
     AETHER_ALWAYS_INLINE bool IsCallable() const noexcept { return is_callable_; }

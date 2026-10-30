@@ -43,8 +43,15 @@ public:
           card_count_(heap_size >> kCardShift),
           cards_(card_count_, kCleanCard) {}
 
+    uintptr_t HeapBase() const noexcept { return heap_base_; }
+    void SetHeapBase(uintptr_t base) noexcept { heap_base_ = base; }
+
     AETHER_ALWAYS_INLINE void MarkCard(const void* ptr) noexcept {
+        if (!ptr) return;
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+        if (heap_base_ == 0) {
+            heap_base_ = addr & ~(kHeapReservationSize - 1);
+        }
         if (AETHER_UNLIKELY(addr < heap_base_)) return;
         size_t idx = (addr - heap_base_) >> kCardShift;
         if (AETHER_LIKELY(idx < card_count_)) {
@@ -58,6 +65,7 @@ public:
     }
 
     AETHER_ALWAYS_INLINE bool IsCardMarked(const void* ptr) const noexcept {
+        if (!ptr || heap_base_ == 0) return false;
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         if (addr < heap_base_) return false;
         size_t idx = (addr - heap_base_) >> kCardShift;
@@ -71,6 +79,7 @@ public:
     }
 
     AETHER_ALWAYS_INLINE void ClearCard(const void* ptr) noexcept {
+        if (!ptr || heap_base_ == 0) return;
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         if (addr < heap_base_) return;
         size_t idx = (addr - heap_base_) >> kCardShift;
@@ -93,56 +102,43 @@ private:
 };
 
 /**
- * @brief Semi-space Nursery with ultra-fast bump-pointer allocation and Cheney evacuation.
+ * @brief Nursery Generation interface mapped over Immix Young Generation.
  */
 class NurserySpace {
 public:
-    explicit NurserySpace(size_t semi_space_size = kDefaultNurserySemiSpaceSize);
-    ~NurserySpace();
+    explicit NurserySpace(size_t semi_space_size = 0)
+        : semi_space_size_(semi_space_size) {}
+    ~NurserySpace() = default;
     NurserySpace(const NurserySpace&) = delete;
     NurserySpace& operator=(const NurserySpace&) = delete;
 
-    void* Allocate(size_t bytes) noexcept;
+    void* Allocate(size_t /*bytes*/) noexcept { return nullptr; }
 
     bool Contains(const void* ptr) const noexcept {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        return addr >= from_space_start_ && addr < from_space_limit_;
+        if (!ptr) return false;
+        return !reinterpret_cast<const HeapObject*>(ptr)->IsOld();
     }
 
-    // Flip after the collector has destroyed dead from-space objects.  The
-    // live bump is passed explicitly so survivors are not discarded.
-    void Flip(uintptr_t live_bump) noexcept;
-    void Flip() noexcept;
+    void Flip(uintptr_t /*live_bump*/) noexcept {}
+    void Flip() noexcept {}
 
     uintptr_t FromSpaceStart() const noexcept { return from_space_start_; }
-    uintptr_t FromSpaceLimit() const noexcept { return from_space_limit_; }
-    uintptr_t ToSpaceStart() const noexcept { return to_space_start_; }
-    uintptr_t ToSpaceLimit() const noexcept { return to_space_limit_; }
-    bool ContainsToSpace(const void* ptr) const noexcept {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        return addr >= to_space_start_ && addr < to_space_limit_;
-    }
+    void SetFromSpaceStart(uintptr_t start) noexcept { from_space_start_ = start; }
+    uintptr_t FromSpaceLimit() const noexcept { return from_space_start_ + semi_space_size_; }
+    uintptr_t ToSpaceStart() const noexcept { return 0; }
+    uintptr_t ToSpaceLimit() const noexcept { return 0; }
+    bool ContainsToSpace(const void* /*ptr*/) const noexcept { return false; }
 
-    size_t BytesAllocated() const noexcept { return bump_ptr_ - from_space_start_; }
+    size_t BytesAllocated() const noexcept { return 0; }
     size_t Capacity() const noexcept { return semi_space_size_; }
-    bool HasReservation() const noexcept { return has_reservation_; }
-    uint8_t* OldGenStart() const noexcept { return buffer_ + (semi_space_size_ * 2); }
+    bool HasReservation() const noexcept { return false; }
+    uint8_t* OldGenStart() const noexcept { return nullptr; }
 
-    void ResetBumpPointer() noexcept {
-        bump_ptr_ = from_space_start_;
-    }
+    void ResetBumpPointer() noexcept {}
 
 private:
-    size_t semi_space_size_;
-    uint8_t* buffer_{nullptr};
-    bool has_reservation_{false};
-
+    size_t semi_space_size_{0};
     uintptr_t from_space_start_{0};
-    uintptr_t from_space_limit_{0};
-    uintptr_t bump_ptr_{0};
-
-    uintptr_t to_space_start_{0};
-    uintptr_t to_space_limit_{0};
 };
 
 enum class BlockState : uint8_t {
@@ -275,6 +271,7 @@ static_assert(offsetof(ImmixBlock, payload) == kHeaderSize, "Payload must start 
  */
 class ImmixSpace {
 public:
+    friend class IsolateHeap;
     ImmixSpace() = default;
     ~ImmixSpace();
 
@@ -284,7 +281,7 @@ public:
     void Sweep();
     // Allocate returns raw storage. Placement-new users must register only
     // after successful construction to enable destruction at sweep/shutdown.
-    void RegisterObject(HeapObject* obj, bool charged = false);
+    void RegisterObject(HeapObject* obj, bool charged = false, bool old = true);
     void DiscardAllocation(void* ptr) noexcept;
     void DestroyAll() noexcept;
     void SetBudget(std::shared_ptr<MemoryBudgetState> budget) { budget_ = std::move(budget); }

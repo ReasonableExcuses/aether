@@ -9,6 +9,7 @@ namespace aether {
 struct Options {
     int gc_stress{0};                   // Collect every N allocations (0 = disabled, 1 if flag given without =N)
     bool gc_verify{false};              // Run heap verifier before/after every GC
+    bool gc_verify_barrier{false};      // Assert no old->unmarked-young edge exists after minor GC
     bool trace_gc{false};               // Print GC traces to stdout/stderr
     bool gc_at_safepoints{false};       // Trigger GC at safepoints
     size_t max_heap_mb{0};              // Maximum heap budget in MB (0 = default 4GB)

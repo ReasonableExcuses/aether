@@ -42,9 +42,16 @@ private:
     std::shared_ptr<State> state_;
 };
 
-MicrotaskQueue::~MicrotaskQueue() {
+void MicrotaskQueue::Teardown() {
     Clear();
-    if (heap_) heap_->UnregisterExtraRoot(&anchor_);
+    if (heap_) {
+        heap_->UnregisterExtraRoot(&anchor_);
+        heap_ = nullptr;
+    }
+}
+
+MicrotaskQueue::~MicrotaskQueue() {
+    Teardown();
 }
 
 void MicrotaskQueue::InitializeRoots(Heap& heap) {

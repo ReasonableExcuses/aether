@@ -140,12 +140,17 @@ struct InstructionRootsGuard {
 };
 } // namespace
 
-Interpreter::~Interpreter() {
+void Interpreter::UnregisterRoots() noexcept {
     if (!root_heap_) return;
     for (auto* root : {&acc_, &current_new_target_, &pending_exception_,
                       &last_environment_root_, &resource_exception_, &stack_exception_, &last_result_}) {
         root_heap_->UnregisterExtraRoot(root);
     }
+    root_heap_ = nullptr;
+}
+
+Interpreter::~Interpreter() {
+    UnregisterRoots();
 }
 
 void Interpreter::EnsureRoots() {
@@ -5782,7 +5787,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* gen = frame.GetGenerator();
                     TaggedValue yielded_val = acc_;
                     gen->SetPCOffset(static_cast<uint32_t>(pc - code_start));
-                    gen->SavedRegisters() = frame.GetRegisters();
+                    gen->SaveRegisters(frame.GetRegisters());
                     gen->SetEnvironment(frame.GetEnvironment());
                     gen->SavedHandlers().clear();
                     for (const auto& h : frame.Handlers()) {
@@ -5801,7 +5806,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* gen = frame.GetGenerator();
                     TaggedValue yielded_val = acc_;
                     gen->SetPCOffset(static_cast<uint32_t>(pc - code_start));
-                    gen->SavedRegisters() = frame.GetRegisters();
+                    gen->SaveRegisters(frame.GetRegisters());
                     gen->SetEnvironment(frame.GetEnvironment());
                     gen->SavedHandlers().clear();
                     for (const auto& h : frame.Handlers()) {

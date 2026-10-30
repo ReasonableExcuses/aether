@@ -37,6 +37,8 @@ void Options::Parse(std::vector<std::string>& args) {
             }
         } else if (arg == "--gc-verify") {
             Get().gc_verify = true;
+        } else if (arg == "--gc-verify-barrier") {
+            Get().gc_verify_barrier = true;
         } else if (arg == "--trace-gc") {
             Get().trace_gc = true;
         } else if (arg == "--gc-at-safepoints") {

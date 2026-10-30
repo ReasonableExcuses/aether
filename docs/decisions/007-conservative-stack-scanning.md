@@ -36,3 +36,4 @@ Prior to this architectural change, Aether relied exclusively on an explicit han
 - Passes all 30 test suites cleanly.
 - Passes all 9 configurations of the Tier $\times$ GC stress matrix (`python tools/matrix.py`).
 - All 8 benchmarks in `bench/run.py` pass across Interpreter, Baseline JIT, and Optimizing JIT tiers.
+

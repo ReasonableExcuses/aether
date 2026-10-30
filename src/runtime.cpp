@@ -1565,6 +1565,11 @@ static TaggedValue Array_unshift(TaggedValue this_val, const std::vector<TaggedV
     if (obj->IsArray()) {
         auto* arr = static_cast<JSArray*>(obj);
         arr->Elements().insert(arr->Elements().begin(), args.begin(), args.end());
+        if (arr->IsOld()) {
+            for (const auto& arg : args) {
+                if (arg.IsHeapObject()) RecordWriteBarrier(arr, arg);
+            }
+        }
         uint64_t new_len = arr->Length();
         return new_len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(new_len)) : TaggedValue::FromDouble(static_cast<double>(new_len));
     }
@@ -2415,6 +2420,11 @@ static TaggedValue Array_splice(TaggedValue this_val, const std::vector<TaggedVa
         auto it = elems.begin() + start;
         elems.erase(it, it + delete_count);
         elems.insert(elems.begin() + start, items_to_insert.begin(), items_to_insert.end());
+        if (arr->IsOld()) {
+            for (const auto& item : items_to_insert) {
+                if (item.IsHeapObject()) RecordWriteBarrier(arr, item);
+            }
+        }
         arr->SetLength(elems.size());
 
         auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(removed));
@@ -5644,10 +5654,11 @@ Realm::~Realm() {
 }
 
 void Realm::InitializeIntrinsics(Heap& heap) {
+    NoGCScope no_gc(heap);
     heap_ = &heap;
     s_current_realm_ = this;
 
-    auto make_old_obj = [this, &heap]() -> JSObject* {
+    auto make_old_obj = [this, &heap](const char* /*tag*/ = "") -> JSObject* {
         JSObject* obj = heap.AllocateOld<JSObject>(root_shape_.get());
         auto val = std::make_unique<TaggedValue>(TaggedValue::FromHeapObject(obj));
         heap.RegisterExtraRoot(val.get());
@@ -5674,12 +5685,12 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         return s;
     };
 
-    global_object_ = make_old_obj();
-    math_object_ = make_old_obj();
-    console_object_ = make_old_obj();
-    json_object_ = make_old_obj();
+    global_object_ = make_old_obj("global");
+    math_object_ = make_old_obj("math");
+    console_object_ = make_old_obj("console");
+    json_object_ = make_old_obj("json");
 
-    object_prototype_ = make_old_obj();
+    object_prototype_ = make_old_obj("object_proto");
     function_prototype_ = heap.AllocateOld<JSNativeFunction>("", [](const std::vector<TaggedValue>&) -> TaggedValue {
         return TaggedValue::Undefined();
     });
@@ -5816,7 +5827,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
         auto* p = make_promise();
         TaggedValue sent_val = args.empty() ? TaggedValue::Undefined() : args[0];
-        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Next, sent_val, p});
+        gen->EnqueueAsyncRequest(JSGeneratorObject::AsyncRequest::Type::Next, sent_val, p);
         if (Interpreter::Current()) {
             Interpreter::Current()->RunAsyncGeneratorStep(gen);
         }
@@ -5832,7 +5843,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
         auto* p = make_promise();
         TaggedValue ret_val = args.empty() ? TaggedValue::Undefined() : args[0];
-        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Return, ret_val, p});
+        gen->EnqueueAsyncRequest(JSGeneratorObject::AsyncRequest::Type::Return, ret_val, p);
         if (Interpreter::Current()) {
             Interpreter::Current()->RunAsyncGeneratorStep(gen);
         }
@@ -5848,7 +5859,7 @@ void Realm::InitializeIntrinsics(Heap& heap) {
         auto* gen = static_cast<JSGeneratorObject*>(this_val.AsHeapObject());
         auto* p = make_promise();
         TaggedValue err_val = args.empty() ? TaggedValue::Undefined() : args[0];
-        gen->AsyncQueue().push_back({JSGeneratorObject::AsyncRequest::Type::Throw, err_val, p});
+        gen->EnqueueAsyncRequest(JSGeneratorObject::AsyncRequest::Type::Throw, err_val, p);
         if (Interpreter::Current()) {
             Interpreter::Current()->RunAsyncGeneratorStep(gen);
         }
@@ -7531,6 +7542,7 @@ void Realm::SetGlobalProperty(std::string_view name, TaggedValue value) {
 Agent::Agent() {
     s_current_agent_ = this;
     heap_ = std::make_unique<Heap>();
+    NoGCScope no_gc(*heap_);
     IsolateHeap::SetCurrent(heap_.get());
     realm_ = std::make_unique<Realm>(*heap_);
     Realm::SetCurrent(realm_.get());
@@ -7566,6 +7578,12 @@ Agent::~Agent() {
     if (s_current_microtasks_ == &microtasks_) {
         s_current_microtasks_ = nullptr;
     }
+    module_loader_.reset();
+    event_loop_.reset();
+    realm_.reset();
+    interpreter_.UnregisterRoots();
+    microtasks_.Teardown();
+    heap_.reset();
 }
 
 void Agent::RunEventLoop() {

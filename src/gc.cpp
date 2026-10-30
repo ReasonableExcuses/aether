@@ -15,88 +15,6 @@
 
 namespace aether {
 
-NurserySpace::NurserySpace(size_t semi_space_size)
-    : semi_space_size_(semi_space_size) {
-    if (semi_space_size == 0 || semi_space_size > kHeapReservationSize / 2 ||
-        semi_space_size % kObjectAlignment != 0) {
-        throw std::length_error("Invalid nursery size");
-    }
-    size_t total_bytes = semi_space_size * 2;
-#ifdef _WIN32
-    buffer_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, kHeapReservationSize, MEM_RESERVE, PAGE_NOACCESS));
-    if (buffer_) {
-        has_reservation_ = true;
-        if (!VirtualAlloc(buffer_, total_bytes, MEM_COMMIT, PAGE_READWRITE)) {
-            VirtualFree(buffer_, 0, MEM_RELEASE);
-            throw std::bad_alloc();
-        }
-    } else {
-        buffer_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    }
-#else
-    buffer_ = static_cast<uint8_t*>(mmap(nullptr, kHeapReservationSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (buffer_ != MAP_FAILED) {
-        has_reservation_ = true;
-        if (mprotect(buffer_, total_bytes, PROT_READ | PROT_WRITE) != 0) {
-            munmap(buffer_, kHeapReservationSize);
-            throw std::bad_alloc();
-        }
-    } else {
-        buffer_ = static_cast<uint8_t*>(mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-        if (buffer_ == MAP_FAILED) buffer_ = nullptr;
-    }
-#endif
-    if (!buffer_) throw std::bad_alloc();
-
-    from_space_start_ = reinterpret_cast<uintptr_t>(buffer_);
-    from_space_limit_ = from_space_start_ + semi_space_size;
-    bump_ptr_         = from_space_start_;
-
-    to_space_start_   = from_space_limit_;
-    to_space_limit_   = to_space_start_ + semi_space_size;
-}
-
-NurserySpace::~NurserySpace() {
-    if (buffer_) {
-#ifdef _WIN32
-        VirtualFree(buffer_, 0, MEM_RELEASE);
-#else
-        munmap(buffer_, has_reservation_ ? kHeapReservationSize : semi_space_size_ * 2);
-#endif
-        buffer_ = nullptr;
-    }
-}
-
-void* NurserySpace::Allocate(size_t bytes) noexcept {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - (kObjectAlignment - 1)) return nullptr;
-    bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
-    if (AETHER_LIKELY(bytes <= from_space_limit_ - bump_ptr_)) {
-        void* mem = reinterpret_cast<void*>(bump_ptr_);
-        bump_ptr_ += bytes;
-        return mem;
-    }
-    return nullptr;
-}
-
-void NurserySpace::Flip() noexcept {
-    Flip(to_space_start_);
-}
-
-void NurserySpace::Flip(uintptr_t live_bump) noexcept {
-    assert(live_bump >= to_space_start_ && live_bump <= to_space_limit_);
-    // Poison the old from-space (about to become to-space) to catch use-after-free.
-    // Any stale pointer reading from evacuated memory will hit 0xDD bytes,
-    // causing immediate crashes instead of silent data corruption.
-    size_t used_bytes = bump_ptr_ - from_space_start_;
-    if (used_bytes > 0) {
-        std::memset(reinterpret_cast<void*>(from_space_start_), kNurseryPoisonByte, used_bytes);
-    }
-
-    std::swap(from_space_start_, to_space_start_);
-    std::swap(from_space_limit_, to_space_limit_);
-    bump_ptr_ = live_bump;
-}
-
 ImmixBlock::ImmixBlock() {
     std::memset(line_marks, 0, sizeof(line_marks));
     std::memset(object_starts, 0, sizeof(object_starts));
@@ -416,7 +334,7 @@ void* ImmixSpace::Allocate(size_t bytes) {
     return mem;
 }
 
-void ImmixSpace::RegisterObject(HeapObject* obj, bool charged) {
+void ImmixSpace::RegisterObject(HeapObject* obj, bool charged, bool old) {
     if (!obj) throw std::logic_error("Registering null object");
     if (IsLargeObject(obj)) {
         LargeObjectHeader* header = LargeObjectHeader::FromObject(obj);
@@ -426,7 +344,7 @@ void ImmixSpace::RegisterObject(HeapObject* obj, bool charged) {
             obj->SetAllocatedSize(static_cast<uint32_t>(header->size - LargeObjectHeader::HeaderSize()));
         }
         obj->SetCharged(charged);
-        obj->SetOld(true);
+        obj->SetOld(old);
         if (obj == last_allocation_ptr_) {
             last_allocation_ptr_ = nullptr;
             last_allocation_bytes_ = 0;
@@ -449,7 +367,7 @@ void ImmixSpace::RegisterObject(HeapObject* obj, bool charged) {
         }
     }
     obj->SetCharged(charged);
-    obj->SetOld(true);
+    obj->SetOld(old);
 
     size_t bytes = obj->GetAllocatedSize();
     if (bytes == 0) bytes = sizeof(HeapObject);

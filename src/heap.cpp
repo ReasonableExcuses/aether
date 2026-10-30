@@ -31,16 +31,16 @@
 namespace aether {
 
 #if defined(_WIN32)
-static void* DetectThreadStackBase() {
+[[maybe_unused]] static void* DetectThreadStackBase() {
     auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
     return tib ? tib->StackBase : nullptr;
 }
 #elif defined(__APPLE__)
-static void* DetectThreadStackBase() {
+[[maybe_unused]] static void* DetectThreadStackBase() {
     return pthread_get_stackaddr_np(pthread_self());
 }
 #elif defined(__linux__)
-static void* DetectThreadStackBase() {
+[[maybe_unused]] static void* DetectThreadStackBase() {
     pthread_attr_t attr;
     if (pthread_getattr_np(pthread_self(), &attr) == 0) {
         void* stack_addr = nullptr;
@@ -52,7 +52,7 @@ static void* DetectThreadStackBase() {
     return nullptr;
 }
 #else
-static void* DetectThreadStackBase() {
+[[maybe_unused]] static void* DetectThreadStackBase() {
     return nullptr;
 }
 #endif
@@ -109,6 +109,7 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
       card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
+    young_budget_ = nursery_size ? nursery_size : (8 * 1024 * 1024);
     old_gen_.SetBudget(budget_);
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
@@ -127,13 +128,9 @@ IsolateHeap::~IsolateHeap() {
         concurrent_marker_->Stop();
     }
     collecting_ = true;
-    for (auto* obj : young_objects_) {
-        obj->~HeapObject();
-        if (obj->IsCharged() && budget_) {
-            budget_->ReleaseManaged(obj->GetAllocatedSize());
-        }
-    }
     young_objects_.clear();
+    remembered_set_.clear();
+    weak_containers_.clear();
     old_gen_.DestroyAll();
     if (s_current_heap_ == this) {
         s_current_heap_ = previous_current_heap_;
@@ -211,9 +208,7 @@ std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& root
                 HeapObject* obj = val.AsHeapObject();
                 if (obj && !obj->IsMarked()) {
                     obj->SetMarked(true);
-                    if (obj->IsOld()) {
-                        old_gen_.MarkObject(obj);
-                    }
+                    old_gen_.MarkObject(obj);
                     mark_stack_.push_back(obj);
                     live_.push_back(obj);
                     if (obj->IsWeakMap()) {
@@ -237,9 +232,7 @@ std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& root
     for (auto* root : roots) {
         if (root && !root->IsMarked()) {
             root->SetMarked(true);
-            if (root->IsOld()) {
-                old_gen_.MarkObject(root);
-            }
+            old_gen_.MarkObject(root);
             mark_stack_.push_back(root);
             live.push_back(root);
             if (root->IsWeakMap()) {
@@ -254,9 +247,7 @@ std::vector<HeapObject*> IsolateHeap::Trace(const std::vector<HeapObject*>& root
         obj->SetPinned(true);
         if (!obj->IsMarked()) {
             obj->SetMarked(true);
-            if (obj->IsOld()) {
-                old_gen_.MarkObject(obj);
-            }
+            old_gen_.MarkObject(obj);
             mark_stack_.push_back(obj);
             live.push_back(obj);
             if (obj->IsWeakMap()) {
@@ -321,109 +312,238 @@ void IsolateHeap::MinorGC() {
     if (!GCAllowed()) return;
     HeapVerifier::VerifyBeforeGC(*this);
     CollectionScope collecting(collecting_);
-    // Until every mutation path has a complete barrier, scan all tenured
-    // objects. This is conservative for a minor cycle, not permanent rooting.
-    auto live = Trace(old_gen_.Objects());
-    ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
-        return (obj && obj->IsMarked()) ? obj : nullptr;
-    });
+    auto gc_start = std::chrono::steady_clock::now();
 
-    struct Move { HeapObject* source; HeapObject* destination; bool old; };
-    std::vector<Move> moves;
-    moves.reserve(young_objects_.size());
-    std::unordered_map<HeapObject*, HeapObject*> forwarding;
-    std::vector<HeapObject*> survivors;
-    survivors.reserve(young_objects_.size());
-    uintptr_t bump = nursery_.ToSpaceStart();
-    // Reserve all destinations and metadata before the first move. OS OOM
-    // leaves the original graph intact. RelocateTo must be a nonthrowing move.
-    try {
-        for (auto* obj : young_objects_) {
-            if (!obj->IsMarked()) continue;
-            size_t bytes = obj->GetAllocatedSize();
-            bool old = obj->GetAge() + 1 >= kTenuringAgeThreshold;
-            auto* destination = old ? static_cast<HeapObject*>(old_gen_.Allocate(bytes))
-                : reinterpret_cast<HeapObject*>(bump);
-            moves.push_back({obj, destination, old});
-            forwarding.emplace(obj, destination);
-            if (!old) {
-                assert(bytes <= nursery_.ToSpaceLimit() - bump);
-                bump += bytes;
-                survivors.push_back(destination);
-            }
-        }
-    } catch (...) {
-        for (auto& move : moves) if (move.old) old_gen_.DiscardAllocation(move.destination);
-        throw;
-    }
-    auto resolve = [&](HeapObject* obj) -> HeapObject* {
-        auto it = forwarding.find(obj);
-        return it == forwarding.end() ? obj : it->second;
-    };
-    class RelocateVisitor final : public SlotVisitor {
+    class MinorMarkVisitor final : public SlotVisitor {
     public:
-        explicit RelocateVisitor(const std::unordered_map<HeapObject*, HeapObject*>& forwarding)
-            : forwarding_(forwarding) {}
+        explicit MinorMarkVisitor(std::vector<HeapObject*>& mark_stack)
+            : mark_stack_(mark_stack) {}
 
         void Visit(TaggedValue* slot) override {
             if (!slot) return;
             TaggedValue val = *slot;
             if (val.IsHeapObject()) {
-                auto it = forwarding_.find(val.AsHeapObject());
-                if (it != forwarding_.end()) {
-                    *slot = TaggedValue::FromHeapObject(it->second);
+                HeapObject* obj = val.AsHeapObject();
+                if (obj && obj->IsYoung() && !obj->IsMarked()) {
+                    obj->SetMarked(true);
+                    mark_stack_.push_back(obj);
                 }
             }
         }
     private:
-        const std::unordered_map<HeapObject*, HeapObject*>& forwarding_;
+        std::vector<HeapObject*>& mark_stack_;
     };
-    RelocateVisitor relocate(forwarding);
-    std::function<HeapObject*(HeapObject*)> resolve_weak = resolve;
-    std::function<bool(HeapObject*)> all_keys_live = [](HeapObject*) { return true; };
-    // All core nursery RelocateTo implementations move noexcept C++ members.
-    // A custom object violating this contract cannot be safely recovered after
-    // a partial move; fail closed rather than expose an inconsistent heap.
-    try {
-        for (auto& move : moves) {
-            HeapObject* moved = move.source->RelocateTo(move.destination);
-            assert(moved == move.destination);
-            moved->SetAllocatedSize(move.source->GetAllocatedSize());
-            moved->SetCharged(move.source->IsCharged());
-            moved->IncrementAge();
-            moved->SetOld(move.old);
-            if (move.old) old_gen_.RegisterObject(moved, moved->IsCharged());
+
+    MinorMarkVisitor visitor(mark_stack_);
+
+    // 1. Visit roots
+    VisitRoots(&visitor);
+
+    // 2. Visit native stack conservatively (pinned roots)
+    ScanStack([&](HeapObject* obj) {
+        if (!obj) return;
+        obj->SetPinned(true);
+        if (obj->IsYoung() && !obj->IsMarked()) {
+            obj->SetMarked(true);
+            mark_stack_.push_back(obj);
         }
-        VisitRoots(&relocate);
-        for (auto*& obj : live) obj = resolve(obj);
-        for (auto* obj : live) {
-            // Includes promoted survivors: their children must be relocated.
-            obj->IteratePointers(&relocate);
-            if (obj->IsWeakMap()) {
-                static_cast<JSWeakMap*>(obj)->TraceEphemerons(all_keys_live, &relocate);
+    });
+
+    // 3. Mark from Remembered Set
+    for (HeapObject* old_source : remembered_set_) {
+        if (old_source && old_source->IsOld()) {
+            old_source->IteratePointers(&visitor);
+        }
+    }
+
+    if (ConcurrentMarker::Current() && ConcurrentMarker::Current()->IsActive()) {
+        for (HeapObject* old_obj : old_gen_.Objects()) {
+            if (old_obj && old_obj->IsOld()) {
+                old_obj->IteratePointers(&visitor);
             }
         }
-        ProcessWeak(live, resolve_weak);
-        WasmRegistryRelocate([&](JSObject* obj) -> JSObject* {
-            return static_cast<JSObject*>(resolve(obj));
+    }
+
+    // 4. Drain mark stack
+    while (!mark_stack_.empty()) {
+        HeapObject* obj = mark_stack_.back();
+        mark_stack_.pop_back();
+        obj->IteratePointers(&visitor);
+    }
+
+    // 5. Ephemeron fixpoint for weak maps
+    while (true) {
+        size_t before = mark_stack_.size();
+        for (HeapObject* obj : weak_containers_) {
+            if (obj && obj->IsWeakMap() && (obj->IsOld() || obj->IsMarked())) {
+                static_cast<JSWeakMap*>(obj)->TraceEphemerons(
+                    [](HeapObject* key) { return key && (key->IsOld() || key->IsMarked()); },
+                    &visitor);
+            }
+        }
+        while (!mark_stack_.empty()) {
+            HeapObject* obj = mark_stack_.back();
+            mark_stack_.pop_back();
+            obj->IteratePointers(&visitor);
+        }
+        if (mark_stack_.size() == before) break;
+    }
+
+    // 6. Process weak references
+    std::vector<HeapObject*> live_weak_containers;
+    live_weak_containers.reserve(weak_containers_.size());
+    for (HeapObject* obj : weak_containers_) {
+        if (!obj) continue;
+        bool is_container_alive = obj->IsOld() || obj->IsMarked();
+        if (!is_container_alive) {
+            continue;
+        }
+        live_weak_containers.push_back(obj);
+        if (obj->IsWeakRef()) {
+            auto* weak = static_cast<JSWeakRef*>(obj);
+            if (weak->Target() && weak->Target()->IsYoung() && !weak->Target()->IsMarked()) {
+                weak->SetTarget(nullptr);
+            }
+        } else if (obj->IsWeakMap()) {
+            static_cast<JSWeakMap*>(obj)->PruneDeadKeys([](HeapObject* key) {
+                return key && (key->IsOld() || key->IsMarked());
+            });
+        } else if (obj->IsWeakSet()) {
+            static_cast<JSWeakSet*>(obj)->PruneDeadEntries([](HeapObject* val) {
+                return val && (val->IsOld() || val->IsMarked());
+            });
+        } else if (obj->IsFinalizationRegistry()) {
+            static_cast<JSFinalizationRegistry*>(obj)->ProcessWeakTargets(
+                [](HeapObject* target) -> HeapObject* {
+                    if (!target) return nullptr;
+                    if (target->IsOld() || target->IsMarked()) return target;
+                    return nullptr;
+                },
+                [this](TaggedValue callback, TaggedValue held) {
+                    finalizers_.push_back({callback, held});
+                });
+        }
+    }
+    weak_containers_.swap(live_weak_containers);
+
+    // 7. Sweep and promote in Immix
+    std::vector<HeapObject*> surviving_young;
+    surviving_young.reserve(young_objects_.size() / 2);
+    std::vector<HeapObject*> newly_tenured;
+
+    for (HeapObject* obj : young_objects_) {
+        if (!obj) continue;
+        if (obj->IsMarked()) {
+            // Survivor!
+            obj->IncrementAge();
+            obj->SetMarked(false);
+            obj->SetPinned(false);
+            if (obj->GetAge() >= kTenuringAgeThreshold) {
+                obj->SetOld(true);
+                newly_tenured.push_back(obj);
+            } else {
+                surviving_young.push_back(obj);
+            }
+
+            if (ImmixBlock* block = old_gen_.BlockForPointer(obj)) {
+                size_t bytes = obj->GetAllocatedSize();
+                if (bytes == 0) bytes = sizeof(HeapObject);
+                size_t start_line = block->LineFor(obj);
+                size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + bytes - 1);
+                for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+                    block->line_marks[l] = 1;
+                }
+            }
+        } else {
+            // Dead young object: reclaim in-place
+            size_t bytes = obj->GetAllocatedSize();
+            bool was_charged = obj->IsCharged();
+            obj->~HeapObject();
+            if (ImmixBlock* block = old_gen_.BlockForPointer(obj)) {
+                block->ClearObjectStart(obj);
+                if (Options::Get().gc_verify) {
+                    std::memset(static_cast<void*>(obj), kNurseryPoisonByte, bytes);
+                }
+            } else if (old_gen_.IsLargeObject(obj)) {
+                old_gen_.FreeLarge(LargeObjectHeader::FromObject(obj));
+            }
+            if (was_charged && budget_) budget_->ReleaseManaged(bytes);
+        }
+    }
+    young_objects_.swap(surviving_young);
+    young_bytes_allocated_ = 0;
+
+    // Check newly tenured objects: if they reference young objects, add to remembered set
+    for (HeapObject* obj : newly_tenured) {
+        bool points_to_young = false;
+        LambdaSlotVisitor check_young([&](TaggedValue* s) {
+            if (s && s->IsHeapObject() && s->AsHeapObject()->IsYoung()) {
+                points_to_young = true;
+            }
         });
-        WasmRegistryPruneDead([&](JSObject* obj) { return obj && Contains(obj) && obj->IsMarked(); });
-    } catch (...) {
-        std::terminate();
+        obj->IteratePointers(&check_young);
+        if (points_to_young && !obj->IsRemembered()) {
+            obj->SetRemembered(true);
+            remembered_set_.push_back(obj);
+            card_table_.MarkCard(obj);
+        }
     }
-    for (auto* obj : young_objects_) {
-        size_t bytes = obj->GetAllocatedSize();
-        bool was_charged = obj->IsCharged();
-        obj->~HeapObject(); // also destroys the moved-from C++ object
-        if (!forwarding.contains(obj) && was_charged && budget_) budget_->ReleaseManaged(bytes);
+
+    // 8. Prune remembered set: retain only old objects that still point to young objects
+    std::vector<HeapObject*> active_remembered;
+    for (HeapObject* old_source : remembered_set_) {
+        if (!old_source || !old_source->IsOld()) continue;
+        bool still_points_to_young = false;
+        LambdaSlotVisitor check_visitor([&](TaggedValue* slot) {
+            if (slot && slot->IsHeapObject() && slot->AsHeapObject()->IsYoung()) {
+                still_points_to_young = true;
+            }
+        });
+        old_source->IteratePointers(&check_visitor);
+        if (still_points_to_young) {
+            active_remembered.push_back(old_source);
+        } else {
+            old_source->SetRemembered(false);
+            card_table_.ClearCard(old_source);
+        }
     }
-    young_objects_.swap(survivors);
-    nursery_.Flip(bump);
-    card_table_.Clear();
+    remembered_set_.swap(active_remembered);
+
     ++minor_gc_count_;
+
+    if (Options::Get().gc_verify_barrier || Options::Get().gc_verify) {
+        VerifyBarrierInvariant();
+    }
+
     HeapVerifier::VerifyAfterGC(*this);
+
     if (Options::Get().trace_gc) {
-        std::cout << "[GC] MinorGC #" << minor_gc_count_ << ": live young=" << young_objects_.size() << std::endl;
+        auto gc_end = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(gc_end - gc_start).count();
+        std::cout << "[GC] MinorGC #" << minor_gc_count_ << " completed in " << ms
+                  << "ms: live young=" << young_objects_.size() << ", remembered=" << remembered_set_.size() << std::endl;
+    }
+}
+
+void IsolateHeap::VerifyBarrierInvariant() {
+    for (HeapObject* old_obj : old_gen_.Objects()) {
+        if (!old_obj || !old_obj->IsOld()) continue;
+        LambdaSlotVisitor check_visitor([&](TaggedValue* slot) {
+            if (slot && slot->IsHeapObject()) {
+                HeapObject* child = slot->AsHeapObject();
+                if (child && child->IsYoung()) {
+                    if (!old_obj->IsRemembered()) {
+                        throw std::runtime_error(
+                            "Barrier Invariant Violation: Old object at " +
+                            std::to_string(reinterpret_cast<uintptr_t>(old_obj)) +
+                            " points to young object at " +
+                            std::to_string(reinterpret_cast<uintptr_t>(child)) +
+                            " but is not in the remembered set!");
+                    }
+                }
+            }
+        });
+        old_obj->IteratePointers(&check_visitor);
     }
 }
 
@@ -461,21 +581,30 @@ void IsolateHeap::MajorGC() {
         return (obj && obj->IsMarked()) ? obj : nullptr;
     });
     WasmRegistryPruneDead([&](JSObject* obj) { return obj && Contains(obj) && obj->IsMarked(); });
-    std::vector<HeapObject*> surviving_young;
-    surviving_young.reserve(young_objects_.size());
+
+    // In Major GC, any live young object promotes to old
     for (auto* obj : young_objects_) {
-        if (obj->IsMarked()) {
-            surviving_young.push_back(obj);
-            continue;
+        if (obj && obj->IsMarked()) {
+            obj->SetOld(true);
         }
-        size_t bytes = obj->GetAllocatedSize();
-        bool was_charged = obj->IsCharged();
-        obj->~HeapObject();
-        std::memset(static_cast<void*>(obj), kNurseryPoisonByte, bytes);
-        if (was_charged && budget_) budget_->ReleaseManaged(bytes);
     }
-    young_objects_.swap(surviving_young);
-    if (young_objects_.empty()) nursery_.ResetBumpPointer();
+    young_objects_.clear();
+    young_bytes_allocated_ = 0;
+
+    std::vector<HeapObject*> live_weak_containers;
+    for (HeapObject* obj : weak_containers_) {
+        if (obj && obj->IsMarked()) {
+            live_weak_containers.push_back(obj);
+        }
+    }
+    weak_containers_.swap(live_weak_containers);
+
+    // Clear remembered set since all live objects are now Old
+    for (auto* obj : remembered_set_) {
+        if (obj) obj->SetRemembered(false);
+    }
+    remembered_set_.clear();
+
     old_gen_.Sweep();
     card_table_.Clear();
     ++major_gc_count_;
@@ -518,20 +647,20 @@ bool IsolateHeap::Contains(const void* ptr) const noexcept {
 }
 
 bool IsolateHeap::IsValidObjectStart(const void* ptr) const noexcept {
-    if (!ptr) return false;
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    if ((addr & (kObjectAlignment - 1)) != 0) return false;
-
-    if (nursery_.Contains(ptr)) {
-        return std::binary_search(young_objects_.begin(), young_objects_.end(), static_cast<const HeapObject*>(ptr));
-    }
     return old_gen_.IsValidObjectStart(ptr);
 }
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4611)
+#endif
 AETHER_NOINLINE
 static void CaptureRegisters(jmp_buf env) {
     setjmp(env);
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 AETHER_NOINLINE
 AETHER_NO_SANITIZE_ADDRESS

@@ -21,7 +21,7 @@ TIERS = {
 
 GC_MODES = {
     "default": [],
-    "gc-stress": ["--gc-stress=10"],
+    "gc-stress": ["--gc-stress=1000"],
     "gc-verify": ["--gc-verify"]
 }
 

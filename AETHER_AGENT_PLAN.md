@@ -197,7 +197,7 @@ Implements D1, D2, D3. **Order matters.**
 - Keep `HandleScope` working for embedders; mark it "optional" in docs.
 - **Acceptance:** `--gc-stress=1 --gc-verify` passes all test binaries; `HandleScope::Clear` removed from the dispatch loop; measured interpreter overhead ↓.
 
-### T1.5 Sticky generational minor GC (replace `MinorGC` and the copying nursery)
+### [x] T1.5 Sticky generational minor GC (replace `MinorGC` and the copying nursery)
 - Allocate everything in Immix. "Young" = allocated since the last collection (sticky mark bits: survivors keep their mark).
 - Minor GC marks from roots + remembered set, only newly allocated objects; sweeps only blocks that received allocation.
 - **Write barrier:** `WriteBarrier(source, value)` records `source` into the remembered set when `source` is old and `value` is young. **Audit every mutation path** (property set, array element set, `Map/Set` insert, closures/environments, `JSFunction` fields, TypedArray no, promise reactions, generators, proxies, module bindings). Today there are only ~22 barrier call sites.

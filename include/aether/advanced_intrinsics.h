@@ -44,6 +44,10 @@ public:
             throw std::length_error("WeakMap size limit exceeded");
         }
         (*entries_)[key] = val;
+        if (AETHER_UNLIKELY(IsOld())) {
+            if (key) RecordWriteBarrier(this, TaggedValue::FromHeapObject(key));
+            if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+        }
     }
 
     TaggedValue Get(HeapObject* key) const {

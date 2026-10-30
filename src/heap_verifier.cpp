@@ -81,9 +81,7 @@ void HeapVerifier::VerifyHeap(IsolateHeap& heap, const std::string& phase) {
                 // Generational invariant check: if parent is old and child is young,
                 // the card table or remembered set must cover the parent.
                 if (curr->IsOld() && child_obj->IsYoung()) {
-                    // Check if card table is marked
-                    if (!heap.card_table_.IsCardMarked(curr)) {
-                        // If card is not marked, report missing write barrier
+                    if (!curr->IsRemembered() && !heap.card_table_.IsCardMarked(curr)) {
                         throw std::runtime_error("HeapVerifier [" + phase + "]: Unremembered cross-generational pointer from old " +
                                                  std::to_string(reinterpret_cast<uintptr_t>(curr)) + " to young " +
                                                  std::to_string(reinterpret_cast<uintptr_t>(child_obj)));
