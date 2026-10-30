@@ -803,6 +803,9 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         entry_roots.CreateHandle(env);
         for (auto value : args) entry_roots.CreateHandle(value);
         for (auto value : bytecode.Constants()) entry_roots.CreateHandle(value);
+        if (AETHER_UNLIKELY(ExecutionHeap().GCAllowed() && (ExecutionHeap().IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+            ExecutionHeap().CollectAtSafepoint();
+        }
         ValueRestore accumulator(acc_);
         struct LookupGuard {
             Interpreter& interp;
@@ -1405,9 +1408,6 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
     while (pc < code_end) {
         try {
-        if (AETHER_UNLIKELY(heap.GCAllowed() && (Options::Get().gc_at_safepoints || heap.HeapPressure() >= kGCPressureThresholdPct))) {
-            heap.CollectAtSafepoint();
-        }
         Opcode op = static_cast<Opcode>(*pc++);
 
         switch (op) {
@@ -3200,6 +3200,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 int32_t offset = pc[0] | (pc[1] << 8) | (pc[2] << 16) | (pc[3] << 24);
                 pc += 4;
                 pc += offset;
+                if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                    heap.CollectAtSafepoint();
+                }
                 break;
             }
             case Opcode::JumpIfTrue: {
@@ -3207,6 +3210,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (acc_.ToBoolean()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3215,6 +3221,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (!acc_.ToBoolean()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3223,6 +3232,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (!acc_.IsNull() && !acc_.IsUndefined()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3231,6 +3243,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (acc_.IsNull() || acc_.IsUndefined()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3239,6 +3254,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (acc_.IsUndefined()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3247,6 +3265,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (!acc_.IsUndefined()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3255,6 +3276,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (acc_.IsNull()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -3263,6 +3287,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 4;
                 if (!acc_.IsNull()) {
                     pc += offset;
+                    if (offset < 0 && AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) {
+                        heap.CollectAtSafepoint();
+                    }
                 }
                 break;
             }
@@ -4528,7 +4555,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     while (true) {
                         HandleScope iteration_roots(heap);
                         InstructionRootsGuard iteration_guard(instruction_roots_, iteration_roots);
-                        if (heap.GCAllowed() && (Options::Get().gc_at_safepoints || heap.HeapPressure() >= kGCPressureThresholdPct)) heap.CollectAtSafepoint();
+                        if (AETHER_UNLIKELY(heap.GCAllowed() && (heap.IsSafepointRequested() || Options::Get().gc_at_safepoints))) heap.CollectAtSafepoint();
                         TaggedValue next_fn;
                         if (iterator.AsHeapObject()->IsProxy()) {
                             next_fn = ProxyGet(static_cast<JSProxy*>(iterator.AsHeapObject()), "next", iterator);

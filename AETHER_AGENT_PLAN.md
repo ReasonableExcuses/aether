@@ -205,7 +205,7 @@ Implements D1, D2, D3. **Order matters.**
 - Remove `NurserySpace`, `young_`, `RelocateTo`-based scavenging, and `CardTable` (D3) once green. Keep poisoning (`0xDD`/`0xCD`) under a debug flag.
 - **Acceptance:** `gc1.js 400000` peak RSS ≤ 15% of baseline; minor GC time scales with *live young* data, not heap size (benchmark at 1×, 4×, 16× old-gen size; pause growth < 1.5×).
 
-### T1.6 Triggering and pacing
+### [x] T1.6 Triggering and pacing
 - Replace "75% of 512 MB" with allocation-volume triggers: minor GC after `young_budget` bytes (start 8 MB, adaptive on survival rate); major GC when old gen grows 1.5–2× over post-last-major live size (min 32 MB).
 - Safepoint poll = decrement an allocation debt counter at backward jumps/calls; no per-instruction `HeapPressure()` call.
 - Keep `MemoryBudget` as a hard limit only (OOM), not as a trigger.

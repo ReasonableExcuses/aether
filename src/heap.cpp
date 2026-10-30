@@ -109,7 +109,15 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     : nursery_(nursery_size),
       old_gen_(),
       card_table_(nursery_.FromSpaceStart(), kHeapReservationSize) {
-    young_budget_ = nursery_size ? nursery_size : (8 * 1024 * 1024);
+    if (nursery_size > 0) {
+        young_budget_ = nursery_size;
+        min_young_budget_ = std::min<size_t>(kMinYoungBudget, nursery_size);
+        max_young_budget_ = std::max<size_t>(min_young_budget_, nursery_size * 4);
+    } else {
+        young_budget_ = kDefaultYoungBudget;
+        min_young_budget_ = kMinYoungBudget;
+        max_young_budget_ = kMaxYoungBudget;
+    }
     old_gen_.SetBudget(budget_);
     if (nursery_.HasReservation()) {
         old_gen_.SetReservation(nursery_.OldGenStart(), kHeapReservationSize - (nursery_size * 2));
@@ -427,6 +435,8 @@ void IsolateHeap::MinorGC() {
     weak_containers_.swap(live_weak_containers);
 
     // 7. Sweep and promote in Immix
+    size_t allocated_before = young_bytes_allocated_;
+    size_t surviving_bytes = 0;
     std::vector<HeapObject*> surviving_young;
     surviving_young.reserve(young_objects_.size() / 2);
     std::vector<HeapObject*> newly_tenured;
@@ -435,19 +445,21 @@ void IsolateHeap::MinorGC() {
         if (!obj) continue;
         if (obj->IsMarked()) {
             // Survivor!
+            size_t bytes = obj->GetAllocatedSize();
+            if (bytes == 0) bytes = sizeof(HeapObject);
+            surviving_bytes += bytes;
             obj->IncrementAge();
             obj->SetMarked(false);
             obj->SetPinned(false);
             if (obj->GetAge() >= kTenuringAgeThreshold) {
                 obj->SetOld(true);
                 newly_tenured.push_back(obj);
+                old_bytes_allocated_ += bytes;
             } else {
                 surviving_young.push_back(obj);
             }
 
             if (ImmixBlock* block = old_gen_.BlockForPointer(obj)) {
-                size_t bytes = obj->GetAllocatedSize();
-                if (bytes == 0) bytes = sizeof(HeapObject);
                 size_t start_line = block->LineFor(obj);
                 size_t end_line = block->LineFor(reinterpret_cast<const uint8_t*>(obj) + bytes - 1);
                 for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
@@ -472,6 +484,21 @@ void IsolateHeap::MinorGC() {
     }
     young_objects_.swap(surviving_young);
     young_bytes_allocated_ = 0;
+
+    // Adaptive young budget adjustment based on survival rate
+    if (allocated_before > 0) {
+        double survival_rate = static_cast<double>(surviving_bytes) / allocated_before;
+        if (survival_rate > 0.6) {
+            young_budget_ = std::min(max_young_budget_, static_cast<size_t>(young_budget_ * 1.5));
+        } else if (survival_rate < 0.2) {
+            young_budget_ = std::max(min_young_budget_, static_cast<size_t>(young_budget_ * 0.8));
+        }
+    }
+
+    const bool budget_pressure = (HeapBudget() > 0 && TotalAllocatedBytes() >= HeapBudget() * 75 / 100);
+    if (old_bytes_allocated_ >= old_gen_growth_threshold_ || budget_pressure) {
+        RequestSafepoint();
+    }
 
     // Check newly tenured objects: if they reference young objects, add to remembered set
     for (HeapObject* obj : newly_tenured) {
@@ -608,6 +635,22 @@ void IsolateHeap::MajorGC() {
     old_gen_.Sweep();
     card_table_.Clear();
     ++major_gc_count_;
+
+    size_t post_major_live_bytes = 0;
+    for (auto* obj : live) {
+        if (obj) post_major_live_bytes += obj->GetAllocatedSize();
+    }
+    last_major_live_bytes_ = post_major_live_bytes;
+    old_bytes_allocated_ = 0;
+    safepoint_requested_ = false;
+
+    // Major GC threshold: 1.5-2x over post-last-major live size (min 32 MB)
+    size_t target_threshold = std::max(kMinMajorGCThreshold, static_cast<size_t>(last_major_live_bytes_ * 1.75));
+    if (budget_->TotalLimit() > 0 && target_threshold > budget_->TotalLimit()) {
+        target_threshold = std::max<size_t>(1024, budget_->TotalLimit() * 75 / 100);
+    }
+    old_gen_growth_threshold_ = target_threshold;
+
     HeapVerifier::VerifyAfterGC(*this);
     if (Options::Get().trace_gc) {
         std::cout << "[GC] MajorGC #" << major_gc_count_ << ": live=" << live.size() << " objects, usage=" << (budget_->ChargedBytes() / 1024) << "KB" << std::endl;
@@ -617,7 +660,16 @@ void IsolateHeap::MajorGC() {
 bool IsolateHeap::CollectAtSafepoint() {
     AssertOwnerThread();
     if (!GCAllowed()) return false;
-    MajorGC();
+    safepoint_requested_ = false;
+    const bool budget_pressure = (HeapBudget() > 0 && TotalAllocatedBytes() >= HeapBudget() * 75 / 100);
+    if (budget_pressure || old_bytes_allocated_ >= old_gen_growth_threshold_ || young_objects_.empty()) {
+        MajorGC();
+    } else {
+        MinorGC();
+        if ((budget_->TotalLimit() > 0 && (minor_gc_count_ % 10) == 0) || (minor_gc_count_ % 50) == 0) {
+            MajorGC();
+        }
+    }
     return true;
 }
 

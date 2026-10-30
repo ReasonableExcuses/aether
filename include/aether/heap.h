@@ -205,11 +205,31 @@ public:
     size_t TotalAllocatedBytes() const noexcept { return budget_->ChargedBytes(); }
     size_t ManagedBytes() const noexcept { return budget_->ManagedBytes(); }
     size_t HeapBudget() const noexcept { return budget_->TotalLimit(); }
-    void SetHeapBudget(size_t budget) noexcept { budget_->SetTotalLimit(budget); }
+    void SetHeapBudget(size_t budget) noexcept {
+        budget_->SetTotalLimit(budget);
+        if (budget > 0) {
+            size_t max_young = std::max<size_t>(1024, budget / 4);
+            young_budget_ = std::min(young_budget_, max_young);
+            min_young_budget_ = std::min(min_young_budget_, max_young);
+            max_young_budget_ = std::min(max_young_budget_, max_young);
+            old_gen_growth_threshold_ = std::max<size_t>(1024, budget * 75 / 100);
+        } else {
+            young_budget_ = kDefaultYoungBudget;
+            min_young_budget_ = kMinYoungBudget;
+            max_young_budget_ = kMaxYoungBudget;
+            old_gen_growth_threshold_ = kMinMajorGCThreshold;
+        }
+    }
     std::shared_ptr<MemoryBudgetState> BudgetState() const noexcept { return budget_; }
     double HeapPressure() const noexcept {
         return HeapBudget() > 0 ? static_cast<double>(TotalAllocatedBytes()) / static_cast<double>(HeapBudget()) * 100.0 : 0.0;
     }
+    bool IsSafepointRequested() const noexcept { return safepoint_requested_; }
+    void RequestSafepoint() noexcept { safepoint_requested_ = true; }
+    void ClearSafepointRequest() noexcept { safepoint_requested_ = false; }
+    size_t YoungBudget() const noexcept { return young_budget_; }
+    size_t OldGenGrowthThreshold() const noexcept { return old_gen_growth_threshold_; }
+    size_t OldBytesAllocated() const noexcept { return old_bytes_allocated_; }
 
     size_t PendingFinalizationCount() const noexcept { return finalizers_.size(); }
     // Called by the owning Agent outside sweep. Values stay rooted for the
@@ -263,13 +283,30 @@ private:
                 }
             }
         }
-        if (!old && GCAllowed() && !collecting_) {
+        const bool budget_pressure = (HeapBudget() > 0 && TotalAllocatedBytes() >= HeapBudget() * 75 / 100);
+        const bool major_due = (old_bytes_allocated_ >= old_gen_growth_threshold_) || budget_pressure;
+        if (!old) {
             young_bytes_allocated_ += bytes;
-            if (young_bytes_allocated_ >= young_budget_) {
-                MinorGC();
-                if (minor_gc_count_ > 0 && (minor_gc_count_ % 20) == 0) {
+            if (GCAllowed() && !collecting_) {
+                if (major_due) {
+                    MajorGC();
+                } else if (young_bytes_allocated_ >= young_budget_) {
+                    MinorGC();
+                    if ((budget_->TotalLimit() > 0 && (minor_gc_count_ % 10) == 0) || (minor_gc_count_ % 50) == 0) {
+                        MajorGC();
+                    }
+                }
+            } else if (major_due || young_bytes_allocated_ >= young_budget_) {
+                RequestSafepoint();
+            }
+        } else {
+            old_bytes_allocated_ += bytes;
+            if (GCAllowed() && !collecting_) {
+                if (major_due) {
                     MajorGC();
                 }
+            } else if (major_due) {
+                RequestSafepoint();
             }
         }
         ReserveManaged(bytes);
@@ -341,8 +378,19 @@ private:
     ImmixSpace old_gen_;
     CardTable card_table_;
     std::vector<HeapObject*> remembered_set_;
-    size_t young_budget_{8 * 1024 * 1024};
+    static constexpr size_t kDefaultYoungBudget = 8 * 1024 * 1024;
+    static constexpr size_t kMinYoungBudget = 1024 * 1024;
+    static constexpr size_t kMaxYoungBudget = 32 * 1024 * 1024;
+    static constexpr size_t kMinMajorGCThreshold = 32 * 1024 * 1024;
+
+    size_t young_budget_{kDefaultYoungBudget};
+    size_t min_young_budget_{kMinYoungBudget};
+    size_t max_young_budget_{kMaxYoungBudget};
     size_t young_bytes_allocated_{0};
+    size_t old_bytes_allocated_{0};
+    size_t last_major_live_bytes_{0};
+    size_t old_gen_growth_threshold_{kMinMajorGCThreshold};
+    bool safepoint_requested_{false};
     std::unique_ptr<ConcurrentMarker> concurrent_marker_;
 
     HandleScope* top_scope_{nullptr};
