@@ -25,6 +25,7 @@ struct MemoryBudgetState {
         size_t total_limit = kDefaultHeapBudget,
         size_t array_buffer_limit = kDefaultArrayBufferExternalBudget) noexcept
         : total_limit_(total_limit),
+          has_total_limit_(total_limit != 0),
           array_buffer_limit_(array_buffer_limit) {}
 
     bool TryCharge(size_t bytes, bool array_buffer) noexcept {
@@ -32,7 +33,7 @@ struct MemoryBudgetState {
         if (bytes > std::numeric_limits<size_t>::max() - charged_bytes_) {
             return false;
         }
-        if (total_limit_ != 0 && charged_bytes_ + bytes > total_limit_) {
+        if (has_total_limit_ && charged_bytes_ + bytes > total_limit_) {
             return false;
         }
         if (array_buffer) {
@@ -58,7 +59,7 @@ struct MemoryBudgetState {
             return false;
         }
         const size_t total_after = charged_bytes_ + bytes;
-        if (total_limit_ != 0 && total_after > total_limit_) return false;
+        if (has_total_limit_ && total_after > total_limit_) return false;
         managed_bytes_ += bytes;
         charged_bytes_ += bytes;
         return true;
@@ -79,14 +80,26 @@ struct MemoryBudgetState {
         charged_bytes_ = bytes > charged_bytes_ ? 0 : charged_bytes_ - bytes;
     }
 
-    void SetTotalLimit(size_t limit) noexcept {
+    void SetTotalLimit(size_t limit, bool has_limit = true) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         total_limit_ = limit;
+        has_total_limit_ = has_limit;
+    }
+
+    void ClearTotalLimit() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        total_limit_ = 0;
+        has_total_limit_ = false;
+    }
+
+    bool HasTotalLimit() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return has_total_limit_;
     }
 
     size_t TotalLimit() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
-        return total_limit_;
+        return has_total_limit_ ? total_limit_ : 0;
     }
 
     size_t ChargedBytes() const noexcept {
@@ -107,6 +120,7 @@ struct MemoryBudgetState {
 private:
     mutable std::mutex mutex_;
     size_t total_limit_;
+    bool has_total_limit_{true};
     size_t array_buffer_limit_;
     size_t charged_bytes_{0};
     size_t managed_bytes_{0};

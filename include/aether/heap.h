@@ -206,14 +206,15 @@ public:
     size_t ManagedBytes() const noexcept { return budget_->ManagedBytes(); }
     size_t HeapBudget() const noexcept { return budget_->TotalLimit(); }
     void SetHeapBudget(size_t budget) noexcept {
-        budget_->SetTotalLimit(budget);
         if (budget > 0) {
+            budget_->SetTotalLimit(budget, true);
             size_t max_young = std::max<size_t>(1024, budget / 4);
             young_budget_ = std::min(young_budget_, max_young);
             min_young_budget_ = std::min(min_young_budget_, max_young);
             max_young_budget_ = std::min(max_young_budget_, max_young);
             old_gen_growth_threshold_ = std::max<size_t>(1024, budget * 75 / 100);
         } else {
+            budget_->ClearTotalLimit();
             young_budget_ = kDefaultYoungBudget;
             min_young_budget_ = kMinYoungBudget;
             max_young_budget_ = kMaxYoungBudget;

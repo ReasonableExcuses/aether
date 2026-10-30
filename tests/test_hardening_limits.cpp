@@ -23,12 +23,17 @@ void ExpectLengthError(F&& operation) {
 
 struct BudgetLimit {
     explicit BudgetLimit(size_t limit)
-        : state(CurrentMemoryBudgetState()), previous(state->TotalLimit()) {
-        state->SetTotalLimit(limit);
+        : state(CurrentMemoryBudgetState()),
+          previous_has_limit(state ? state->HasTotalLimit() : false),
+          previous(state ? state->TotalLimit() : 0) {
+        if (state) state->SetTotalLimit(limit, true);
     }
-    ~BudgetLimit() { state->SetTotalLimit(previous); }
+    ~BudgetLimit() {
+        if (state) state->SetTotalLimit(previous, previous_has_limit);
+    }
     std::shared_ptr<MemoryBudgetState> state;
-    size_t previous;
+    bool previous_has_limit{false};
+    size_t previous{0};
 };
 
 // Stable native slots keep this suite independent of HandleScope's container

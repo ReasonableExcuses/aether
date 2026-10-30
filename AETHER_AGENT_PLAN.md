@@ -211,7 +211,7 @@ Implements D1, D2, D3. **Order matters.**
 - Keep `MemoryBudget` as a hard limit only (OOM), not as a trigger.
 - **Acceptance:** `gc1.js` runs in bounded RSS (< 64 MB) at any N; `--trace-gc` shows regular minor GCs.
 
-### T1.7 Per-object memory diet
+### [x] T1.7 Per-object memory diet
 - Investigate `PropertyStorage` (`heap_object.h` ~L150) and `Shape` (`shape.h`): ≈1.2 KB per small object means per-object hash tables / vectors / `MemoryCharge` members.
 - Store named properties as inline slots described by `Shape`; spill to a single out-of-line array; dictionary mode only after many deletes/adds. Keep property **insertion order** (see T6.2).
 - Target sizes: `{a:1,b:2}` ≤ 64 B (+ shared shape); `[x]` ≤ 64 B + elements; closure ≤ 64 B.

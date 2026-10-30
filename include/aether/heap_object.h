@@ -247,7 +247,7 @@ enum class HeapObjectType : uint16_t {
 class HeapObject {
 public:
     HeapObject(HeapObjectType type, Shape* shape)
-        : shape_(shape), type_(type), gc_metadata_(0), allocated_size_(0) {}
+        : shape_(shape), type_(type), gc_metadata_(kExtensibleBit), allocated_size_(0) {}
     virtual ~HeapObject() = default;
 
     AETHER_ALWAYS_INLINE Shape* GetShape() const noexcept { return shape_; }
@@ -309,6 +309,37 @@ public:
     static constexpr uint16_t kChargedBit     = 1 << 5;
     static constexpr uint16_t kAgeShift       = 6;
     static constexpr uint16_t kAgeMask        = 0x03C0; // 4 bits: 6..9 (0..15)
+    static constexpr uint16_t kExtensibleBit  = 1 << 10;
+    static constexpr uint16_t kSealedBit      = 1 << 11;
+    static constexpr uint16_t kFrozenBit      = 1 << 12;
+
+    AETHER_ALWAYS_INLINE bool IsExtensible() const noexcept { return (gc_metadata_ & kExtensibleBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetExtensible(bool e) noexcept {
+        if (e) gc_metadata_ |= kExtensibleBit;
+        else   gc_metadata_ &= ~kExtensibleBit;
+    }
+    AETHER_ALWAYS_INLINE void PreventExtensions() noexcept { SetExtensible(false); }
+
+    AETHER_ALWAYS_INLINE bool IsSealed() const noexcept { return (gc_metadata_ & kSealedBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetSealed(bool s) noexcept {
+        if (s) gc_metadata_ |= kSealedBit;
+        else   gc_metadata_ &= ~kSealedBit;
+    }
+    AETHER_ALWAYS_INLINE void Seal() noexcept {
+        SetSealed(true);
+        PreventExtensions();
+    }
+
+    AETHER_ALWAYS_INLINE bool IsFrozen() const noexcept { return (gc_metadata_ & kFrozenBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetFrozen(bool f) noexcept {
+        if (f) gc_metadata_ |= kFrozenBit;
+        else   gc_metadata_ &= ~kFrozenBit;
+    }
+    AETHER_ALWAYS_INLINE void Freeze() noexcept {
+        SetFrozen(true);
+        SetSealed(true);
+        PreventExtensions();
+    }
 
     AETHER_ALWAYS_INLINE bool IsMarked() const noexcept { return (gc_metadata_ & kMarkBit) != 0; }
     AETHER_ALWAYS_INLINE void SetMarked(bool m) noexcept {
@@ -489,8 +520,25 @@ private:
 /**
  * @brief Standard ECMAScript Object with hidden class transitions and property storage.
  */
+struct AccessorDescriptor {
+    TaggedValue getter{TaggedValue::Undefined()};
+    TaggedValue setter{TaggedValue::Undefined()};
+    PropertyAttributes attributes{PropertyAttributes::None};
+};
+
+struct ObjectExtraData {
+    std::vector<TaggedValue> out_of_line_slots;
+    MemoryCharge slots_storage;
+    detail::StorageAllocator<char> key_allocator;
+    std::unique_ptr<detail::PropertyMap<AccessorDescriptor>> accessors;
+    std::unique_ptr<detail::PropertyMap<PropertyAttributes>> own_attributes;
+    std::unique_ptr<detail::PropertySet> deleted_properties;
+};
+
 class JSObject : public HeapObject {
 public:
+    using AccessorDescriptor = aether::AccessorDescriptor;
+
     explicit JSObject(Shape* shape)
         : HeapObject(HeapObjectType::JSObject, shape) {
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
@@ -500,16 +548,8 @@ public:
 
     JSObject(JSObject&& other) noexcept
         : HeapObject(std::move(other)),
-          is_frozen_(other.is_frozen_),
-          is_sealed_(other.is_sealed_),
-           is_extensible_(other.is_extensible_),
-           prototype_(other.prototype_),
-           key_allocator_(std::move(other.key_allocator_)),
-           slots_storage_(std::move(other.slots_storage_)),
-           out_of_line_slots_(std::move(other.out_of_line_slots_)),
-           accessors_(std::move(other.accessors_)),
-           own_attributes_(std::move(other.own_attributes_)),
-           deleted_properties_(std::move(other.deleted_properties_)) {
+          prototype_(other.prototype_),
+          extra_(std::move(other.extra_)) {
         for (size_t i = 0; i < Shape::kDefaultInObjectProperties; ++i) {
             in_object_slots_[i] = other.in_object_slots_[i];
         }
@@ -521,7 +561,6 @@ public:
         return new (dst) JSObject(std::move(*this));
     }
 
-    // Fast-path direct slot access using cached Inline Cache offset
     AETHER_ALWAYS_INLINE TaggedValue GetFastSlot(uint32_t slot_index, bool in_object) const {
         if (AETHER_LIKELY(in_object)) {
             if (AETHER_UNLIKELY(slot_index >= Shape::kDefaultInObjectProperties)) {
@@ -532,16 +571,16 @@ public:
         if (AETHER_UNLIKELY(slot_index < Shape::kDefaultInObjectProperties)) {
             return TaggedValue::Empty();
         }
-        size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
-        if (AETHER_UNLIKELY(ool_idx >= out_of_line_slots_.size())) {
+        if (!extra_) {
             return TaggedValue::Empty();
         }
-        return out_of_line_slots_[ool_idx];
+        size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
+        if (AETHER_UNLIKELY(ool_idx >= extra_->out_of_line_slots.size())) {
+            return TaggedValue::Empty();
+        }
+        return extra_->out_of_line_slots[ool_idx];
     }
 
-    // Reserve a fast slot before a shape transition.  This is deliberately
-    // separate from SetFastSlot so callers can fail before publishing a new
-    // shape or descriptor.
     void PrepareFastSlot(uint32_t slot_index, bool in_object) {
         if (in_object) {
             if (AETHER_UNLIKELY(slot_index >= Shape::kDefaultInObjectProperties)) {
@@ -556,7 +595,8 @@ public:
         if (AETHER_UNLIKELY(slot_index >= kMaxObjectProperties)) {
             throw std::length_error("object property limit exceeded");
         }
-        detail::ReserveStorage(out_of_line_slots_, slots_storage_, ool_idx + 1,
+        auto& extra = EnsureExtra();
+        detail::ReserveStorage(extra.out_of_line_slots, extra.slots_storage, ool_idx + 1,
                                kMaxObjectProperties - Shape::kDefaultInObjectProperties);
     }
 
@@ -569,17 +609,17 @@ public:
         } else {
             PrepareFastSlot(slot_index, false);
             size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
-            if (ool_idx >= out_of_line_slots_.size()) {
-                out_of_line_slots_.resize(ool_idx + 1, TaggedValue::Empty());
+            auto& extra = EnsureExtra();
+            if (ool_idx >= extra.out_of_line_slots.size()) {
+                extra.out_of_line_slots.resize(ool_idx + 1, TaggedValue::Empty());
             }
-            out_of_line_slots_[ool_idx] = value;
+            extra.out_of_line_slots[ool_idx] = value;
         }
         if (AETHER_UNLIKELY(IsOld() && value.IsHeapObject())) {
             RecordWriteBarrier(this, value);
         }
     }
 
-    // Full property lookup and mutation with shape transitions
     TaggedValue GetNamedProperty(std::string_view key) const;
     void SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id);
     bool HasNamedProperty(std::string_view key) const;
@@ -590,18 +630,15 @@ public:
     void SetOwnPropertyAttributes(std::string_view key, PropertyAttributes attributes);
 
     JSObject* GetPrototype() const noexcept { return prototype_; }
-    /// Sets the prototype with cycle detection and depth limiting.
-    /// Returns false if setting would create a cycle or exceed max depth.
     bool SetPrototypeSafe(JSObject* proto) noexcept {
         if (proto == prototype_) return true;
-        if (!is_extensible_) return false;
-        if (proto == this) return false; // Self-reference
-        // Walk the chain to detect cycles and enforce max depth
+        if (!IsExtensible()) return false;
+        if (proto == this) return false;
         JSObject* cursor = proto;
         size_t depth = 0;
         while (cursor != nullptr) {
-            if (cursor == this) return false; // Cycle detected
-            if (++depth > kMaxPrototypeChainDepth) return false; // Chain too deep
+            if (cursor == this) return false;
+            if (++depth > kMaxPrototypeChainDepth) return false;
             if (cursor->prototype_) {
                 cursor = cursor->prototype_;
             } else {
@@ -621,46 +658,46 @@ public:
         return SetPrototypeSafe(proto);
     }
 
-    bool IsFrozen() const noexcept { return is_frozen_; }
-    void Freeze() noexcept;
-    bool IsSealed() const noexcept { return is_sealed_; }
-    void Seal() noexcept;
-    bool IsExtensible() const noexcept { return is_extensible_; }
-    void PreventExtensions() noexcept { is_extensible_ = false; }
-
     bool IsDeletedProperty(std::string_view key) const {
-        return deleted_properties_.count(key) > 0;
+        if (!extra_ || !extra_->deleted_properties) return false;
+        return extra_->deleted_properties->count(key) > 0;
     }
     void ClearDeletedProperty(std::string_view key) {
-        auto it = deleted_properties_.find(key);
-        if (it != deleted_properties_.end()) deleted_properties_.erase(it);
+        if (extra_ && extra_->deleted_properties) {
+            auto it = extra_->deleted_properties->find(key);
+            if (it != extra_->deleted_properties->end()) extra_->deleted_properties->erase(it);
+        }
     }
     void MarkDeletedProperty(std::string_view key) {
-        if (!deleted_properties_.contains(key)) {
-            if (deleted_properties_.size() >= kMaxObjectProperties) {
+        auto& extra = EnsureExtra();
+        if (!extra.deleted_properties) {
+            extra.deleted_properties = std::make_unique<detail::PropertySet>();
+        }
+        if (!extra.deleted_properties->contains(key)) {
+            if (extra.deleted_properties->size() >= kMaxObjectProperties) {
                 throw std::length_error("object property limit exceeded");
             }
-            deleted_properties_.insert(detail::MakePropertyKey(key, key_allocator_));
+            extra.deleted_properties->insert(detail::MakePropertyKey(key, extra.key_allocator));
         }
     }
     const auto& GetDeletedProperties() const noexcept {
-        return deleted_properties_.Get();
+        static const detail::PropertySet kEmptySet;
+        if (!extra_ || !extra_->deleted_properties) return kEmptySet.Get();
+        return extra_->deleted_properties->Get();
     }
-
-    struct AccessorDescriptor {
-        TaggedValue getter{TaggedValue::Undefined()};
-        TaggedValue setter{TaggedValue::Undefined()};
-        PropertyAttributes attributes{PropertyAttributes::None};
-    };
 
     void SetAccessor(std::string_view key, TaggedValue getter, TaggedValue setter,
                      PropertyAttributes attributes = PropertyAttributes::None) {
         CheckPropertyGrowth(key);
-        auto [it, inserted] = accessors_.try_emplace(detail::MakePropertyKey(key, key_allocator_));
+        auto& extra = EnsureExtra();
+        if (!extra.accessors) {
+            extra.accessors = std::make_unique<detail::PropertyMap<AccessorDescriptor>>();
+        }
+        auto [it, inserted] = extra.accessors->try_emplace(detail::MakePropertyKey(key, extra.key_allocator));
         try {
             SetOwnPropertyAttributes(key, attributes);
         } catch (...) {
-            if (inserted) accessors_.erase(it);
+            if (inserted) extra.accessors->erase(it);
             throw;
         }
         it->second = AccessorDescriptor{getter, setter, attributes};
@@ -671,23 +708,75 @@ public:
         }
     }
     const AccessorDescriptor* GetAccessor(std::string_view key) const {
-        auto it = accessors_.find(key);
-        if (it != accessors_.end()) return &it->second;
+        if (!extra_ || !extra_->accessors) return nullptr;
+        auto it = extra_->accessors->find(key);
+        if (it != extra_->accessors->end()) return &it->second;
         return nullptr;
     }
     bool HasAccessor(std::string_view key) const {
-        return accessors_.count(key) > 0;
+        if (!extra_ || !extra_->accessors) return false;
+        return extra_->accessors->count(key) > 0;
     }
     bool RemoveAccessor(std::string_view key) {
-        auto it = accessors_.find(key);
-        if (it != accessors_.end()) {
-            accessors_.erase(it);
+        if (!extra_ || !extra_->accessors) return false;
+        auto it = extra_->accessors->find(key);
+        if (it != extra_->accessors->end()) {
+            extra_->accessors->erase(it);
             return true;
         }
         return false;
     }
+    size_t AccessorCount() const noexcept {
+        if (!extra_ || !extra_->accessors) return 0;
+        return extra_->accessors->size();
+    }
     const auto& GetAccessors() const {
-        return accessors_.Get();
+        static const detail::PropertyMap<AccessorDescriptor> kEmptyMap;
+        if (!extra_ || !extra_->accessors) return kEmptyMap.Get();
+        return extra_->accessors->Get();
+    }
+
+    bool HasOwnAttributeOverride(std::string_view key) const {
+        if (!extra_ || !extra_->own_attributes) return false;
+        return extra_->own_attributes->count(key) > 0;
+    }
+    PropertyAttributes GetOwnAttributeOverride(std::string_view key) const {
+        if (!extra_ || !extra_->own_attributes) return PropertyAttributes::None;
+        auto it = extra_->own_attributes->find(key);
+        if (it != extra_->own_attributes->end()) return it->second;
+        return PropertyAttributes::None;
+    }
+    void SetOwnAttributeOverride(std::string_view key, PropertyAttributes attr) {
+        auto& extra = EnsureExtra();
+        if (!extra.own_attributes) {
+            extra.own_attributes = std::make_unique<detail::PropertyMap<PropertyAttributes>>();
+        }
+        if (!extra.own_attributes->contains(key) && extra.own_attributes->size() >= kMaxObjectProperties) {
+            throw std::length_error("object property limit exceeded");
+        }
+        extra.own_attributes->insert_or_assign(detail::MakePropertyKey(key, extra.key_allocator), attr);
+        if (extra.accessors) {
+            auto accessor = extra.accessors->find(key);
+            if (accessor != extra.accessors->end()) accessor->second.attributes = attr;
+        }
+    }
+    void RemoveOwnAttributeOverride(std::string_view key) {
+        if (extra_ && extra_->own_attributes) {
+            auto it = extra_->own_attributes->find(key);
+            if (it != extra_->own_attributes->end()) extra_->own_attributes->erase(it);
+        }
+    }
+    size_t OwnAttributeOverrideCount() const {
+        if (!extra_ || !extra_->own_attributes) return 0;
+        return extra_->own_attributes->size();
+    }
+
+    ObjectExtraData* GetExtraData() const noexcept { return extra_.get(); }
+    ObjectExtraData& EnsureExtra() {
+        if (!extra_) {
+            extra_ = std::make_unique<ObjectExtraData>();
+        }
+        return *extra_;
     }
 
     size_t ObjectSize() const override { return sizeof(JSObject); }
@@ -704,14 +793,18 @@ public:
                 visitor->Visit(&in_object_slots_[i]);
             }
         }
-        for (auto& slot : out_of_line_slots_) {
-            if (!slot.IsEmpty()) {
-                visitor->Visit(&slot);
+        if (extra_) {
+            for (auto& slot : extra_->out_of_line_slots) {
+                if (!slot.IsEmpty()) {
+                    visitor->Visit(&slot);
+                }
             }
-        }
-        for (auto& [k, acc] : accessors_) {
-            if (!acc.getter.IsEmpty()) visitor->Visit(&acc.getter);
-            if (!acc.setter.IsEmpty()) visitor->Visit(&acc.setter);
+            if (extra_->accessors) {
+                for (auto& [k, acc] : *extra_->accessors) {
+                    if (!acc.getter.IsEmpty()) visitor->Visit(&acc.getter);
+                    if (!acc.setter.IsEmpty()) visitor->Visit(&acc.setter);
+                }
+            }
         }
     }
 
@@ -726,61 +819,79 @@ protected:
 private:
     void CheckPropertyGrowth(std::string_view key) const;
 
-    bool is_frozen_{false};
-    bool is_sealed_{false};
-    bool is_extensible_{true};
     JSObject* prototype_{nullptr};
     TaggedValue in_object_slots_[Shape::kDefaultInObjectProperties];
-    detail::StorageAllocator<char> key_allocator_;
-    MemoryCharge slots_storage_;
-    std::vector<TaggedValue> out_of_line_slots_;
-    detail::PropertyMap<AccessorDescriptor> accessors_;
-    detail::PropertyMap<PropertyAttributes> own_attributes_;
-    detail::PropertySet deleted_properties_;
+    std::unique_ptr<ObjectExtraData> extra_{nullptr};
 };
 
-/**
- * @brief Managed JavaScript Array with contiguous elements and length property.
- */
+static_assert(sizeof(JSObject) == 56, "sizeof(JSObject) must be 56 bytes");
+
 class JSArray : public JSObject {
 public:
+    struct ArrayStorage {
+        MemoryCharge elements_storage;
+        std::vector<TaggedValue> elements;
+
+        explicit ArrayStorage(size_t initial_capacity = 0)
+            : elements_storage(CheckedStorageBytes(initial_capacity, sizeof(TaggedValue))),
+              elements(initial_capacity, TaggedValue::Empty()) {
+            elements_storage.Resize(CheckedStorageBytes(elements.capacity(), sizeof(TaggedValue)));
+        }
+        explicit ArrayStorage(const std::vector<TaggedValue>& elems)
+            : elements_storage(CheckedStorageBytes(elems.size(), sizeof(TaggedValue))),
+              elements(elems) {
+            elements_storage.Resize(CheckedStorageBytes(elements.capacity(), sizeof(TaggedValue)));
+        }
+        explicit ArrayStorage(std::vector<TaggedValue>&& elems)
+            : elements_storage(CheckedStorageBytes(elems.capacity(), sizeof(TaggedValue))),
+              elements(std::move(elems)) {}
+    };
+
     explicit JSArray(Shape* shape, size_t initial_capacity = 0)
-        : JSObject(HeapObjectType::JSArray, shape),
-          elements_storage_(CheckedArrayLength(initial_capacity)),
-          elements_(initial_capacity, TaggedValue::Empty()) {
-        elements_storage_.Resize(CheckedStorageBytes(elements_.capacity(), sizeof(TaggedValue)));
+        : JSObject(HeapObjectType::JSArray, shape) {
+        if (AETHER_UNLIKELY(initial_capacity > kMaxArrayLength)) {
+            throw std::length_error("array length exceeds maximum");
+        }
+        if (initial_capacity > 0) {
+            array_storage_ = std::make_unique<ArrayStorage>(initial_capacity);
+        }
     }
 
     explicit JSArray(Shape* shape, const std::vector<TaggedValue>& elements)
-        : JSObject(HeapObjectType::JSArray, shape),
-          elements_storage_(CheckedArrayLength(elements.size())),
-          elements_(elements) {
-        elements_storage_.Resize(CheckedStorageBytes(elements_.capacity(), sizeof(TaggedValue)));
+        : JSObject(HeapObjectType::JSArray, shape) {
+        if (AETHER_UNLIKELY(elements.size() > kMaxArrayLength)) {
+            throw std::length_error("array length exceeds maximum");
+        }
+        array_storage_ = std::make_unique<ArrayStorage>(elements);
     }
 
     explicit JSArray(Shape* shape, std::vector<TaggedValue>&& elements)
-        : JSObject(HeapObjectType::JSArray, shape),
-          elements_storage_(CheckedArrayStorage(elements)),
-          elements_(std::move(elements)) {
+        : JSObject(HeapObjectType::JSArray, shape) {
+        if (AETHER_UNLIKELY(elements.size() > kMaxArrayLength)) {
+            throw std::length_error("array length exceeds maximum");
+        }
+        array_storage_ = std::make_unique<ArrayStorage>(std::move(elements));
     }
 
     JSArray(JSArray&& other) noexcept
         : JSObject(std::move(other)),
-          elements_storage_(std::move(other.elements_storage_)),
-          elements_(std::move(other.elements_)) {}
+          array_storage_(std::move(other.array_storage_)) {}
 
-    size_t Length() const noexcept { return elements_.size(); }
+    size_t Length() const noexcept { return array_storage_ ? array_storage_->elements.size() : 0; }
     void SetLength(size_t len) {
         if (AETHER_UNLIKELY(len > kMaxArrayLength)) {
             throw std::length_error("array length exceeds the maximum length");
         }
-        PrepareElementStorage(len);
-        elements_.resize(len, TaggedValue::Empty());
+        auto& storage = EnsureStorage();
+        if (len > storage.elements.capacity()) {
+            detail::ReserveStorage(storage.elements, storage.elements_storage, len);
+        }
+        storage.elements.resize(len, TaggedValue::Empty());
     }
 
     TaggedValue GetElement(size_t index) const {
-        if (index < elements_.size() && !elements_[index].IsEmpty()) {
-            return elements_[index];
+        if (array_storage_ && index < array_storage_->elements.size() && !array_storage_->elements[index].IsEmpty()) {
+            return array_storage_->elements[index];
         }
         return TaggedValue::Undefined();
     }
@@ -789,67 +900,88 @@ public:
         if (AETHER_UNLIKELY(index >= kMaxArrayLength)) {
             throw std::length_error("array index exceeds the maximum length");
         }
-        if (index >= elements_.size()) {
-            PrepareElementStorage(index + 1);
-            elements_.resize(index + 1, TaggedValue::Empty());
+        auto& storage = EnsureStorage();
+        if (index >= storage.elements.size()) {
+            if (index + 1 > storage.elements.capacity()) {
+                detail::ReserveStorage(storage.elements, storage.elements_storage, index + 1);
+            }
+            storage.elements.resize(index + 1, TaggedValue::Empty());
         }
-        elements_[index] = val;
+        storage.elements[index] = val;
         if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
             RecordWriteBarrier(this, val);
         }
     }
 
     void Push(TaggedValue val) {
-        if (AETHER_UNLIKELY(elements_.size() >= kMaxArrayLength)) {
+        if (AETHER_UNLIKELY(Length() >= kMaxArrayLength)) {
             throw std::length_error("array length exceeds the maximum length");
         }
-        PrepareElementStorage(elements_.size() + 1);
-        elements_.push_back(val);
+        auto& storage = EnsureStorage();
+        if (storage.elements.size() + 1 > storage.elements.capacity()) {
+            detail::ReserveStorage(storage.elements, storage.elements_storage, storage.elements.size() + 1);
+        }
+        storage.elements.push_back(val);
         if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
             RecordWriteBarrier(this, val);
         }
     }
 
     TaggedValue Pop() {
-        if (elements_.empty()) return TaggedValue::Undefined();
-        TaggedValue last = elements_.back();
-        elements_.pop_back();
+        if (!array_storage_ || array_storage_->elements.empty()) return TaggedValue::Undefined();
+        TaggedValue last = array_storage_->elements.back();
+        array_storage_->elements.pop_back();
         return last;
     }
 
-    const std::vector<TaggedValue>& Elements() const noexcept { return elements_; }
-    // Internal callers that insert through Elements() must reserve the final
-    // size first, so both the hard limit and the external budget are enforced.
-    void ReserveElements(size_t length) { PrepareElementStorage(length); }
+    const std::vector<TaggedValue>& Elements() const noexcept {
+        static const std::vector<TaggedValue> kEmptyElements;
+        return array_storage_ ? array_storage_->elements : kEmptyElements;
+    }
+    std::vector<TaggedValue>& Elements() noexcept {
+        return EnsureStorage().elements;
+    }
+
+    void ReserveElements(size_t length) {
+        if (AETHER_UNLIKELY(length > kMaxArrayLength)) {
+            throw std::length_error("array capacity exceeds the maximum length");
+        }
+        auto& storage = EnsureStorage();
+        if (length > storage.elements.capacity()) {
+            detail::ReserveStorage(storage.elements, storage.elements_storage, length);
+            storage.elements.reserve(length);
+        }
+    }
+    void PrepareElementStorage(size_t new_size) {
+        auto& storage = EnsureStorage();
+        if (new_size > storage.elements.capacity()) {
+            detail::ReserveStorage(storage.elements, storage.elements_storage, new_size);
+        }
+    }
     void ReplaceElements(const std::vector<TaggedValue>& elements) {
-        if (&elements == &elements_) return;
-        PrepareElementStorage(elements.size());
-        elements_.assign(elements.begin(), elements.end());
+        auto& storage = EnsureStorage();
+        if (&elements == &storage.elements) return;
+        storage.elements_storage.Resize(CheckedStorageBytes(elements.size(), sizeof(TaggedValue)));
+        storage.elements.assign(elements.begin(), elements.end());
         RecordElementWrites();
     }
     void ReplaceElements(std::vector<TaggedValue>&& elements) {
-        if (&elements == &elements_) return;
+        auto& storage = EnsureStorage();
+        if (&elements == &storage.elements) return;
         const size_t bytes = CheckedArrayStorage(elements);
-        const size_t old_bytes = elements_storage_.Bytes();
-        if (bytes > std::numeric_limits<size_t>::max() - old_bytes) {
-            throw std::length_error("array storage overflow");
-        }
-        elements_storage_.Resize(old_bytes + bytes);
-        elements_.swap(elements);
-        std::vector<TaggedValue>().swap(elements);
-        elements_storage_.Resize(bytes);
+        storage.elements_storage.Resize(bytes);
+        storage.elements = std::move(elements);
         RecordElementWrites();
     }
-    std::vector<TaggedValue>& Elements() noexcept { return elements_; }
 
-    size_t ObjectSize() const override {
-        return sizeof(JSArray);
-    }
+    size_t ObjectSize() const override { return sizeof(JSArray); }
 
     void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        for (auto& el : elements_) {
-            if (!el.IsEmpty()) visitor->Visit(&el);
+        if (array_storage_) {
+            for (auto& el : array_storage_->elements) {
+                if (!el.IsEmpty()) visitor->Visit(&el);
+            }
         }
     }
 
@@ -858,9 +990,16 @@ public:
     }
 
 private:
+    ArrayStorage& EnsureStorage() {
+        if (!array_storage_) {
+            array_storage_ = std::make_unique<ArrayStorage>();
+        }
+        return *array_storage_;
+    }
+
     void RecordElementWrites() {
-        if (IsOld()) {
-            for (auto value : elements_) {
+        if (IsOld() && array_storage_) {
+            for (auto value : array_storage_->elements) {
                 if (value.IsHeapObject()) RecordWriteBarrier(this, value);
             }
         }
@@ -878,17 +1017,11 @@ private:
         return CheckedStorageBytes(len, sizeof(TaggedValue));
     }
 
-    void PrepareElementStorage(size_t new_size) {
-        detail::ReserveStorage(elements_, elements_storage_, new_size);
-    }
-
-    MemoryCharge elements_storage_;
-    std::vector<TaggedValue> elements_;
+    std::unique_ptr<ArrayStorage> array_storage_{nullptr};
 };
 
-/**
- * @brief Managed ECMAScript Map collection preserving insertion order.
- */
+static_assert(sizeof(JSArray) == 64, "sizeof(JSArray) must be 64 bytes");
+
 class JSMap : public JSObject {
 public:
     explicit JSMap(Shape* shape)
@@ -1159,105 +1292,126 @@ private:
  */
 class JSFunction : public JSObject {
 public:
+    struct InstanceField {
+        MemoryCharge name_storage;
+        std::string name;
+        TaggedValue initial_value{TaggedValue::Undefined()};
+        bool is_method{false};
+
+        InstanceField() = default;
+        InstanceField(std::string_view field_name, TaggedValue value, bool method = false)
+            : name(detail::ChargedString(field_name, name_storage)),
+              initial_value(value), is_method(method) {}
+        InstanceField(InstanceField&&) noexcept = default;
+        InstanceField& operator=(InstanceField&&) noexcept = default;
+        InstanceField(const InstanceField&) = delete;
+        InstanceField& operator=(const InstanceField&) = delete;
+    };
+
+    struct FunctionData {
+        MemoryCharge name_storage;
+        std::string name;
+        std::shared_ptr<const BytecodeArray> bytecode_shared{nullptr};
+        const BytecodeArray* bytecode{nullptr};
+        LexicalEnvironment* environment{nullptr};
+        TaggedValue ctor_prototype{TaggedValue::Empty()};
+        MemoryCharge fields_storage;
+        std::vector<InstanceField> instance_fields;
+        bool is_generator{false};
+        bool is_async{false};
+        bool is_arrow{false};
+        bool is_method{false};
+        TaggedValue lexical_this{TaggedValue::Undefined()};
+        TaggedValue lexical_new_target{TaggedValue::Undefined()};
+        MemoryCharge with_storage;
+        std::vector<JSObject*> with_stack;
+    };
+
     JSFunction(std::string_view name, std::shared_ptr<const BytecodeArray> bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr);
     JSFunction(std::string_view name, const BytecodeArray* bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr);
 
     JSFunction(JSFunction&& other) noexcept
         : JSObject(std::move(other)),
-          name_storage_(std::move(other.name_storage_)),
-          name_(std::move(other.name_)),
-          bytecode_shared_(std::move(other.bytecode_shared_)),
-           bytecode_(other.bytecode_),
-           environment_(other.environment_),
-           ctor_prototype_(other.ctor_prototype_),
-           fields_storage_(std::move(other.fields_storage_)),
-           instance_fields_(std::move(other.instance_fields_)),
-           is_generator_(other.is_generator_),
-           is_async_(other.is_async_),
-           is_arrow_(other.is_arrow_),
-           is_method_(other.is_method_),
-           lexical_this_(other.lexical_this_),
-           lexical_new_target_(other.lexical_new_target_),
-           with_storage_(std::move(other.with_storage_)),
-           with_stack_(std::move(other.with_stack_)) {}
+          fn_data_(std::move(other.fn_data_)) {}
 
-    const std::string& Name() const noexcept { return name_; }
-    const BytecodeArray* GetBytecode() const noexcept { return bytecode_; }
+    const std::string& Name() const noexcept;
+    const BytecodeArray* GetBytecode() const noexcept { return fn_data_ ? fn_data_->bytecode : nullptr; }
     void SetBytecode(const BytecodeArray* bytecode) noexcept { 
-        bytecode_ = bytecode; 
-        bytecode_shared_.reset();
+        auto& d = EnsureFnData();
+        d.bytecode = bytecode; 
+        d.bytecode_shared.reset();
     }
     void SetBytecode(std::shared_ptr<const BytecodeArray> bytecode) noexcept {
-        bytecode_shared_ = std::move(bytecode);
-        bytecode_ = bytecode_shared_.get();
+        auto& d = EnsureFnData();
+        d.bytecode_shared = std::move(bytecode);
+        d.bytecode = d.bytecode_shared.get();
     }
-    std::shared_ptr<const BytecodeArray> GetSharedBytecode() const noexcept { return bytecode_shared_; }
+    std::shared_ptr<const BytecodeArray> GetSharedBytecode() const noexcept {
+        return fn_data_ ? fn_data_->bytecode_shared : nullptr;
+    }
 
-    LexicalEnvironment* GetEnvironment() const noexcept { return environment_; }
+    LexicalEnvironment* GetEnvironment() const noexcept { return fn_data_ ? fn_data_->environment : nullptr; }
     void SetEnvironment(LexicalEnvironment* env) noexcept {
-        environment_ = env;
+        EnsureFnData().environment = env;
         if (env) RecordWriteBarrier(this, TaggedValue::FromHeapObject(env));
     }
 
-    bool IsGenerator() const noexcept { return is_generator_; }
-    void SetGenerator(bool g) noexcept { is_generator_ = g; }
+    bool IsGenerator() const noexcept { return fn_data_ && fn_data_->is_generator; }
+    void SetGenerator(bool g) noexcept { EnsureFnData().is_generator = g; }
 
-    bool IsAsync() const noexcept { return is_async_; }
-    void SetAsync(bool a) noexcept { is_async_ = a; }
+    bool IsAsync() const noexcept { return fn_data_ && fn_data_->is_async; }
+    void SetAsync(bool a) noexcept { EnsureFnData().is_async = a; }
 
-    bool IsAsyncGenerator() const noexcept { return is_async_ && is_generator_; }
+    bool IsAsyncGenerator() const noexcept { return IsAsync() && IsGenerator(); }
 
-    bool IsArrow() const noexcept { return is_arrow_; }
-    void SetArrow(bool a) noexcept { is_arrow_ = a; }
+    bool IsArrow() const noexcept { return fn_data_ && fn_data_->is_arrow; }
+    void SetArrow(bool a) noexcept { EnsureFnData().is_arrow = a; }
 
-    bool IsMethod() const noexcept { return is_method_; }
-    void SetIsMethod(bool m) noexcept { is_method_ = m; }
+    bool IsMethod() const noexcept { return fn_data_ && fn_data_->is_method; }
+    void SetMethod(bool m) noexcept { EnsureFnData().is_method = m; }
+    void SetIsMethod(bool m) noexcept { SetMethod(m); }
 
-    TaggedValue GetLexicalThis() const noexcept { return lexical_this_; }
+    TaggedValue LexicalThis() const noexcept { return fn_data_ ? fn_data_->lexical_this : TaggedValue::Undefined(); }
+    TaggedValue GetLexicalThis() const noexcept { return LexicalThis(); }
     void SetLexicalThis(TaggedValue t) noexcept {
-        lexical_this_ = t;
-        if (t.IsHeapObject()) RecordWriteBarrier(this, t);
-    }
-
-    TaggedValue GetLexicalNewTarget() const noexcept { return lexical_new_target_; }
-    void SetLexicalNewTarget(TaggedValue nt) noexcept {
-        lexical_new_target_ = nt;
-        if (nt.IsHeapObject()) RecordWriteBarrier(this, nt);
-    }
-
-    TaggedValue GetConstructorPrototype() const noexcept { return ctor_prototype_; }
-    void SetConstructorPrototype(TaggedValue proto) noexcept {
-        ctor_prototype_ = proto;
-        if (proto.IsHeapObject()) RecordWriteBarrier(this, proto);
-    }
-    JSObject* GetOrCreateConstructorPrototype();
-    struct InstanceField {
-        MemoryCharge name_storage;
-        std::string name;
-        TaggedValue initial_value;
-        bool is_method{false};
-        InstanceField(std::string_view field_name, TaggedValue value, bool method)
-            : name(detail::ChargedString(field_name, name_storage)),
-              initial_value(value), is_method(method) {}
-        InstanceField(InstanceField&&) noexcept = default;
-        InstanceField& operator=(InstanceField&&) noexcept = default;
-    };
-    void AddInstanceField(std::string_view name, TaggedValue initial_value, bool is_method = false) {
-        InstanceField field(name, initial_value, is_method);
-        detail::ReserveStorage(instance_fields_, fields_storage_, instance_fields_.size() + 1, kMaxObjectProperties);
-        instance_fields_.push_back(std::move(field));
-        if (IsOld() && initial_value.IsHeapObject()) RecordWriteBarrier(this, initial_value);
-    }
-    const std::vector<InstanceField>& InstanceFields() const noexcept { return instance_fields_; }
-    const std::vector<JSObject*>& GetWithStack() const noexcept { return with_stack_; }
-    void SetWithStack(std::vector<JSObject*> ws) {
-        with_storage_.Resize(CheckedStorageBytes(ws.capacity(), sizeof(JSObject*)));
-        with_stack_ = std::move(ws);
-        if (IsOld()) {
-            for (auto* obj : with_stack_) if (obj) RecordWriteBarrier(this, TaggedValue::FromHeapObject(obj));
+        EnsureFnData().lexical_this = t;
+        if (AETHER_UNLIKELY(IsOld() && t.IsHeapObject())) {
+            RecordWriteBarrier(this, t);
         }
     }
-    bool HasWithStack() const noexcept { return !with_stack_.empty(); }
+
+    TaggedValue LexicalNewTarget() const noexcept { return fn_data_ ? fn_data_->lexical_new_target : TaggedValue::Undefined(); }
+    TaggedValue GetLexicalNewTarget() const noexcept { return LexicalNewTarget(); }
+    void SetLexicalNewTarget(TaggedValue nt) noexcept {
+        EnsureFnData().lexical_new_target = nt;
+        if (AETHER_UNLIKELY(IsOld() && nt.IsHeapObject())) {
+            RecordWriteBarrier(this, nt);
+        }
+    }
+
+    TaggedValue ConstructorPrototype() const noexcept { return fn_data_ ? fn_data_->ctor_prototype : TaggedValue::Empty(); }
+    TaggedValue GetConstructorPrototype() const noexcept { return ConstructorPrototype(); }
+    void SetConstructorPrototype(TaggedValue proto) noexcept {
+        EnsureFnData().ctor_prototype = proto;
+        if (AETHER_UNLIKELY(IsOld() && proto.IsHeapObject())) {
+            RecordWriteBarrier(this, proto);
+        }
+    }
+
+    JSObject* GetOrCreateConstructorPrototype();
+
+    void AddInstanceField(std::string_view name, TaggedValue initial_val = TaggedValue::Undefined(), bool is_method = false) {
+        auto& d = EnsureFnData();
+        detail::ReserveStorage(d.instance_fields, d.fields_storage, d.instance_fields.size() + 1, kMaxObjectProperties);
+        d.instance_fields.emplace_back(name, initial_val, is_method);
+        if (IsOld() && initial_val.IsHeapObject()) {
+            RecordWriteBarrier(this, initial_val);
+        }
+    }
+    const std::vector<InstanceField>& InstanceFields() const noexcept;
+    const std::vector<JSObject*>& GetWithStack() const noexcept;
+    void SetWithStack(std::vector<JSObject*> ws);
+    bool HasWithStack() const noexcept { return fn_data_ && !fn_data_->with_stack.empty(); }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(SlotVisitor* visitor) override;
@@ -1266,28 +1420,20 @@ public:
         return new (dst) JSFunction(std::move(*this));
     }
 
+    FunctionData* GetFunctionData() const noexcept { return fn_data_.get(); }
+    FunctionData& EnsureFnData() {
+        if (!fn_data_) {
+            fn_data_ = std::make_unique<FunctionData>();
+        }
+        return *fn_data_;
+    }
+
 private:
-    MemoryCharge name_storage_;
-    std::string name_;
-    std::shared_ptr<const BytecodeArray> bytecode_shared_{nullptr};
-    const BytecodeArray* bytecode_{nullptr};
-    LexicalEnvironment* environment_{nullptr};
-    TaggedValue ctor_prototype_{TaggedValue::Empty()};
-    MemoryCharge fields_storage_;
-    std::vector<InstanceField> instance_fields_;
-    bool is_generator_{false};
-    bool is_async_{false};
-    bool is_arrow_{false};
-    bool is_method_{false};
-    TaggedValue lexical_this_{TaggedValue::Undefined()};
-    TaggedValue lexical_new_target_{TaggedValue::Undefined()};
-    MemoryCharge with_storage_;
-    std::vector<JSObject*> with_stack_;
+    std::unique_ptr<FunctionData> fn_data_{nullptr};
 };
 
-/**
- * @brief Managed ECMAScript Generator Object suspended/resumed across yield points.
- */
+static_assert(sizeof(JSFunction) == 64, "sizeof(JSFunction) must be 64 bytes");
+
 class JSGeneratorObject : public JSObject {
 public:
     enum class State : uint8_t {

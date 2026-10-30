@@ -3,6 +3,7 @@
 
 #include "aether/common.h"
 #include "aether/value.h"
+#include "aether/memory_budget.h"
 #include <unordered_map>
 #include <string>
 #include <string_view>
@@ -90,7 +91,7 @@ public:
         return raw_ptr;
     }
 
-    static constexpr uint32_t kDefaultInObjectProperties = 4;
+    static constexpr uint32_t kDefaultInObjectProperties = 2;
 
 private:
     uint32_t id_;
