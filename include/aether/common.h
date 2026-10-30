@@ -58,6 +58,22 @@ inline constexpr size_t kHeapReservationSize = 4ULL * 1024ULL * 1024ULL * 1024UL
 #define AETHER_NO_SANITIZE_ADDRESS
 #endif
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#pragma intrinsic(_AddressOfReturnAddress)
+#endif
+
+AETHER_ALWAYS_INLINE void* GetCurrentStackPointer() noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_frame_address(0);
+#elif defined(_MSC_VER)
+    return _AddressOfReturnAddress();
+#else
+    volatile uintptr_t marker = 0;
+    return const_cast<uintptr_t*>(&marker);
+#endif
+}
+
 // Compiler tail-call optimization attribute for direct-threaded dispatch
 #if defined(__clang__)
 #define AETHER_MUSTTAIL [[clang::musttail]]

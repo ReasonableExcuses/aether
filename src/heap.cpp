@@ -4,6 +4,24 @@
 #include <algorithm>
 #include <setjmp.h>
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define AETHER_ASAN_ACTIVE 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define AETHER_ASAN_ACTIVE 1
+#endif
+
+#if defined(AETHER_ASAN_ACTIVE) && (defined(__GNUC__) || defined(__clang__))
+#if defined(__has_include)
+#if __has_include(<sanitizer/asan_interface.h>)
+#include <sanitizer/asan_interface.h>
+#define AETHER_HAS_ASAN_INTERFACE 1
+#endif
+#endif
+#endif
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -729,17 +747,23 @@ void IsolateHeap::ScanStack(const std::function<void(HeapObject*)>& on_root) {
     RtlCaptureContext(&win_context);
 #endif
 
-    volatile uintptr_t sp_marker = 0;
-    uintptr_t sp = reinterpret_cast<uintptr_t>(&sp_marker) & ~(sizeof(void*) - 1);
+    uintptr_t sp = reinterpret_cast<uintptr_t>(GetCurrentStackPointer()) & ~(sizeof(void*) - 1);
     uintptr_t base = reinterpret_cast<uintptr_t>(base_ptr);
-    if (sp > base) {
-        std::swap(sp, base);
+
+    // Stacks grow downward on all supported targets (x86-64, ARM64):
+    // stack_base_ (caller) must be greater than current sp (callee).
+    if (sp >= base) {
+        return;
     }
 
     constexpr size_t kMaxScanWords = (8 * 1024 * 1024) / sizeof(uintptr_t);
     if ((base - sp) / sizeof(uintptr_t) > kMaxScanWords) {
-        base = sp + kMaxScanWords * sizeof(uintptr_t);
+        return;
     }
+
+#if defined(AETHER_HAS_ASAN_INTERFACE)
+    void* fake_stack = __asan_get_current_fake_stack();
+#endif
 
     auto* current = reinterpret_cast<uintptr_t*>(sp);
     auto* limit   = reinterpret_cast<uintptr_t*>(base);
@@ -766,6 +790,37 @@ void IsolateHeap::ScanStack(const std::function<void(HeapObject*)>& on_root) {
                 }
             }
         }
+
+#if defined(AETHER_HAS_ASAN_INTERFACE)
+        if (fake_stack != nullptr && word != 0) {
+            void* beg = nullptr;
+            void* end = nullptr;
+            void* real_frame = __asan_addr_is_in_fake_stack(fake_stack, reinterpret_cast<void*>(word), &beg, &end);
+            if (real_frame != nullptr && beg != nullptr && end != nullptr && beg < end) {
+                auto* f_cur = reinterpret_cast<uintptr_t*>(beg);
+                auto* f_lim = reinterpret_cast<uintptr_t*>(end);
+                while (f_cur < f_lim) {
+                    uintptr_t f_word = *f_cur++;
+                    if (f_word != 0 && (f_word & (kObjectAlignment - 1)) == 0) {
+                        void* r_ptr = reinterpret_cast<void*>(f_word);
+                        if (IsValidObjectStart(r_ptr)) {
+                            on_root(static_cast<HeapObject*>(r_ptr));
+                            continue;
+                        }
+                    }
+                    if ((f_word & TaggedValue::kTagMask) == TaggedValue::kTagHeapObject) {
+                        uintptr_t f_payload = f_word & TaggedValue::kPayloadMask;
+                        if (f_payload != 0 && (f_payload & (kObjectAlignment - 1)) == 0) {
+                            void* t_ptr = reinterpret_cast<void*>(f_payload);
+                            if (IsValidObjectStart(t_ptr)) {
+                                on_root(static_cast<HeapObject*>(t_ptr));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#endif
     }
 }
 

@@ -779,8 +779,8 @@ bool Interpreter::IsLooselyEqual(TaggedValue x, TaggedValue y) {
 }
 
 TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vector<TaggedValue>& args, TaggedValue this_val, LexicalEnvironment* env) {
-    char stack_marker;
-    NativeStackGuard stack_guard(&stack_marker);
+    void* stack_marker = GetCurrentStackPointer();
+    NativeStackGuard stack_guard(stack_marker);
     struct StackScope {
         IsolateHeap& heap;
         void* prev;
@@ -790,7 +790,7 @@ TaggedValue Interpreter::Execute(const BytecodeArray& bytecode, const std::vecto
         ~StackScope() {
             if (!prev) heap.SetStackBase(nullptr);
         }
-    } stack_scope(ExecutionHeap(), &stack_marker);
+    } stack_scope(ExecutionHeap(), stack_marker);
     try {
         InitializeResourceExceptions();
         if (stack_guard.exhausted || call_depth_ >= kMaxCallDepth) {
@@ -948,8 +948,8 @@ TaggedValue Interpreter::ExecuteImpl(const BytecodeArray& bytecode, const std::v
 }
 
 TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sent_val, bool is_rejection, bool* out_is_await) {
-    char stack_marker;
-    NativeStackGuard stack_guard(&stack_marker);
+    void* stack_marker = GetCurrentStackPointer();
+    NativeStackGuard stack_guard(stack_marker);
     struct StackScope {
         IsolateHeap& heap;
         void* prev;
@@ -959,7 +959,7 @@ TaggedValue Interpreter::ResumeGenerator(JSGeneratorObject* gen, TaggedValue sen
         ~StackScope() {
             if (!prev) heap.SetStackBase(nullptr);
         }
-    } stack_scope(ExecutionHeap(), &stack_marker);
+    } stack_scope(ExecutionHeap(), stack_marker);
     try {
         InitializeResourceExceptions();
         if (stack_guard.exhausted || call_depth_ >= kMaxCallDepth) {

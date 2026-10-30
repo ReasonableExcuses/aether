@@ -352,8 +352,8 @@ void TestConservativeStackScanning() {
     Assert(!heap.IsValidObjectStart(reinterpret_cast<void*>(0x12345)), "heap.IsValidObjectStart must return false for random address");
 
     // 2. Set stack base to current frame marker to enable conservative stack scan
-    volatile int stack_marker = 0;
-    heap.SetStackBase(const_cast<int*>(&stack_marker));
+    void* stack_marker = GetCurrentStackPointer();
+    heap.SetStackBase(stack_marker);
 
     // Allocate an object in C++ local variable without any HandleScope or extra roots
     JSObject* raw_local_obj = heap.AllocateOld<JSObject>(nullptr);
