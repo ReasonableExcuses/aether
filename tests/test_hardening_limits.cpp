@@ -98,7 +98,7 @@ void TestArrayLimitsAndAtomicFailure() {
     JSArray array(&root, 3);
     array.SetElement(0, TaggedValue::FromSmi(17));
     const size_t before = state->ChargedBytes();
-    const auto* data = array.Elements().data();
+    const auto* data = array.Data();
     ExpectLengthError([&] { array.SetLength(kMaxArrayLength + 1); });
     ExpectLengthError([&] { array.SetElement(kMaxArrayLength, TaggedValue::True()); });
     ExpectLengthError([&] { array.SetElement(std::numeric_limits<size_t>::max(), TaggedValue::True()); });
@@ -106,12 +106,12 @@ void TestArrayLimitsAndAtomicFailure() {
     {
         BudgetLimit limit(before + 1);
         ExpectLengthError([&] { array.SetLength(100); });
-        array.SetLength(array.Elements().capacity());
+        array.SetLength(array.Capacity());
         ExpectLengthError([&] { array.Push(TaggedValue::True()); });
         array.SetLength(3);
     }
     assert(array.Length() == 3 && array.GetElement(0).AsSmi() == 17);
-    assert(array.Elements().data() == data);
+    assert(array.Data() == data);
     assert(state->ChargedBytes() == before);
     uint32_t sid = 1;
     ExpectLengthError([&] { array.SetNamedProperty("length", TaggedValue::FromDouble(3.5), sid); });
@@ -320,6 +320,7 @@ void TestCollectionRelocationAndBudgetOwnership() {
         assert(moved->GetNamedProperty(key).AsSmi() == 21 && !moved->IsExtensible());
         moved->~JSArray();
     }
+    heap.MajorGC();
     assert(state->ChargedBytes() == baseline);
     {
         JSMap map(&root);

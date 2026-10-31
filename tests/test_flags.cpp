@@ -294,6 +294,7 @@ void TestMarkingEngine() {
     arr->SetElement(1, TaggedValue::FromHeapObject(heap.AllocateOld<JSObject>(nullptr)));
     arr->SetElement(2, TaggedValue::FromHeapObject(heap.AllocateOld<JSObject>(nullptr)));
     arr->IteratePointers(&counter);
+    if (arr->ElementsArray()) arr->ElementsArray()->IteratePointers(&counter);
     Assert(counter.count >= 3, "SlotVisitor must visit all array element slots");
 
     // 2. Verify O(1) Immix line marking directly via block header

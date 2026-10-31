@@ -119,9 +119,7 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
         size_t idx = 0;
         if (TryParseArrayIndex(key, idx)) {
             const auto* arr = static_cast<const JSArray*>(this);
-            if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
-                return arr->Elements()[idx];
-            }
+            return arr->GetElement(idx);
         }
     } else if (IsMap()) {
         if (key == "size") {
@@ -257,9 +255,7 @@ bool JSObject::HasNamedProperty(std::string_view key) const {
         size_t idx = 0;
         if (TryParseArrayIndex(key, idx)) {
             const auto* arr = static_cast<const JSArray*>(this);
-            if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
-                return true;
-            }
+            return arr->HasElement(idx);
         }
     } else if (IsMap()) {
         if (key == "size") return true;
@@ -399,7 +395,7 @@ bool JSObject::HasOwnProperty(std::string_view key) const {
         size_t idx = 0;
         if (TryParseArrayIndex(key, idx)) {
             const auto* arr = static_cast<const JSArray*>(this);
-            return idx < arr->Length() && !arr->Elements()[idx].IsEmpty();
+            return arr->HasElement(idx);
         }
     } else if (IsFunction()) {
         if (key == "length" || key == "name") return true;
@@ -540,7 +536,7 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
     if (IsArray()) {
         const auto* arr = static_cast<const JSArray*>(this);
         for (size_t i = 0; i < arr->Length(); ++i) {
-            if (!arr->Elements()[i].IsEmpty()) {
+            if (arr->HasElement(i)) {
                 add_key(std::to_string(i));
             }
         }
@@ -1160,6 +1156,287 @@ JSTypedArray* JSTypedArray::Subarray(int64_t begin, int64_t end, Shape* shape) c
     result->buffer_ = scope ? source.Get() : buffer;
     if (result->IsOld()) RecordWriteBarrier(result, TaggedValue::FromHeapObject(result->buffer_));
     return result;
+}
+
+
+JSArray::JSArray(Shape* shape, size_t initial_capacity)
+    : JSObject(HeapObjectType::JSArray, shape) {
+    if (AETHER_UNLIKELY(initial_capacity > kMaxArrayLength)) {
+        throw std::length_error("array length exceeds maximum");
+    }
+    if (initial_capacity > 0) {
+        elements_ = AllocateRuntimeFixedArrayFor(this,
+                                                 static_cast<uint32_t>(initial_capacity),
+                                                 static_cast<uint32_t>(initial_capacity),
+                                                 TaggedValue::Empty());
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    }
+}
+
+JSArray::JSArray(Shape* shape, const std::vector<TaggedValue>& elements)
+    : JSObject(HeapObjectType::JSArray, shape) {
+    if (AETHER_UNLIKELY(elements.size() > kMaxArrayLength)) {
+        throw std::length_error("array length exceeds maximum");
+    }
+    uint32_t len = static_cast<uint32_t>(elements.size());
+    if (len > 0) {
+        elements_ = AllocateRuntimeFixedArrayFor(this, len, len, TaggedValue::Empty());
+        std::memcpy(elements_->elements(), elements.data(), len * sizeof(TaggedValue));
+        if (AETHER_UNLIKELY(IsOld())) {
+            if (elements_->IsYoung()) {
+                RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+            }
+            for (auto val : elements) {
+                if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+            }
+        }
+    }
+}
+
+JSArray::JSArray(Shape* shape, std::vector<TaggedValue>&& elements)
+    : JSArray(shape, elements) {}
+
+void JSArray::SetLength(size_t len) {
+    if (AETHER_UNLIKELY(len > kMaxArrayLength)) {
+        throw std::length_error("array length exceeds the maximum length");
+    }
+    uint32_t new_len = static_cast<uint32_t>(len);
+    if (!elements_) {
+        if (new_len > 0) {
+            elements_ = AllocateRuntimeFixedArrayFor(this, new_len, new_len, TaggedValue::Empty());
+            if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+                RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+            }
+        }
+        return;
+    }
+    if (new_len <= elements_->Capacity()) {
+        uint32_t old_len = elements_->Length();
+        if (new_len > old_len) {
+            for (uint32_t i = old_len; i < new_len; ++i) {
+                elements_->elements()[i] = TaggedValue::Empty();
+            }
+        } else if (new_len < old_len) {
+            for (uint32_t i = new_len; i < old_len; ++i) {
+                elements_->elements()[i] = TaggedValue::Empty();
+            }
+        }
+        elements_->SetLength(new_len);
+    } else {
+        uint32_t old_len = elements_->Length();
+        uint32_t old_cap = elements_->Capacity();
+        uint32_t new_cap = std::max(new_len, old_cap * 2);
+        FixedArray* new_elements = AllocateRuntimeFixedArrayFor(elements_, new_len, new_cap, TaggedValue::Empty());
+        std::memcpy(new_elements->elements(), elements_->elements(), old_len * sizeof(TaggedValue));
+        elements_ = new_elements;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    }
+}
+
+void JSArray::SetElement(size_t index, TaggedValue val) {
+    if (AETHER_UNLIKELY(index >= kMaxArrayLength)) {
+        throw std::length_error("array index exceeds the maximum length");
+    }
+    uint32_t idx = static_cast<uint32_t>(index);
+    uint32_t needed_len = idx + 1;
+    if (!elements_) {
+        uint32_t initial_cap = std::max<uint32_t>(4, needed_len);
+        elements_ = AllocateRuntimeFixedArrayFor(this, needed_len, initial_cap, TaggedValue::Empty());
+        elements_->elements()[idx] = val;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    } else if (needed_len > elements_->Capacity()) {
+        uint32_t old_len = elements_->Length();
+        uint32_t old_cap = elements_->Capacity();
+        uint32_t new_cap = std::max(needed_len, old_cap * 2);
+        FixedArray* new_elements = AllocateRuntimeFixedArrayFor(elements_, needed_len, new_cap, TaggedValue::Empty());
+        std::memcpy(new_elements->elements(), elements_->elements(), old_len * sizeof(TaggedValue));
+        new_elements->elements()[idx] = val;
+        elements_ = new_elements;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    } else {
+        if (needed_len > elements_->Length()) {
+            uint32_t old_len = elements_->Length();
+            for (uint32_t i = old_len; i < needed_len; ++i) {
+                elements_->elements()[i] = TaggedValue::Empty();
+            }
+            elements_->SetLength(needed_len);
+        }
+        elements_->elements()[idx] = val;
+    }
+    if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
+        RecordWriteBarrier(this, val);
+    }
+}
+
+void JSArray::Push(TaggedValue val) {
+    if (AETHER_UNLIKELY(Length() >= kMaxArrayLength)) {
+        throw std::length_error("array length exceeds the maximum length");
+    }
+    uint32_t cur_len = elements_ ? elements_->Length() : 0;
+    SetElement(cur_len, val);
+}
+
+TaggedValue JSArray::Pop() {
+    if (!elements_ || elements_->Length() == 0) return TaggedValue::Undefined();
+    uint32_t last_idx = elements_->Length() - 1;
+    TaggedValue last = elements_->elements()[last_idx];
+    elements_->elements()[last_idx] = TaggedValue::Empty();
+    elements_->SetLength(last_idx);
+    return last.IsEmpty() ? TaggedValue::Undefined() : last;
+}
+
+TaggedValue JSArray::Shift() {
+    if (!elements_ || elements_->Length() == 0) return TaggedValue::Undefined();
+    TaggedValue first = elements_->elements()[0];
+    uint32_t old_len = elements_->Length();
+    if (old_len > 1) {
+        std::memmove(elements_->elements(), elements_->elements() + 1, (old_len - 1) * sizeof(TaggedValue));
+    }
+    elements_->elements()[old_len - 1] = TaggedValue::Empty();
+    elements_->SetLength(old_len - 1);
+    return first.IsEmpty() ? TaggedValue::Undefined() : first;
+}
+
+void JSArray::Unshift(const TaggedValue* items, size_t count) {
+    if (count == 0) return;
+    if (AETHER_UNLIKELY(Length() + count > kMaxArrayLength)) {
+        throw std::length_error("array length exceeds maximum");
+    }
+    uint32_t cnt = static_cast<uint32_t>(count);
+    uint32_t old_len = elements_ ? elements_->Length() : 0;
+    uint32_t new_len = old_len + cnt;
+    if (!elements_ || new_len > elements_->Capacity()) {
+        uint32_t old_cap = elements_ ? elements_->Capacity() : 0;
+        uint32_t new_cap = std::max(new_len, old_cap * 2);
+        FixedArray* new_elements = AllocateRuntimeFixedArrayFor(elements_ ? (const void*)elements_ : (const void*)this,
+                                                                new_len, new_cap, TaggedValue::Empty());
+        if (old_len > 0) {
+            std::memcpy(new_elements->elements() + cnt, elements_->elements(), old_len * sizeof(TaggedValue));
+        }
+        std::memcpy(new_elements->elements(), items, cnt * sizeof(TaggedValue));
+        elements_ = new_elements;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    } else {
+        if (old_len > 0) {
+            std::memmove(elements_->elements() + cnt, elements_->elements(), old_len * sizeof(TaggedValue));
+        }
+        std::memcpy(elements_->elements(), items, cnt * sizeof(TaggedValue));
+        elements_->SetLength(new_len);
+    }
+    if (AETHER_UNLIKELY(IsOld())) {
+        for (size_t i = 0; i < count; ++i) {
+            if (items[i].IsHeapObject()) RecordWriteBarrier(this, items[i]);
+        }
+    }
+}
+
+void JSArray::Reverse() {
+    if (elements_ && elements_->Length() > 1) {
+        std::reverse(elements_->elements(), elements_->elements() + elements_->Length());
+    }
+}
+
+void JSArray::Splice(size_t start, size_t delete_count, const TaggedValue* items, size_t insert_count) {
+    uint32_t old_len = elements_ ? elements_->Length() : 0;
+    if (start > old_len) start = old_len;
+    if (start + delete_count > old_len) delete_count = old_len - start;
+    if (AETHER_UNLIKELY(static_cast<uint64_t>(old_len) - delete_count + insert_count > kMaxArrayLength)) {
+        throw std::length_error("array length exceeds maximum");
+    }
+    uint32_t new_len = static_cast<uint32_t>(old_len - delete_count + insert_count);
+    size_t tail = old_len - (start + delete_count);
+    if (!elements_ || new_len > elements_->Capacity()) {
+        uint32_t old_cap = elements_ ? elements_->Capacity() : 0;
+        uint32_t new_cap = std::max(new_len, old_cap * 2);
+        FixedArray* new_elements = AllocateRuntimeFixedArrayFor(elements_ ? (const void*)elements_ : (const void*)this,
+                                                                new_len, new_cap, TaggedValue::Empty());
+        if (start > 0 && elements_) {
+            std::memcpy(new_elements->elements(), elements_->elements(), start * sizeof(TaggedValue));
+        }
+        if (insert_count > 0 && items) {
+            std::memcpy(new_elements->elements() + start, items, insert_count * sizeof(TaggedValue));
+        }
+        if (tail > 0 && elements_) {
+            std::memcpy(new_elements->elements() + start + insert_count,
+                        elements_->elements() + start + delete_count,
+                        tail * sizeof(TaggedValue));
+        }
+        elements_ = new_elements;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    } else {
+        if (tail > 0) {
+            std::memmove(elements_->elements() + start + insert_count,
+                         elements_->elements() + start + delete_count,
+                         tail * sizeof(TaggedValue));
+        }
+        if (insert_count > 0 && items) {
+            std::memcpy(elements_->elements() + start, items, insert_count * sizeof(TaggedValue));
+        }
+        if (new_len < old_len) {
+            for (uint32_t i = new_len; i < old_len; ++i) {
+                elements_->elements()[i] = TaggedValue::Empty();
+            }
+        }
+        elements_->SetLength(new_len);
+    }
+    if (AETHER_UNLIKELY(IsOld() && insert_count > 0 && items)) {
+        for (size_t i = 0; i < insert_count; ++i) {
+            if (items[i].IsHeapObject()) RecordWriteBarrier(this, items[i]);
+        }
+    }
+}
+
+void JSArray::ReserveElements(size_t length) {
+    if (AETHER_UNLIKELY(length > kMaxArrayLength)) {
+        throw std::length_error("array capacity exceeds the maximum length");
+    }
+    uint32_t new_cap = static_cast<uint32_t>(length);
+    if (!elements_) {
+        if (new_cap > 0) {
+            elements_ = AllocateRuntimeFixedArrayFor(this, 0, new_cap, TaggedValue::Empty());
+            if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+                RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+            }
+        }
+        return;
+    }
+    if (new_cap > elements_->Capacity()) {
+        uint32_t old_len = elements_->Length();
+        FixedArray* new_elements = AllocateRuntimeFixedArrayFor(elements_, old_len, new_cap, TaggedValue::Empty());
+        std::memcpy(new_elements->elements(), elements_->elements(), old_len * sizeof(TaggedValue));
+        elements_ = new_elements;
+        if (AETHER_UNLIKELY(IsOld() && elements_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        }
+    }
+}
+
+void JSArray::ReplaceElements(const std::vector<TaggedValue>& elements) {
+    uint32_t len = static_cast<uint32_t>(elements.size());
+    if (len == 0) {
+        if (elements_) elements_->SetLength(0);
+        return;
+    }
+    elements_ = AllocateRuntimeFixedArrayFor(this, len, len, TaggedValue::Empty());
+    std::memcpy(elements_->elements(), elements.data(), len * sizeof(TaggedValue));
+    if (IsOld()) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(elements_));
+        for (auto val : elements) {
+            if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+        }
+    }
 }
 
 } // namespace aether

@@ -626,9 +626,7 @@ bool HasProperty(TaggedValue obj, std::string_view key) {
         if (key == "length") return true;
         try {
             size_t idx = std::stoull(std::string(key));
-            if (idx < arr->Length()) {
-                return !arr->Elements()[idx].IsEmpty();
-            }
+            return arr->HasElement(idx);
         } catch (...) {}
     }
     if (ho->IsJSObject()) {
@@ -1532,10 +1530,7 @@ static TaggedValue Array_shift(TaggedValue this_val, const std::vector<TaggedVal
     if (!obj) return TaggedValue::Undefined();
     if (obj->IsArray()) {
         auto* arr = static_cast<JSArray*>(obj);
-        if (arr->Length() == 0) return TaggedValue::Undefined();
-        TaggedValue first = arr->GetElement(0);
-        arr->Elements().erase(arr->Elements().begin());
-        return first;
+        return arr->Shift();
     }
     uint64_t len = ToLength(obj->GetNamedProperty("length"));
     if (len == 0) {
@@ -1564,12 +1559,7 @@ static TaggedValue Array_unshift(TaggedValue this_val, const std::vector<TaggedV
     if (!obj) return TaggedValue::Undefined();
     if (obj->IsArray()) {
         auto* arr = static_cast<JSArray*>(obj);
-        arr->Elements().insert(arr->Elements().begin(), args.begin(), args.end());
-        if (arr->IsOld()) {
-            for (const auto& arg : args) {
-                if (arg.IsHeapObject()) RecordWriteBarrier(arr, arg);
-            }
-        }
+        arr->Unshift(args.data(), args.size());
         uint64_t new_len = arr->Length();
         return new_len <= 0x7FFFFFFF ? TaggedValue::FromSmi(static_cast<int32_t>(new_len)) : TaggedValue::FromDouble(static_cast<double>(new_len));
     }
@@ -1704,7 +1694,7 @@ static TaggedValue Array_reverse(TaggedValue this_val, const std::vector<TaggedV
     if (!obj) return TaggedValue::Undefined();
     if (obj->IsArray()) {
         auto* arr = static_cast<JSArray*>(obj);
-        std::reverse(arr->Elements().begin(), arr->Elements().end());
+        arr->Reverse();
         return this_val;
     }
     uint64_t len = ToLength(obj->GetNamedProperty("length"));
@@ -1781,8 +1771,8 @@ static TaggedValue Array_map(TaggedValue this_val, const std::vector<TaggedValue
         bool present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 present = true;
             }
         } else {
@@ -1823,8 +1813,8 @@ static TaggedValue Array_filter(TaggedValue this_val, const std::vector<TaggedVa
         bool present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 present = true;
             }
         } else {
@@ -1863,8 +1853,8 @@ static TaggedValue Array_forEach(TaggedValue this_val, const std::vector<TaggedV
         bool present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 present = true;
             }
         } else {
@@ -1903,8 +1893,8 @@ static TaggedValue Array_reduce(TaggedValue this_val, const std::vector<TaggedVa
         while (k < len) {
             if (obj->IsArray()) {
                 auto* arr = static_cast<JSArray*>(obj);
-                if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                    acc = arr->Elements()[k];
+                if (arr->HasElement(k)) {
+                    acc = arr->GetElement(k);
                     k_present = true;
                     k++;
                     break;
@@ -1933,8 +1923,8 @@ static TaggedValue Array_reduce(TaggedValue this_val, const std::vector<TaggedVa
         bool k_present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 k_present = true;
             }
         } else {
@@ -1983,8 +1973,8 @@ static TaggedValue Array_reduceRight(TaggedValue this_val, const std::vector<Tag
         while (k >= 0) {
             if (obj->IsArray()) {
                 auto* arr = static_cast<JSArray*>(obj);
-                if (static_cast<size_t>(k) < arr->Length() && static_cast<size_t>(k) < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                    acc = arr->Elements()[k];
+                if (arr->HasElement(static_cast<size_t>(k))) {
+                    acc = arr->GetElement(static_cast<size_t>(k));
                     k_present = true;
                     k--;
                     break;
@@ -2013,8 +2003,8 @@ static TaggedValue Array_reduceRight(TaggedValue this_val, const std::vector<Tag
         bool k_present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (static_cast<size_t>(k) < arr->Length() && static_cast<size_t>(k) < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(static_cast<size_t>(k))) {
+                k_val = arr->GetElement(static_cast<size_t>(k));
                 k_present = true;
             }
         } else {
@@ -2053,8 +2043,8 @@ static TaggedValue Array_some(TaggedValue this_val, const std::vector<TaggedValu
         bool k_present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 k_present = true;
             }
         } else {
@@ -2091,8 +2081,8 @@ static TaggedValue Array_every(TaggedValue this_val, const std::vector<TaggedVal
         bool k_present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                k_val = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                k_val = arr->GetElement(k);
                 k_present = true;
             }
         } else {
@@ -2197,8 +2187,8 @@ static TaggedValue Array_copyWithin(TaggedValue this_val, const std::vector<Tagg
         bool from_present = false;
         if (obj->IsArray()) {
             auto* arr = static_cast<JSArray*>(obj);
-            if (static_cast<size_t>(from) < arr->Length() && static_cast<size_t>(from) < arr->Elements().size() && !arr->Elements()[from].IsEmpty()) {
-                from_val = arr->Elements()[from];
+            if (arr->HasElement(static_cast<size_t>(from))) {
+                from_val = arr->GetElement(static_cast<size_t>(from));
                 from_present = true;
             }
         } else {
@@ -2247,8 +2237,8 @@ static void FlattenIntoArray(JSArray* target, JSObject* source, uint64_t source_
         bool present = false;
         if (source->IsArray()) {
             auto* arr = static_cast<JSArray*>(source);
-            if (k < arr->Length() && k < arr->Elements().size() && !arr->Elements()[k].IsEmpty()) {
-                element = arr->Elements()[k];
+            if (arr->HasElement(k)) {
+                element = arr->GetElement(k);
                 present = true;
             }
         } else {
@@ -2411,21 +2401,9 @@ static TaggedValue Array_splice(TaggedValue this_val, const std::vector<TaggedVa
             removed.push_back(arr->GetElement(static_cast<size_t>(start + i)));
         }
 
-        std::vector<TaggedValue>& elems = arr->Elements();
-        std::vector<TaggedValue> items_to_insert;
-        if (args.size() > 2) {
-            items_to_insert.assign(args.begin() + 2, args.end());
-        }
-
-        auto it = elems.begin() + start;
-        elems.erase(it, it + delete_count);
-        elems.insert(elems.begin() + start, items_to_insert.begin(), items_to_insert.end());
-        if (arr->IsOld()) {
-            for (const auto& item : items_to_insert) {
-                if (item.IsHeapObject()) RecordWriteBarrier(arr, item);
-            }
-        }
-        arr->SetLength(elems.size());
+        const TaggedValue* items_to_insert = (args.size() > 2) ? (args.data() + 2) : nullptr;
+        size_t insert_count = (args.size() > 2) ? (args.size() - 2) : 0;
+        arr->Splice(static_cast<size_t>(start), static_cast<size_t>(delete_count), items_to_insert, insert_count);
 
         auto* new_arr = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, std::move(removed));
         if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
@@ -2501,24 +2479,27 @@ static TaggedValue Array_sort(TaggedValue this_val, const std::vector<TaggedValu
     }
     if (obj->IsArray()) {
         auto* arr = static_cast<JSArray*>(obj);
-        std::vector<TaggedValue>& elems = arr->Elements();
-        if (compare_fn.IsHeapObject() && compare_fn.AsHeapObject()->IsFunction()) {
-            std::stable_sort(elems.begin(), elems.end(), [&](const TaggedValue& a, const TaggedValue& b) {
-                if (a.IsUndefined() && b.IsUndefined()) return false;
-                if (a.IsUndefined()) return false;
-                if (b.IsUndefined()) return true;
-                std::vector<TaggedValue> cmp_args = {a, b};
-                TaggedValue res = CallFunction(compare_fn, TaggedValue::Undefined(), cmp_args);
-                double d = res.ToDouble();
-                return d < 0;
-            });
-        } else {
-            std::stable_sort(elems.begin(), elems.end(), [](const TaggedValue& a, const TaggedValue& b) {
-                if (a.IsUndefined() && b.IsUndefined()) return false;
-                if (a.IsUndefined()) return false;
-                if (b.IsUndefined()) return true;
-                return a.ToString() < b.ToString();
-            });
+        if (arr->Length() > 1 && arr->Data()) {
+            TaggedValue* data = arr->Data();
+            size_t len = arr->Length();
+            if (compare_fn.IsHeapObject() && compare_fn.AsHeapObject()->IsFunction()) {
+                std::stable_sort(data, data + len, [&](const TaggedValue& a, const TaggedValue& b) {
+                    if (a.IsUndefined() && b.IsUndefined()) return false;
+                    if (a.IsUndefined()) return false;
+                    if (b.IsUndefined()) return true;
+                    std::vector<TaggedValue> cmp_args = {a, b};
+                    TaggedValue res = CallFunction(compare_fn, TaggedValue::Undefined(), cmp_args);
+                    double d = res.ToDouble();
+                    return d < 0;
+                });
+            } else {
+                std::stable_sort(data, data + len, [](const TaggedValue& a, const TaggedValue& b) {
+                    if (a.IsUndefined() && b.IsUndefined()) return false;
+                    if (a.IsUndefined()) return false;
+                    if (b.IsUndefined()) return true;
+                    return a.ToString() < b.ToString();
+                });
+            }
         }
     }
     return this_val;
@@ -3035,7 +3016,7 @@ static TaggedValue Object_propertyIsEnumerable(TaggedValue this_val, const std::
                     if (is_digits(key)) {
                         size_t idx = static_cast<size_t>(std::stoull(key));
                         auto* arr = static_cast<const JSArray*>(obj);
-                        if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
+                        if (arr->HasElement(idx)) {
                             has_own = true;
                         }
                     }

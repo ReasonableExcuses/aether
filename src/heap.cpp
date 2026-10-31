@@ -76,9 +76,23 @@ namespace aether {
 #endif
 
 static thread_local IsolateHeap* s_current_heap_{nullptr};
+static thread_local std::vector<IsolateHeap*> s_active_heaps;
 
 IsolateHeap* IsolateHeap::Current() noexcept { return s_current_heap_; }
 void IsolateHeap::SetCurrent(IsolateHeap* heap) noexcept { s_current_heap_ = heap; }
+
+IsolateHeap* IsolateHeap::HeapForObject(const void* ptr) noexcept {
+    if (!ptr) return nullptr;
+    if (s_current_heap_ && s_current_heap_->Contains(ptr)) {
+        return s_current_heap_;
+    }
+    for (auto it = s_active_heaps.rbegin(); it != s_active_heaps.rend(); ++it) {
+        if (*it && (*it)->Contains(ptr)) {
+            return *it;
+        }
+    }
+    return nullptr;
+}
 
 std::shared_ptr<MemoryBudgetState> CurrentMemoryBudgetState() noexcept {
     return IsolateHeap::Current() ? IsolateHeap::Current()->BudgetState() : nullptr;
@@ -147,6 +161,7 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     stack_base_ = nullptr;
     previous_current_heap_ = s_current_heap_;
     s_current_heap_ = this;
+    s_active_heaps.push_back(this);
 }
 
 IsolateHeap::~IsolateHeap() {
@@ -158,6 +173,10 @@ IsolateHeap::~IsolateHeap() {
     remembered_set_.clear();
     weak_containers_.clear();
     old_gen_.DestroyAll();
+    auto it = std::find(s_active_heaps.begin(), s_active_heaps.end(), this);
+    if (it != s_active_heaps.end()) {
+        s_active_heaps.erase(it);
+    }
     if (s_current_heap_ == this) {
         s_current_heap_ = previous_current_heap_;
     }

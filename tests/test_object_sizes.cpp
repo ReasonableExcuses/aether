@@ -101,9 +101,13 @@ void TestArrayMemoryDiet() {
     JSArray empty_array(&root_shape, 0);
     assert(empty_array.Length() == 0);
     assert(empty_array.ObjectSize() == sizeof(JSArray));
+    assert(empty_array.ElementsArray() == nullptr);
 
     JSArray array(&root_shape, 2);
     assert(array.Length() == 2);
+    assert(array.ElementsArray() != nullptr);
+    assert(array.ElementsArray()->IsFixedArray());
+    assert(array.ElementsArray()->Length() == 2);
     array.SetElement(0, TaggedValue::FromSmi(100));
     array.SetElement(1, TaggedValue::FromSmi(200));
 

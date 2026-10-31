@@ -940,159 +940,57 @@ static_assert(sizeof(JSObject) == 56, "sizeof(JSObject) must be 56 bytes");
 
 class JSArray : public JSObject {
 public:
-    struct ArrayStorage {
-        MemoryCharge elements_storage;
-        std::vector<TaggedValue> elements;
-
-        explicit ArrayStorage(size_t initial_capacity = 0)
-            : elements_storage(CheckedStorageBytes(initial_capacity, sizeof(TaggedValue))),
-              elements(initial_capacity, TaggedValue::Empty()) {
-            elements_storage.Resize(CheckedStorageBytes(elements.capacity(), sizeof(TaggedValue)));
-        }
-        explicit ArrayStorage(const std::vector<TaggedValue>& elems)
-            : elements_storage(CheckedStorageBytes(elems.size(), sizeof(TaggedValue))),
-              elements(elems) {
-            elements_storage.Resize(CheckedStorageBytes(elements.capacity(), sizeof(TaggedValue)));
-        }
-        explicit ArrayStorage(std::vector<TaggedValue>&& elems)
-            : elements_storage(CheckedStorageBytes(elems.capacity(), sizeof(TaggedValue))),
-              elements(std::move(elems)) {}
-    };
-
-    explicit JSArray(Shape* shape, size_t initial_capacity = 0)
-        : JSObject(HeapObjectType::JSArray, shape) {
-        if (AETHER_UNLIKELY(initial_capacity > kMaxArrayLength)) {
-            throw std::length_error("array length exceeds maximum");
-        }
-        if (initial_capacity > 0) {
-            array_storage_ = std::make_unique<ArrayStorage>(initial_capacity);
-        }
-    }
-
-    explicit JSArray(Shape* shape, const std::vector<TaggedValue>& elements)
-        : JSObject(HeapObjectType::JSArray, shape) {
-        if (AETHER_UNLIKELY(elements.size() > kMaxArrayLength)) {
-            throw std::length_error("array length exceeds maximum");
-        }
-        array_storage_ = std::make_unique<ArrayStorage>(elements);
-    }
-
-    explicit JSArray(Shape* shape, std::vector<TaggedValue>&& elements)
-        : JSObject(HeapObjectType::JSArray, shape) {
-        if (AETHER_UNLIKELY(elements.size() > kMaxArrayLength)) {
-            throw std::length_error("array length exceeds maximum");
-        }
-        array_storage_ = std::make_unique<ArrayStorage>(std::move(elements));
-    }
+    explicit JSArray(Shape* shape, size_t initial_capacity = 0);
+    explicit JSArray(Shape* shape, const std::vector<TaggedValue>& elements);
+    explicit JSArray(Shape* shape, std::vector<TaggedValue>&& elements);
 
     JSArray(JSArray&& other) noexcept
         : JSObject(std::move(other)),
-          array_storage_(std::move(other.array_storage_)) {}
+          elements_(other.elements_) {
+        other.elements_ = nullptr;
+    }
 
-    size_t Length() const noexcept { return array_storage_ ? array_storage_->elements.size() : 0; }
-    void SetLength(size_t len) {
-        if (AETHER_UNLIKELY(len > kMaxArrayLength)) {
-            throw std::length_error("array length exceeds the maximum length");
-        }
-        auto& storage = EnsureStorage();
-        if (len > storage.elements.capacity()) {
-            detail::ReserveStorage(storage.elements, storage.elements_storage, len);
-        }
-        storage.elements.resize(len, TaggedValue::Empty());
+    ~JSArray() override = default;
+
+    size_t Length() const noexcept { return elements_ ? elements_->Length() : 0; }
+    size_t Capacity() const noexcept { return elements_ ? elements_->Capacity() : 0; }
+    FixedArray* ElementsArray() const noexcept { return elements_; }
+    TaggedValue* Data() noexcept { return elements_ ? elements_->elements() : nullptr; }
+    const TaggedValue* Data() const noexcept { return elements_ ? elements_->elements() : nullptr; }
+
+    bool HasElement(size_t index) const noexcept {
+        return elements_ && index < elements_->Length() && !elements_->elements()[index].IsEmpty();
     }
 
     TaggedValue GetElement(size_t index) const {
-        if (array_storage_ && index < array_storage_->elements.size() && !array_storage_->elements[index].IsEmpty()) {
-            return array_storage_->elements[index];
+        if (elements_ && index < elements_->Length() && !elements_->elements()[index].IsEmpty()) {
+            return elements_->elements()[index];
         }
         return TaggedValue::Undefined();
     }
 
-    void SetElement(size_t index, TaggedValue val) {
-        if (AETHER_UNLIKELY(index >= kMaxArrayLength)) {
-            throw std::length_error("array index exceeds the maximum length");
-        }
-        auto& storage = EnsureStorage();
-        if (index >= storage.elements.size()) {
-            if (index + 1 > storage.elements.capacity()) {
-                detail::ReserveStorage(storage.elements, storage.elements_storage, index + 1);
-            }
-            storage.elements.resize(index + 1, TaggedValue::Empty());
-        }
-        storage.elements[index] = val;
-        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
-            RecordWriteBarrier(this, val);
-        }
-    }
-
-    void Push(TaggedValue val) {
-        if (AETHER_UNLIKELY(Length() >= kMaxArrayLength)) {
-            throw std::length_error("array length exceeds the maximum length");
-        }
-        auto& storage = EnsureStorage();
-        if (storage.elements.size() + 1 > storage.elements.capacity()) {
-            detail::ReserveStorage(storage.elements, storage.elements_storage, storage.elements.size() + 1);
-        }
-        storage.elements.push_back(val);
-        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
-            RecordWriteBarrier(this, val);
-        }
-    }
-
-    TaggedValue Pop() {
-        if (!array_storage_ || array_storage_->elements.empty()) return TaggedValue::Undefined();
-        TaggedValue last = array_storage_->elements.back();
-        array_storage_->elements.pop_back();
-        return last;
-    }
-
-    const std::vector<TaggedValue>& Elements() const noexcept {
-        static const std::vector<TaggedValue> kEmptyElements;
-        return array_storage_ ? array_storage_->elements : kEmptyElements;
-    }
-    std::vector<TaggedValue>& Elements() noexcept {
-        return EnsureStorage().elements;
-    }
-
-    void ReserveElements(size_t length) {
-        if (AETHER_UNLIKELY(length > kMaxArrayLength)) {
-            throw std::length_error("array capacity exceeds the maximum length");
-        }
-        auto& storage = EnsureStorage();
-        if (length > storage.elements.capacity()) {
-            detail::ReserveStorage(storage.elements, storage.elements_storage, length);
-            storage.elements.reserve(length);
-        }
-    }
-    void PrepareElementStorage(size_t new_size) {
-        auto& storage = EnsureStorage();
-        if (new_size > storage.elements.capacity()) {
-            detail::ReserveStorage(storage.elements, storage.elements_storage, new_size);
-        }
-    }
-    void ReplaceElements(const std::vector<TaggedValue>& elements) {
-        auto& storage = EnsureStorage();
-        if (&elements == &storage.elements) return;
-        storage.elements_storage.Resize(CheckedStorageBytes(elements.size(), sizeof(TaggedValue)));
-        storage.elements.assign(elements.begin(), elements.end());
-        RecordElementWrites();
-    }
-    void ReplaceElements(std::vector<TaggedValue>&& elements) {
-        auto& storage = EnsureStorage();
-        if (&elements == &storage.elements) return;
-        const size_t bytes = CheckedArrayStorage(elements);
-        storage.elements_storage.Resize(bytes);
-        storage.elements = std::move(elements);
-        RecordElementWrites();
-    }
+    void SetElement(size_t index, TaggedValue val);
+    void SetLength(size_t len);
+    void Push(TaggedValue val);
+    TaggedValue Pop();
+    TaggedValue Shift();
+    void Unshift(const TaggedValue* items, size_t count);
+    void Reverse();
+    void Splice(size_t start, size_t delete_count, const TaggedValue* items, size_t insert_count);
+    void ReserveElements(size_t length);
+    void PrepareElementStorage(size_t new_size) { ReserveElements(new_size); }
+    void ReplaceElements(const std::vector<TaggedValue>& elements);
+    void ReplaceElements(std::vector<TaggedValue>&& elements) { ReplaceElements(elements); }
 
     size_t ObjectSize() const override { return sizeof(JSArray); }
 
     void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        if (array_storage_) {
-            for (auto& el : array_storage_->elements) {
-                if (!el.IsEmpty()) visitor->Visit(&el);
+        if (elements_) {
+            TaggedValue el_val = TaggedValue::FromHeapObject(elements_);
+            visitor->Visit(&el_val);
+            if (el_val.IsHeapObject()) {
+                elements_ = el_val.As<FixedArray>();
             }
         }
     }
@@ -1102,34 +1000,7 @@ public:
     }
 
 private:
-    ArrayStorage& EnsureStorage() {
-        if (!array_storage_) {
-            array_storage_ = std::make_unique<ArrayStorage>();
-        }
-        return *array_storage_;
-    }
-
-    void RecordElementWrites() {
-        if (IsOld() && array_storage_) {
-            for (auto value : array_storage_->elements) {
-                if (value.IsHeapObject()) RecordWriteBarrier(this, value);
-            }
-        }
-    }
-
-    static size_t CheckedArrayStorage(const std::vector<TaggedValue>& elements) {
-        (void)CheckedArrayLength(elements.size());
-        return CheckedStorageBytes(elements.capacity(), sizeof(TaggedValue));
-    }
-
-    static size_t CheckedArrayLength(size_t len) {
-        if (len > kMaxArrayLength) {
-            throw std::length_error("array length exceeds the maximum length");
-        }
-        return CheckedStorageBytes(len, sizeof(TaggedValue));
-    }
-
-    std::unique_ptr<ArrayStorage> array_storage_{nullptr};
+    FixedArray* elements_{nullptr};
 };
 
 static_assert(sizeof(JSArray) == 64, "sizeof(JSArray) must be 64 bytes");

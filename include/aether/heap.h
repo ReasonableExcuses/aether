@@ -192,6 +192,7 @@ public:
 
     static IsolateHeap* Current() noexcept;
     static void SetCurrent(IsolateHeap* heap) noexcept;
+    static IsolateHeap* HeapForObject(const void* ptr) noexcept;
     // Thread-owned fallback heap (collectible at explicit safe boundaries and
     // destroyed at thread exit). Prefer an explicit IsolateScope in embedders.
     // Roots belong to the allocation heap; moving a value to another isolate
@@ -531,6 +532,28 @@ inline ByteArray* AllocateRuntimeByteArray(uint32_t length) {
         return h->AllocateByteArray(length);
     }
     return IsolateHeap::RuntimeFallbackHeap().AllocateByteArray(length);
+}
+
+inline FixedArray* AllocateRuntimeFixedArrayFor(const void* owner, uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {
+    IsolateHeap* h = IsolateHeap::HeapForObject(owner);
+    if (!h) h = IsolateHeap::Current();
+    if (!h) h = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*h);
+    if (owner && h->Contains(owner)) {
+        scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+    }
+    return h->AllocateFixedArray(length, capacity, init);
+}
+
+inline ByteArray* AllocateRuntimeByteArrayFor(const void* owner, uint32_t length) {
+    IsolateHeap* h = IsolateHeap::HeapForObject(owner);
+    if (!h) h = IsolateHeap::Current();
+    if (!h) h = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*h);
+    if (owner && h->Contains(owner)) {
+        scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+    }
+    return h->AllocateByteArray(length);
 }
 
 } // namespace aether

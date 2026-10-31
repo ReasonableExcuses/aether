@@ -4420,7 +4420,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* arr = static_cast<JSArray*>(enum_val.AsHeapObject());
                     int32_t idx = idx_val.AsSmi();
                     if (idx >= 0 && static_cast<size_t>(idx) < arr->Length()) {
-                        TaggedValue key_val = arr->Elements()[idx];
+                        TaggedValue key_val = arr->GetElement(static_cast<size_t>(idx));
                         if (target.IsHeapObject() && target.AsHeapObject()->IsJSObject()) {
                             std::string key_str = key_val.ToString();
                             if (HasProperty(target, key_str)) {
@@ -4809,8 +4809,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* arr = static_cast<JSArray*>(h_obj);
                     if (key_val.IsSmi()) {
                         int32_t idx = key_val.AsSmi();
-                        if (idx >= 0 && static_cast<size_t>(idx) < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
-                            acc_ = arr->Elements()[idx];
+                        if (idx >= 0 && arr->HasElement(static_cast<size_t>(idx))) {
+                            acc_ = arr->GetElement(static_cast<size_t>(idx));
                         } else if (idx >= 0) {
                             acc_ = arr->GetNamedProperty(std::to_string(idx));
                         } else {
@@ -4820,8 +4820,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         double d = key_val.AsNumber();
                         if (d >= 0.0 && std::floor(d) == d) {
                             size_t idx = static_cast<size_t>(d);
-                            if (idx < arr->Length() && !arr->Elements()[idx].IsEmpty()) {
-                                acc_ = arr->Elements()[idx];
+                            if (arr->HasElement(idx)) {
+                                acc_ = arr->GetElement(idx);
                             } else {
                                 acc_ = arr->GetNamedProperty(std::to_string(idx));
                             }
