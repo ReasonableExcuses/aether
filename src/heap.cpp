@@ -76,7 +76,7 @@ namespace aether {
 #endif
 
 static thread_local IsolateHeap* s_current_heap_{nullptr};
-static thread_local std::vector<IsolateHeap*> s_active_heaps;
+static thread_local IsolateHeap* s_active_heaps_head{nullptr};
 
 IsolateHeap* IsolateHeap::Current() noexcept { return s_current_heap_; }
 void IsolateHeap::SetCurrent(IsolateHeap* heap) noexcept { s_current_heap_ = heap; }
@@ -86,9 +86,9 @@ IsolateHeap* IsolateHeap::HeapForObject(const void* ptr) noexcept {
     if (s_current_heap_ && s_current_heap_->Contains(ptr)) {
         return s_current_heap_;
     }
-    for (auto it = s_active_heaps.rbegin(); it != s_active_heaps.rend(); ++it) {
-        if (*it && (*it)->Contains(ptr)) {
-            return *it;
+    for (IsolateHeap* h = s_active_heaps_head; h != nullptr; h = h->active_next_) {
+        if (h->Contains(ptr)) {
+            return h;
         }
     }
     return nullptr;
@@ -161,7 +161,12 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     stack_base_ = nullptr;
     previous_current_heap_ = s_current_heap_;
     s_current_heap_ = this;
-    s_active_heaps.push_back(this);
+    active_prev_ = nullptr;
+    active_next_ = s_active_heaps_head;
+    if (s_active_heaps_head) {
+        s_active_heaps_head->active_prev_ = this;
+    }
+    s_active_heaps_head = this;
 }
 
 IsolateHeap::~IsolateHeap() {
@@ -173,10 +178,16 @@ IsolateHeap::~IsolateHeap() {
     remembered_set_.clear();
     weak_containers_.clear();
     old_gen_.DestroyAll();
-    auto it = std::find(s_active_heaps.begin(), s_active_heaps.end(), this);
-    if (it != s_active_heaps.end()) {
-        s_active_heaps.erase(it);
+    if (active_prev_) {
+        active_prev_->active_next_ = active_next_;
+    } else if (s_active_heaps_head == this) {
+        s_active_heaps_head = active_next_;
     }
+    if (active_next_) {
+        active_next_->active_prev_ = active_prev_;
+    }
+    active_prev_ = nullptr;
+    active_next_ = nullptr;
     if (s_current_heap_ == this) {
         s_current_heap_ = previous_current_heap_;
     }

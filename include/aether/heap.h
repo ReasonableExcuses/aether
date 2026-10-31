@@ -470,6 +470,8 @@ private:
     bool draining_finalizers_{false};
     void* stack_base_{nullptr};
     const std::thread::id owner_thread_{std::this_thread::get_id()};
+    IsolateHeap* active_next_{nullptr};
+    IsolateHeap* active_prev_{nullptr};
 };
 
 inline HandleScope::HandleScope(IsolateHeap& heap)
@@ -536,22 +538,58 @@ inline ByteArray* AllocateRuntimeByteArray(uint32_t length) {
 
 inline FixedArray* AllocateRuntimeFixedArrayFor(const void* owner, uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {
     IsolateHeap* h = IsolateHeap::HeapForObject(owner);
+    if (!h && owner) {
+        auto* heap_obj = static_cast<const HeapObject*>(owner);
+        const_cast<HeapObject*>(heap_obj)->IteratePointers([&](TaggedValue* slot) {
+            if (!h && slot && slot->IsHeapObject()) {
+                h = IsolateHeap::HeapForObject(slot->AsHeapObject());
+            }
+        });
+    }
     if (!h) h = IsolateHeap::Current();
     if (!h) h = &IsolateHeap::RuntimeFallbackHeap();
     HandleScope scope(*h);
-    if (owner && h->Contains(owner)) {
-        scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+    if (owner) {
+        if (h->Contains(owner)) {
+            scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+        } else {
+            auto* heap_obj = const_cast<HeapObject*>(static_cast<const HeapObject*>(owner));
+            LambdaSlotVisitor visitor([&](TaggedValue* slot) {
+                if (slot && slot->IsHeapObject()) {
+                    scope.CreateHandle(slot->AsHeapObject());
+                }
+            });
+            heap_obj->IteratePointers(&visitor);
+        }
     }
     return h->AllocateFixedArray(length, capacity, init);
 }
 
 inline ByteArray* AllocateRuntimeByteArrayFor(const void* owner, uint32_t length) {
     IsolateHeap* h = IsolateHeap::HeapForObject(owner);
+    if (!h && owner) {
+        auto* heap_obj = static_cast<const HeapObject*>(owner);
+        const_cast<HeapObject*>(heap_obj)->IteratePointers([&](TaggedValue* slot) {
+            if (!h && slot && slot->IsHeapObject()) {
+                h = IsolateHeap::HeapForObject(slot->AsHeapObject());
+            }
+        });
+    }
     if (!h) h = IsolateHeap::Current();
     if (!h) h = &IsolateHeap::RuntimeFallbackHeap();
     HandleScope scope(*h);
-    if (owner && h->Contains(owner)) {
-        scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+    if (owner) {
+        if (h->Contains(owner)) {
+            scope.CreateHandle(const_cast<HeapObject*>(static_cast<const HeapObject*>(owner)));
+        } else {
+            auto* heap_obj = const_cast<HeapObject*>(static_cast<const HeapObject*>(owner));
+            LambdaSlotVisitor visitor([&](TaggedValue* slot) {
+                if (slot && slot->IsHeapObject()) {
+                    scope.CreateHandle(slot->AsHeapObject());
+                }
+            });
+            heap_obj->IteratePointers(&visitor);
+        }
     }
     return h->AllocateByteArray(length);
 }

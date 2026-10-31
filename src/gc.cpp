@@ -441,21 +441,18 @@ void ImmixSpace::Sweep() {
     }
 
     // 3. Sweep Large Objects
-    LargeObjectHeader** curr = &large_objects_head_;
-    while (*curr) {
-        LargeObjectHeader* header = *curr;
+    LargeObjectHeader* header = large_objects_head_;
+    while (header) {
+        LargeObjectHeader* next = header->next;
         HeapObject* obj = header->Object();
         if (header->constructed && !obj->IsMarked() && !header->marked) {
-            *curr = header->next;
-            if (header->next) header->next->prev = header->prev;
             obj->~HeapObject();
             if (header->charged && budget_) {
                 budget_->ReleaseManaged(header->size - LargeObjectHeader::HeaderSize());
             }
             FreeLarge(header);
-        } else {
-            curr = &header->next;
         }
+        header = next;
     }
 }
 
