@@ -3,7 +3,6 @@
 
 #include "aether/common.h"
 #include "aether/value.h"
-#include "aether/memory_budget.h"
 #include <unordered_map>
 #include <string>
 #include <string_view>

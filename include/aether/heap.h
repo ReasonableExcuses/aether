@@ -112,18 +112,51 @@ public:
     // nonmoving MajorGC, with direct object/TaggedValue arguments rooted.
     template <typename T, typename... Args>
     T* Allocate(Args&&... args) {
-        return AllocateImpl<T>(false, std::forward<Args>(args)...);
+        if constexpr (std::is_same_v<T, FixedArray>) {
+            return AllocateFixedArrayHelper(false, std::forward<Args>(args)...);
+        } else if constexpr (std::is_same_v<T, ByteArray>) {
+            return AllocateByteArrayHelper(false, std::forward<Args>(args)...);
+        } else {
+            return AllocateImpl<T>(false, std::forward<Args>(args)...);
+        }
     }
 
     template <typename T, typename... Args>
     T* AllocateOld(Args&&... args) {
-        return AllocateImpl<T>(true, std::forward<Args>(args)...);
+        if constexpr (std::is_same_v<T, FixedArray>) {
+            return AllocateFixedArrayHelper(true, std::forward<Args>(args)...);
+        } else if constexpr (std::is_same_v<T, ByteArray>) {
+            return AllocateByteArrayHelper(true, std::forward<Args>(args)...);
+        } else {
+            return AllocateImpl<T>(true, std::forward<Args>(args)...);
+        }
     }
 
     template <typename T, typename... Args>
     T* AllocateStable(Args&&... args) {
         NoGCScope guard(*this);
         return AllocateOld<T>(std::forward<Args>(args)...);
+    }
+
+    FixedArray* AllocateFixedArray(uint32_t length, uint32_t capacity, TaggedValue init, bool old) {
+        HandleScope argument_roots(*this);
+        RootArgument(argument_roots, init);
+        uint32_t actual_cap = capacity >= length ? capacity : length;
+        size_t bytes = FixedArray::ComputeAllocationSize(actual_cap);
+        return AllocateVariableImpl<FixedArray>(old, bytes, [&](void* mem) {
+            return new (mem) FixedArray(length, actual_cap, init);
+        });
+    }
+
+    FixedArray* AllocateFixedArray(uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {
+        return AllocateFixedArray(length, capacity, init, false);
+    }
+
+    ByteArray* AllocateByteArray(uint32_t length, bool old = false) {
+        size_t bytes = ByteArray::ComputeAllocationSize(length);
+        return AllocateVariableImpl<ByteArray>(old, bytes, [&](void* mem) {
+            return new (mem) ByteArray(length);
+        });
     }
 
     // Generational Write Barrier
@@ -262,14 +295,9 @@ private:
         }
     }
 
-    template <typename T, typename... Args>
-    T* AllocateImpl(bool old, Args&&... args) {
-        static_assert(std::is_base_of_v<HeapObject, T>);
-        static_assert(alignof(T) <= kObjectAlignment, "over-aligned heap object");
+    template <typename T, typename InitFn>
+    T* AllocateVariableImpl(bool old, size_t bytes, InitFn&& init_fn) {
         AssertOwnerThread();
-        HandleScope argument_roots(*this);
-        (RootArgument(argument_roots, args), ...);
-        constexpr size_t bytes = (sizeof(T) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
         if (Options::Get().gc_stress > 0 && GCAllowed() && !collecting_) {
             static thread_local int s_alloc_counter = 0;
             if (++s_alloc_counter >= Options::Get().gc_stress) {
@@ -331,7 +359,7 @@ private:
             // invoke a heap directly while another isolate is current.
             IsolateHeap* previous = Current();
             SetCurrent(this);
-            try { obj = new (mem) T(std::forward<Args>(args)...); }
+            try { obj = init_fn(mem); }
             catch (...) { SetCurrent(previous); throw; }
             SetCurrent(previous);
             obj->SetAllocatedSize(static_cast<uint32_t>(bytes));
@@ -365,6 +393,38 @@ private:
             budget_->ReleaseManaged(bytes);
             throw;
         }
+    }
+
+    template <typename T, typename... Args>
+    T* AllocateImpl(bool old, Args&&... args) {
+        static_assert(std::is_base_of_v<HeapObject, T>);
+        static_assert(alignof(T) <= kObjectAlignment, "over-aligned heap object");
+        HandleScope argument_roots(*this);
+        (RootArgument(argument_roots, args), ...);
+        constexpr size_t bytes = (sizeof(T) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+        return AllocateVariableImpl<T>(old, bytes, [&](void* mem) {
+            return new (mem) T(std::forward<Args>(args)...);
+        });
+    }
+
+    FixedArray* AllocateFixedArrayHelper(bool old, uint32_t length, uint32_t capacity, TaggedValue init) {
+        return AllocateFixedArray(length, capacity, init, old);
+    }
+    FixedArray* AllocateFixedArrayHelper(bool old, uint32_t length, uint32_t capacity) {
+        return AllocateFixedArray(length, capacity, TaggedValue::Empty(), old);
+    }
+    FixedArray* AllocateFixedArrayHelper(bool old, uint32_t length) {
+        return AllocateFixedArray(length, length, TaggedValue::Empty(), old);
+    }
+    FixedArray* AllocateFixedArrayHelper(bool old) {
+        return AllocateFixedArray(0, 0, TaggedValue::Empty(), old);
+    }
+
+    ByteArray* AllocateByteArrayHelper(bool old, uint32_t length) {
+        return AllocateByteArray(length, old);
+    }
+    ByteArray* AllocateByteArrayHelper(bool old) {
+        return AllocateByteArray(0, old);
     }
     void ReserveManaged(size_t bytes);
     void VisitRoots(SlotVisitor* visitor);
@@ -457,6 +517,20 @@ inline T* AllocateRuntime(Args&&... args) {
         return h->Allocate<T>(std::forward<Args>(args)...);
     }
     return IsolateHeap::RuntimeFallbackHeap().Allocate<T>(std::forward<Args>(args)...);
+}
+
+inline FixedArray* AllocateRuntimeFixedArray(uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {
+    if (IsolateHeap* h = IsolateHeap::Current()) {
+        return h->AllocateFixedArray(length, capacity, init);
+    }
+    return IsolateHeap::RuntimeFallbackHeap().AllocateFixedArray(length, capacity, init);
+}
+
+inline ByteArray* AllocateRuntimeByteArray(uint32_t length) {
+    if (IsolateHeap* h = IsolateHeap::Current()) {
+        return h->AllocateByteArray(length);
+    }
+    return IsolateHeap::RuntimeFallbackHeap().AllocateByteArray(length);
 }
 
 } // namespace aether

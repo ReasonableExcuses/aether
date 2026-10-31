@@ -39,7 +39,7 @@ void HeapVerifier::VerifyHeap(IsolateHeap& heap, const std::string& phase) {
 
         // Validate type tag
         uint16_t type_val = static_cast<uint16_t>(obj->GetType());
-        if (type_val < 0x01 || type_val > 0x18) {
+        if (type_val < 0x01 || type_val > 0x19) {
             throw std::runtime_error("HeapVerifier [" + phase + "]: Invalid object type tag 0x" +
                                      std::to_string(type_val) + " at " + std::to_string(addr) +
                                      " from " + source_desc);

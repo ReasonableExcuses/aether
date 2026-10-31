@@ -12,11 +12,13 @@
 
 using namespace aether;
 
-// Compile-time size invariants required by T1.7 per-object memory diet
+// Compile-time size invariants required by T1.7 per-object memory diet & T2.1 GC array types
 static_assert(sizeof(HeapObject) == 24, "HeapObject size must be exactly 24 bytes");
 static_assert(sizeof(JSObject) == 56, "JSObject size must be exactly 56 bytes (<= 64 B)");
 static_assert(sizeof(JSArray) == 64, "JSArray size must be exactly 64 bytes (<= 64 B)");
 static_assert(sizeof(JSFunction) == 64, "JSFunction size must be exactly 64 bytes (<= 64 B)");
+static_assert(sizeof(FixedArray) == 32, "FixedArray size must be exactly 32 bytes");
+static_assert(sizeof(ByteArray) == 32, "ByteArray size must be exactly 32 bytes");
 
 void TestObjectInObjectStorage() {
     Heap heap;
@@ -54,7 +56,8 @@ void TestObjectInObjectStorage() {
     // Adding 3rd property spills out-of-line into extra data
     obj.SetNamedProperty("c", TaggedValue::FromSmi(3), sid);
     assert(obj.GetExtraData() != nullptr);
-    assert(!obj.GetExtraData()->out_of_line_slots.empty());
+    assert(obj.GetExtraData()->out_of_line_slots != nullptr);
+    assert(obj.GetExtraData()->out_of_line_slots->Length() > 0);
     assert(obj.GetNamedProperty("c").AsSmi() == 3);
     assert(obj.GetFastSlot(2, false).AsSmi() == 3);
 
@@ -130,6 +133,34 @@ void TestFunctionMemoryDiet() {
     std::cout << "  -> Function memory diet verified.\n";
 }
 
+void TestGCAllocatedArrays() {
+    Heap heap;
+    IsolateScope isolate(heap);
+
+    // FixedArray allocation & access
+    FixedArray* fa = AllocateRuntimeFixedArray(5, 10, TaggedValue::FromSmi(42));
+    assert(fa->Length() == 5);
+    assert(fa->Capacity() == 10);
+    assert(fa->GetType() == HeapObjectType::FixedArray);
+    assert(fa->IsFixedArray());
+    assert(fa->ObjectSize() == FixedArray::ComputeAllocationSize(10));
+    assert(fa->Get(0).AsSmi() == 42);
+    assert(fa->Get(4).AsSmi() == 42);
+    fa->Set(2, TaggedValue::FromSmi(999));
+    assert(fa->Get(2).AsSmi() == 999);
+
+    // ByteArray allocation & access
+    ByteArray* ba = AllocateRuntimeByteArray(64);
+    assert(ba->Length() == 64);
+    assert(ba->GetType() == HeapObjectType::ByteArray);
+    assert(ba->IsByteArray());
+    assert(ba->ObjectSize() == ByteArray::ComputeAllocationSize(64));
+    ba->Set(10, 0xAB);
+    assert(ba->Get(10) == 0xAB);
+
+    std::cout << "  -> FixedArray and ByteArray GC allocation verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "   AetherVM T1.7 Per-Object Memory Diet Test Suite\n";
@@ -139,7 +170,9 @@ int main() {
     TestObjectDeletionAndReaddition();
     TestArrayMemoryDiet();
     TestFunctionMemoryDiet();
+    TestGCAllocatedArrays();
 
     std::cout << "\n[PASS] All per-object memory diet tests passed successfully.\n";
     return 0;
 }
+

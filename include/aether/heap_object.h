@@ -234,6 +234,7 @@ enum class HeapObjectType : uint16_t {
     JSWeakRef         = 0x16,
     JSFinalizationRegistry = 0x17,
     JSBigInt          = 0x18,
+    ByteArray         = 0x19,
 };
 
 /**
@@ -300,6 +301,8 @@ public:
     AETHER_ALWAYS_INLINE bool IsWeakRef() const noexcept { return type_ == HeapObjectType::JSWeakRef; }
     AETHER_ALWAYS_INLINE bool IsFinalizationRegistry() const noexcept { return type_ == HeapObjectType::JSFinalizationRegistry; }
     AETHER_ALWAYS_INLINE bool IsBigInt() const noexcept { return type_ == HeapObjectType::JSBigInt; }
+    AETHER_ALWAYS_INLINE bool IsFixedArray() const noexcept { return type_ == HeapObjectType::FixedArray; }
+    AETHER_ALWAYS_INLINE bool IsByteArray() const noexcept { return type_ == HeapObjectType::ByteArray; }
 
     static constexpr uint16_t kMarkBit        = 1 << 0;
     static constexpr uint16_t kForwardedBit   = 1 << 1;
@@ -518,6 +521,134 @@ private:
 };
 
 /**
+ * @brief GC-allocated contiguous array of TaggedValue elements.
+ */
+class FixedArray : public HeapObject {
+public:
+    explicit FixedArray(uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty())
+        : HeapObject(HeapObjectType::FixedArray, nullptr),
+          length_(length),
+          capacity_(capacity >= length ? capacity : length) {
+        TaggedValue* elems = elements();
+        for (uint32_t i = 0; i < capacity_; ++i) {
+            elems[i] = init;
+        }
+    }
+
+    uint32_t Length() const noexcept { return length_; }
+    uint32_t Capacity() const noexcept { return capacity_; }
+    void SetLength(uint32_t len) noexcept { length_ = len; }
+
+    TaggedValue* elements() noexcept {
+        return reinterpret_cast<TaggedValue*>(reinterpret_cast<char*>(this) + kHeaderSize);
+    }
+    const TaggedValue* elements() const noexcept {
+        return reinterpret_cast<const TaggedValue*>(reinterpret_cast<const char*>(this) + kHeaderSize);
+    }
+
+    TaggedValue Get(uint32_t index) const {
+        if (index >= length_) return TaggedValue::Undefined();
+        return elements()[index];
+    }
+
+    void Set(uint32_t index, TaggedValue value) {
+        if (index >= capacity_) throw std::length_error("FixedArray index out of bounds");
+        elements()[index] = value;
+        if (AETHER_UNLIKELY(IsOld() && value.IsHeapObject())) {
+            RecordWriteBarrier(this, value);
+        }
+    }
+
+    size_t ObjectSize() const override {
+        return GetAllocatedSize() ? GetAllocatedSize() : ComputeAllocationSize(capacity_);
+    }
+
+    void IteratePointers(SlotVisitor* visitor) override {
+        TaggedValue* elems = elements();
+        for (uint32_t i = 0; i < capacity_; ++i) {
+            if (!elems[i].IsEmpty()) {
+                visitor->Visit(&elems[i]);
+            }
+        }
+    }
+
+    HeapObject* RelocateTo(void* dst) override {
+        auto* new_arr = new (dst) FixedArray(length_, capacity_);
+        std::memcpy(new_arr->elements(), elements(), capacity_ * sizeof(TaggedValue));
+        return new_arr;
+    }
+
+    static constexpr size_t kHeaderSize = 32;
+    static constexpr size_t ComputeAllocationSize(uint32_t capacity) noexcept {
+        return (kHeaderSize + capacity * sizeof(TaggedValue) + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+    }
+
+private:
+    uint32_t length_{0};
+    uint32_t capacity_{0};
+};
+
+static_assert(sizeof(FixedArray) == 32, "sizeof(FixedArray) must be 32 bytes");
+
+/**
+ * @brief GC-allocated contiguous array of raw bytes.
+ */
+class ByteArray : public HeapObject {
+public:
+    explicit ByteArray(uint32_t length)
+        : HeapObject(HeapObjectType::ByteArray, nullptr),
+          length_(length),
+          reserved_(0) {
+        std::memset(data(), 0, length_);
+    }
+
+    uint32_t Length() const noexcept { return length_; }
+
+    uint8_t* data() noexcept {
+        return reinterpret_cast<uint8_t*>(reinterpret_cast<char*>(this) + kHeaderSize);
+    }
+    const uint8_t* data() const noexcept {
+        return reinterpret_cast<const uint8_t*>(reinterpret_cast<const char*>(this) + kHeaderSize);
+    }
+
+    uint8_t Get(uint32_t index) const {
+        if (index >= length_) return 0;
+        return data()[index];
+    }
+
+    void Set(uint32_t index, uint8_t val) {
+        if (index >= length_) throw std::length_error("ByteArray index out of bounds");
+        data()[index] = val;
+    }
+
+    size_t ObjectSize() const override {
+        return GetAllocatedSize() ? GetAllocatedSize() : ComputeAllocationSize(length_);
+    }
+
+    void IteratePointers(SlotVisitor*) override {}
+
+    HeapObject* RelocateTo(void* dst) override {
+        auto* new_arr = new (dst) ByteArray(length_);
+        std::memcpy(new_arr->data(), data(), length_);
+        return new_arr;
+    }
+
+    static constexpr size_t kHeaderSize = 32;
+    static constexpr size_t ComputeAllocationSize(uint32_t length) noexcept {
+        return (kHeaderSize + length + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+    }
+
+private:
+    uint32_t length_{0};
+    uint32_t reserved_{0};
+};
+
+static_assert(sizeof(ByteArray) == 32, "sizeof(ByteArray) must be 32 bytes");
+
+using PropertyArray = FixedArray;
+using ElementsArray = FixedArray;
+
+/**
  * @brief Standard ECMAScript Object with hidden class transitions and property storage.
  */
 struct AccessorDescriptor {
@@ -527,8 +658,7 @@ struct AccessorDescriptor {
 };
 
 struct ObjectExtraData {
-    std::vector<TaggedValue> out_of_line_slots;
-    MemoryCharge slots_storage;
+    FixedArray* out_of_line_slots{nullptr};
     detail::StorageAllocator<char> key_allocator;
     std::unique_ptr<detail::PropertyMap<AccessorDescriptor>> accessors;
     std::unique_ptr<detail::PropertyMap<PropertyAttributes>> own_attributes;
@@ -571,34 +701,17 @@ public:
         if (AETHER_UNLIKELY(slot_index < Shape::kDefaultInObjectProperties)) {
             return TaggedValue::Empty();
         }
-        if (!extra_) {
+        if (!extra_ || !extra_->out_of_line_slots) {
             return TaggedValue::Empty();
         }
         size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
-        if (AETHER_UNLIKELY(ool_idx >= extra_->out_of_line_slots.size())) {
+        if (AETHER_UNLIKELY(ool_idx >= extra_->out_of_line_slots->Length())) {
             return TaggedValue::Empty();
         }
-        return extra_->out_of_line_slots[ool_idx];
+        return extra_->out_of_line_slots->Get(static_cast<uint32_t>(ool_idx));
     }
 
-    void PrepareFastSlot(uint32_t slot_index, bool in_object) {
-        if (in_object) {
-            if (AETHER_UNLIKELY(slot_index >= Shape::kDefaultInObjectProperties)) {
-                throw std::length_error("invalid in-object property slot");
-            }
-            return;
-        }
-        if (AETHER_UNLIKELY(slot_index < Shape::kDefaultInObjectProperties)) {
-            throw std::length_error("invalid out-of-line property slot");
-        }
-        size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
-        if (AETHER_UNLIKELY(slot_index >= kMaxObjectProperties)) {
-            throw std::length_error("object property limit exceeded");
-        }
-        auto& extra = EnsureExtra();
-        detail::ReserveStorage(extra.out_of_line_slots, extra.slots_storage, ool_idx + 1,
-                               kMaxObjectProperties - Shape::kDefaultInObjectProperties);
-    }
+    void PrepareFastSlot(uint32_t slot_index, bool in_object);
 
     AETHER_ALWAYS_INLINE void SetFastSlot(uint32_t slot_index, bool in_object, TaggedValue value) {
         if (AETHER_LIKELY(in_object)) {
@@ -610,10 +723,7 @@ public:
             PrepareFastSlot(slot_index, false);
             size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
             auto& extra = EnsureExtra();
-            if (ool_idx >= extra.out_of_line_slots.size()) {
-                extra.out_of_line_slots.resize(ool_idx + 1, TaggedValue::Empty());
-            }
-            extra.out_of_line_slots[ool_idx] = value;
+            extra.out_of_line_slots->Set(static_cast<uint32_t>(ool_idx), value);
         }
         if (AETHER_UNLIKELY(IsOld() && value.IsHeapObject())) {
             RecordWriteBarrier(this, value);
@@ -794,9 +904,11 @@ public:
             }
         }
         if (extra_) {
-            for (auto& slot : extra_->out_of_line_slots) {
-                if (!slot.IsEmpty()) {
-                    visitor->Visit(&slot);
+            if (extra_->out_of_line_slots) {
+                TaggedValue ool_val = TaggedValue::FromHeapObject(extra_->out_of_line_slots);
+                visitor->Visit(&ool_val);
+                if (ool_val.IsHeapObject()) {
+                    extra_->out_of_line_slots = ool_val.As<FixedArray>();
                 }
             }
             if (extra_->accessors) {

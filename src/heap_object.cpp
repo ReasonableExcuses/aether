@@ -58,6 +58,51 @@ static bool SameValueZero(TaggedValue a, TaggedValue b) {
     return false;
 }
 
+void JSObject::PrepareFastSlot(uint32_t slot_index, bool in_object) {
+    if (in_object) {
+        if (AETHER_UNLIKELY(slot_index >= Shape::kDefaultInObjectProperties)) {
+            throw std::length_error("invalid in-object property slot");
+        }
+        return;
+    }
+    if (AETHER_UNLIKELY(slot_index < Shape::kDefaultInObjectProperties)) {
+        throw std::length_error("invalid out-of-line property slot");
+    }
+    if (AETHER_UNLIKELY(slot_index >= kMaxObjectProperties)) {
+        throw std::length_error("object property limit exceeded");
+    }
+    size_t ool_idx = slot_index - Shape::kDefaultInObjectProperties;
+    auto& extra = EnsureExtra();
+    uint32_t needed_len = static_cast<uint32_t>(ool_idx + 1);
+    if (!extra.out_of_line_slots) {
+        uint32_t initial_cap = std::max<uint32_t>(4, needed_len);
+        extra.out_of_line_slots = AllocateRuntimeFixedArray(needed_len, initial_cap, TaggedValue::Empty());
+        if (AETHER_UNLIKELY(IsOld() && extra.out_of_line_slots->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(extra.out_of_line_slots));
+        }
+    } else if (needed_len > extra.out_of_line_slots->Capacity()) {
+        uint32_t old_cap = extra.out_of_line_slots->Capacity();
+        uint32_t old_len = extra.out_of_line_slots->Length();
+        uint32_t new_cap = std::max(needed_len, old_cap * 2);
+        FixedArray* new_ool = AllocateRuntimeFixedArray(needed_len, new_cap, TaggedValue::Empty());
+        std::memcpy(new_ool->elements(), extra.out_of_line_slots->elements(), old_len * sizeof(TaggedValue));
+        extra.out_of_line_slots = new_ool;
+        if (AETHER_UNLIKELY(IsOld() && new_ool->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(new_ool));
+        }
+        if (AETHER_UNLIKELY(new_ool->IsOld())) {
+            for (uint32_t i = 0; i < old_len; ++i) {
+                TaggedValue el = new_ool->elements()[i];
+                if (el.IsHeapObject()) {
+                    RecordWriteBarrier(new_ool, el);
+                }
+            }
+        }
+    } else if (needed_len > extra.out_of_line_slots->Length()) {
+        extra.out_of_line_slots->SetLength(needed_len);
+    }
+}
+
 TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
     if (property_lookup_depth > kMaxPrototypeChainDepth) return TaggedValue::Undefined();
     PropertyLookupScope lookup_scope;
