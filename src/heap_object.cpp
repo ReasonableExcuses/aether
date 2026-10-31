@@ -1474,4 +1474,24 @@ void JSArray::ReplaceElements(const std::vector<TaggedValue>& elements) {
     }
 }
 
+LexicalEnvironment::LexicalEnvironment(LexicalEnvironment* outer, size_t slot_count)
+    : HeapObject(HeapObjectType::LexicalEnvironment, nullptr),
+      outer_(outer) {
+    if (AETHER_UNLIKELY(slot_count > kMaxObjectProperties)) {
+        throw std::length_error("lexical environment slot limit exceeded");
+    }
+    if (slot_count > 0) {
+        slots_ = AllocateRuntimeFixedArrayFor(this,
+                                              static_cast<uint32_t>(slot_count),
+                                              static_cast<uint32_t>(slot_count),
+                                              TaggedValue::Undefined());
+        if (AETHER_UNLIKELY(IsOld() && slots_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(slots_));
+        }
+    }
+    if (AETHER_UNLIKELY(IsOld() && outer_ && outer_->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(outer_));
+    }
+}
+
 } // namespace aether

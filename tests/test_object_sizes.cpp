@@ -19,6 +19,7 @@ static_assert(sizeof(JSArray) == 64, "JSArray size must be exactly 64 bytes (<= 
 static_assert(sizeof(JSFunction) == 64, "JSFunction size must be exactly 64 bytes (<= 64 B)");
 static_assert(sizeof(FixedArray) == 32, "FixedArray size must be exactly 32 bytes");
 static_assert(sizeof(ByteArray) == 32, "ByteArray size must be exactly 32 bytes");
+static_assert(sizeof(LexicalEnvironment) == 40, "LexicalEnvironment size must be exactly 40 bytes (<= 48 B)");
 
 void TestObjectInObjectStorage() {
     Heap heap;
@@ -165,6 +166,48 @@ void TestGCAllocatedArrays() {
     std::cout << "  -> FixedArray and ByteArray GC allocation verified.\n";
 }
 
+void TestLexicalEnvironmentDiet() {
+    std::cout << "[Test 6] Verifying LexicalEnvironment Memory Diet & GC Slots...\n";
+    Heap heap;
+    IsolateScope isolate(heap);
+
+    // Empty environment requires zero auxiliary FixedArray allocation
+    LexicalEnvironment empty_env(nullptr, 0);
+    assert(empty_env.Outer() == nullptr);
+    assert(empty_env.SlotCount() == 0);
+    assert(empty_env.SlotsArray() == nullptr);
+    assert(empty_env.ObjectSize() == sizeof(LexicalEnvironment));
+    assert(empty_env.GetSlot(0).IsUndefined());
+    assert(empty_env.Get(0, 0).IsUndefined());
+
+    // Non-empty environment allocates FixedArray
+    LexicalEnvironment env(nullptr, 4);
+    assert(env.Outer() == nullptr);
+    assert(env.SlotCount() == 4);
+    assert(env.SlotsArray() != nullptr);
+    assert(env.SlotsArray()->Length() == 4);
+    assert(env.GetSlot(0).IsUndefined());
+    assert(env.GetSlot(3).IsUndefined());
+
+    env.SetSlot(0, TaggedValue::FromSmi(42));
+    env.SetSlot(3, TaggedValue::FromDouble(3.1415));
+    assert(env.GetSlot(0).AsSmi() == 42);
+    assert(env.GetSlot(3).AsDouble() == 3.1415);
+
+    // Nested lexical environment
+    LexicalEnvironment nested(&env, 2);
+    assert(nested.Outer() == &env);
+    assert(nested.SlotCount() == 2);
+    assert(nested.Get(0, 0).IsUndefined());
+    assert(nested.Get(1, 0).AsSmi() == 42);
+    assert(nested.Get(1, 3).AsDouble() == 3.1415);
+
+    nested.Set(1, 0, TaggedValue::FromSmi(100));
+    assert(env.GetSlot(0).AsSmi() == 100);
+
+    std::cout << "  -> LexicalEnvironment memory diet & GC slots verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "   AetherVM T1.7 Per-Object Memory Diet Test Suite\n";
@@ -175,6 +218,7 @@ int main() {
     TestArrayMemoryDiet();
     TestFunctionMemoryDiet();
     TestGCAllocatedArrays();
+    TestLexicalEnvironmentDiet();
 
     std::cout << "\n[PASS] All per-object memory diet tests passed successfully.\n";
     return 0;

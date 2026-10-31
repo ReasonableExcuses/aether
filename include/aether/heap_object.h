@@ -1193,25 +1193,26 @@ private:
  */
 class LexicalEnvironment : public HeapObject {
 public:
-    LexicalEnvironment(LexicalEnvironment* outer, size_t slot_count)
-        : HeapObject(HeapObjectType::LexicalEnvironment, nullptr),
-          outer_(outer),
-          slots_storage_(CheckedEnvironmentSlots(slot_count)),
-          slots_(slot_count, TaggedValue::Undefined()) {}
+    LexicalEnvironment(LexicalEnvironment* outer, size_t slot_count);
 
     LexicalEnvironment* Outer() const noexcept { return outer_; }
-    size_t SlotCount() const noexcept { return slots_.size(); }
+    size_t SlotCount() const noexcept { return slots_ ? slots_->Length() : 0; }
+    FixedArray* SlotsArray() const noexcept { return slots_; }
 
     TaggedValue GetSlot(size_t index) const {
-        assert(index < slots_.size());
-        return slots_[index];
+        if (AETHER_UNLIKELY(!slots_ || index >= slots_->Length())) {
+            return TaggedValue::Undefined();
+        }
+        return slots_->elements()[index];
     }
 
     void SetSlot(size_t index, TaggedValue val) {
-        assert(index < slots_.size());
-        slots_[index] = val;
-        if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
-            RecordWriteBarrier(this, val);
+        if (AETHER_UNLIKELY(!slots_ || index >= slots_->Length())) {
+            throw std::out_of_range("lexical environment slot index out of bounds");
+        }
+        slots_->elements()[index] = val;
+        if (AETHER_UNLIKELY(slots_->IsOld() && val.IsHeapObject())) {
+            RecordWriteBarrier(slots_, val);
         }
     }
 
@@ -1220,7 +1221,9 @@ public:
         for (uint8_t d = 0; d < depth && curr; ++d) {
             curr = curr->outer_;
         }
-        if (curr && index < curr->slots_.size()) return curr->slots_[index];
+        if (curr && curr->slots_ && index < curr->slots_->Length()) {
+            return curr->slots_->elements()[index];
+        }
         return TaggedValue::Undefined();
     }
 
@@ -1229,17 +1232,19 @@ public:
         for (uint8_t d = 0; d < depth && curr; ++d) {
             curr = curr->outer_;
         }
-        if (curr && index < curr->slots_.size()) {
-            curr->slots_[index] = val;
-            if (AETHER_UNLIKELY(curr->IsOld() && val.IsHeapObject())) {
-                RecordWriteBarrier(curr, val);
+        if (curr && curr->slots_ && index < curr->slots_->Length()) {
+            curr->slots_->elements()[index] = val;
+            if (AETHER_UNLIKELY(curr->slots_->IsOld() && val.IsHeapObject())) {
+                RecordWriteBarrier(curr->slots_, val);
             }
         }
     }
 
     LexicalEnvironment(LexicalEnvironment&& other) noexcept = default;
+    LexicalEnvironment& operator=(LexicalEnvironment&& other) noexcept = default;
 
     size_t ObjectSize() const override { return sizeof(LexicalEnvironment); }
+
     void IteratePointers(SlotVisitor* visitor) override {
         if (outer_ != nullptr) {
             TaggedValue outer_val = TaggedValue::FromHeapObject(outer_);
@@ -1248,8 +1253,12 @@ public:
                 outer_ = outer_val.As<LexicalEnvironment>();
             }
         }
-        for (auto& s : slots_) {
-            if (!s.IsEmpty()) visitor->Visit(&s);
+        if (slots_ != nullptr) {
+            TaggedValue slots_val = TaggedValue::FromHeapObject(slots_);
+            visitor->Visit(&slots_val);
+            if (slots_val.IsHeapObject()) {
+                slots_ = slots_val.As<FixedArray>();
+            }
         }
     }
 
@@ -1258,16 +1267,8 @@ public:
     }
 
 private:
-    static size_t CheckedEnvironmentSlots(size_t slot_count) {
-        if (slot_count > kMaxObjectProperties) {
-            throw std::length_error("lexical environment slot limit exceeded");
-        }
-        return CheckedStorageBytes(slot_count, sizeof(TaggedValue));
-    }
-
     LexicalEnvironment* outer_{nullptr};
-    MemoryCharge slots_storage_;
-    std::vector<TaggedValue> slots_;
+    FixedArray* slots_{nullptr};
 };
 
 /**
