@@ -56,8 +56,12 @@ void BackgroundCompiler::Stop() {
         return;
     }
 
-    stop_requested_.store(true, std::memory_order_release);
-    cv_work_.notify_all();
+    {
+        std::lock_guard<std::mutex> q_lock(queue_mutex_);
+        stop_requested_.store(true, std::memory_order_release);
+        cv_work_.notify_all();
+        cv_idle_.notify_all();
+    }
 
     for (auto& worker : workers_) {
         if (worker.joinable()) {
@@ -87,8 +91,8 @@ bool BackgroundCompiler::Enqueue(std::shared_ptr<const BytecodeArray> bytecode,
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.push(std::move(job));
+        cv_work_.notify_one();
     }
-    cv_work_.notify_one();
     return true;
 }
 
@@ -109,15 +113,16 @@ bool BackgroundCompiler::Enqueue(const BytecodeArray& bytecode, const TypeFeedba
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.push(std::move(job));
+        cv_work_.notify_one();
     }
-    cv_work_.notify_one();
     return true;
 }
 
 void BackgroundCompiler::WaitForPendingTasks() {
     std::unique_lock<std::mutex> lock(queue_mutex_);
     cv_idle_.wait(lock, [this]() {
-        return queue_.empty() && active_workers_.load(std::memory_order_relaxed) == 0;
+        return stop_requested_.load(std::memory_order_relaxed) ||
+               (queue_.empty() && active_workers_.load(std::memory_order_relaxed) == 0);
     });
 }
 
