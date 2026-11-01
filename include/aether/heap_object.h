@@ -1125,19 +1125,30 @@ struct PromiseReaction {
 class JSPromise : public JSObject {
 public:
     explicit JSPromise(Shape* shape)
-        : JSObject(HeapObjectType::JSPromise, shape),
-          state_(PromiseState::Pending),
-          result_(TaggedValue::Undefined()) {}
+        : JSObject(HeapObjectType::JSPromise, shape) {}
 
     JSPromise(JSPromise&& other) noexcept
         : JSObject(std::move(other)),
-          state_(other.state_),
           result_(other.result_),
-          reactions_storage_(std::move(other.reactions_storage_)),
-          reactions_(std::move(other.reactions_)) {}
+          reactions_(other.reactions_),
+          state_(other.state_) {
+        other.reactions_ = nullptr;
+    }
+
+    ~JSPromise() override = default;
 
     PromiseState State() const noexcept { return state_; }
     TaggedValue Result() const noexcept { return result_; }
+
+    size_t ReactionCount() const noexcept {
+        return reactions_ ? (reactions_->Length() / 3) : 0;
+    }
+    FixedArray* ReactionsArray() const noexcept {
+        return reactions_;
+    }
+    bool HasReactions() const noexcept {
+        return reactions_ && reactions_->Length() > 0;
+    }
 
     void Fulfill(TaggedValue val, MicrotaskQueue& queue);
     void Reject(TaggedValue reason, MicrotaskQueue& queue);
@@ -1148,9 +1159,12 @@ public:
     void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
         if (!result_.IsEmpty()) visitor->Visit(&result_);
-        for (auto& r : reactions_) {
-            if (!r.on_fulfilled.IsEmpty()) visitor->Visit(&r.on_fulfilled);
-            if (!r.on_rejected.IsEmpty()) visitor->Visit(&r.on_rejected);
+        if (reactions_ != nullptr) {
+            TaggedValue rx_val = TaggedValue::FromHeapObject(reactions_);
+            visitor->Visit(&rx_val);
+            if (rx_val.IsHeapObject()) {
+                reactions_ = rx_val.As<FixedArray>();
+            }
         }
     }
 
@@ -1159,11 +1173,12 @@ public:
     }
 
 private:
-    PromiseState state_;
-    TaggedValue result_;
-    MemoryCharge reactions_storage_;
-    std::vector<PromiseReaction> reactions_;
+    TaggedValue result_{TaggedValue::Undefined()};
+    FixedArray* reactions_{nullptr};
+    PromiseState state_{PromiseState::Pending};
 };
+
+static_assert(sizeof(JSPromise) == 80, "sizeof(JSPromise) must be 80 bytes");
 
 /**
  * @brief Managed ECMAScript RegExp object.

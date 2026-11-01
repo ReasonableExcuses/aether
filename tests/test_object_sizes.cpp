@@ -22,6 +22,7 @@ static_assert(sizeof(ByteArray) == 32, "ByteArray size must be exactly 32 bytes"
 static_assert(sizeof(LexicalEnvironment) == 40, "LexicalEnvironment size must be exactly 40 bytes (<= 48 B)");
 static_assert(sizeof(JSMap) == 64, "JSMap size must be exactly 64 bytes (<= 64 B)");
 static_assert(sizeof(JSSet) == 64, "JSSet size must be exactly 64 bytes (<= 64 B)");
+static_assert(sizeof(JSPromise) == 80, "JSPromise size must be exactly 80 bytes (<= 80 B)");
 
 void TestObjectInObjectStorage() {
     Heap heap;
@@ -330,6 +331,57 @@ void TestMapSetMemoryDiet() {
     std::cout << "  -> JSMap & JSSet memory diet & GC tables verified.\n";
 }
 
+void TestPromiseMemoryDiet() {
+    Heap heap;
+    IsolateScope isolate(heap);
+    MicrotaskQueue queue;
+
+    // JSPromise memory diet and GC FixedArray reactions
+    JSPromise promise(nullptr);
+    assert(promise.ObjectSize() == sizeof(JSPromise));
+    assert(promise.State() == PromiseState::Pending);
+    assert(promise.Result().IsUndefined());
+    assert(promise.ReactionCount() == 0);
+    assert(promise.ReactionsArray() == nullptr);
+    assert(!promise.HasReactions());
+
+    // Add reactions
+    TaggedValue fn1 = TaggedValue::FromSmi(1);
+    TaggedValue fn2 = TaggedValue::FromSmi(2);
+    JSPromise downstream(nullptr);
+
+    promise.AddReaction(fn1, fn2, &downstream, queue);
+    assert(promise.ReactionCount() == 1);
+    assert(promise.HasReactions());
+    assert(promise.ReactionsArray() != nullptr);
+    assert(promise.ReactionsArray()->Length() == 3);
+    assert(promise.ReactionsArray()->Get(0).AsSmi() == 1);
+    assert(promise.ReactionsArray()->Get(1).AsSmi() == 2);
+    assert(promise.ReactionsArray()->Get(2).AsHeapObject() == &downstream);
+
+    // Add another reaction
+    promise.AddReaction(TaggedValue::Null(), TaggedValue::Null(), nullptr, queue);
+    assert(promise.ReactionCount() == 2);
+    assert(promise.ReactionsArray()->Length() == 6);
+
+    // Fulfill promise - reactions cleared to nullptr, state updated
+    TaggedValue fulfill_val = TaggedValue::FromSmi(42);
+    promise.Fulfill(fulfill_val, queue);
+    assert(promise.State() == PromiseState::Fulfilled);
+    assert(promise.Result().AsSmi() == 42);
+    assert(promise.ReactionCount() == 0);
+    assert(promise.ReactionsArray() == nullptr);
+    assert(!promise.HasReactions());
+
+    // Subsequent add reaction on settled promise enqueues microtask immediately
+    size_t q_size_before = queue.Size();
+    promise.AddReaction(fn1, fn2, nullptr, queue);
+    assert(queue.Size() > q_size_before);
+    assert(promise.ReactionCount() == 0);
+
+    std::cout << "  -> JSPromise memory diet & GC reactions verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "   AetherVM T1.7 Per-Object Memory Diet Test Suite\n";
@@ -342,6 +394,7 @@ int main() {
     TestGCAllocatedArrays();
     TestLexicalEnvironmentDiet();
     TestMapSetMemoryDiet();
+    TestPromiseMemoryDiet();
 
     std::cout << "\n[PASS] All per-object memory diet tests passed successfully.\n";
     return 0;

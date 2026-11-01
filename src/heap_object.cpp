@@ -994,19 +994,25 @@ void JSPromise::Fulfill(TaggedValue val, MicrotaskQueue& queue) {
         RecordWriteBarrier(this, val);
     }
 
-    for (const auto& reaction : reactions_) {
-        auto on_fulfilled = reaction.on_fulfilled;
-        auto* downstream = reaction.downstream_promise;
-        queue.Enqueue([on_fulfilled, val, downstream, &queue]() {
-            if (!on_fulfilled.IsEmpty() && !on_fulfilled.IsUndefined()) {
-                TaggedValue res = CallFunction(on_fulfilled, TaggedValue::Undefined(), {val});
-                if (downstream) downstream->Fulfill(res, queue);
-            } else {
-                if (downstream) downstream->Fulfill(val, queue);
-            }
-        }, {on_fulfilled, val, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
+    if (reactions_) {
+        size_t count = ReactionCount();
+        for (size_t i = 0; i < count; ++i) {
+            TaggedValue on_fulfilled = reactions_->Get(static_cast<uint32_t>(i * 3 + 0));
+            TaggedValue on_rejected = reactions_->Get(static_cast<uint32_t>(i * 3 + 1));
+            TaggedValue downstream_val = reactions_->Get(static_cast<uint32_t>(i * 3 + 2));
+            auto* downstream = (downstream_val.IsHeapObject() && downstream_val.AsHeapObject()->IsJSObject())
+                ? static_cast<JSPromise*>(downstream_val.AsHeapObject()) : nullptr;
+            queue.Enqueue([on_fulfilled, val, downstream, &queue]() {
+                if (!on_fulfilled.IsEmpty() && !on_fulfilled.IsUndefined()) {
+                    TaggedValue res = CallFunction(on_fulfilled, TaggedValue::Undefined(), {val});
+                    if (downstream) downstream->Fulfill(res, queue);
+                } else {
+                    if (downstream) downstream->Fulfill(val, queue);
+                }
+            }, {on_fulfilled, val, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
+        }
+        reactions_ = nullptr;
     }
-    reactions_.clear();
 }
 
 void JSPromise::Reject(TaggedValue reason, MicrotaskQueue& queue) {
@@ -1017,19 +1023,25 @@ void JSPromise::Reject(TaggedValue reason, MicrotaskQueue& queue) {
         RecordWriteBarrier(this, reason);
     }
 
-    for (const auto& reaction : reactions_) {
-        auto on_rejected = reaction.on_rejected;
-        auto* downstream = reaction.downstream_promise;
-        queue.Enqueue([on_rejected, reason, downstream, &queue]() {
-            if (!on_rejected.IsEmpty() && !on_rejected.IsUndefined()) {
-                TaggedValue res = CallFunction(on_rejected, TaggedValue::Undefined(), {reason});
-                if (downstream) downstream->Fulfill(res, queue);
-            } else {
-                if (downstream) downstream->Reject(reason, queue);
-            }
-        }, {on_rejected, reason, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
+    if (reactions_) {
+        size_t count = ReactionCount();
+        for (size_t i = 0; i < count; ++i) {
+            TaggedValue on_fulfilled = reactions_->Get(static_cast<uint32_t>(i * 3 + 0));
+            TaggedValue on_rejected = reactions_->Get(static_cast<uint32_t>(i * 3 + 1));
+            TaggedValue downstream_val = reactions_->Get(static_cast<uint32_t>(i * 3 + 2));
+            auto* downstream = (downstream_val.IsHeapObject() && downstream_val.AsHeapObject()->IsJSObject())
+                ? static_cast<JSPromise*>(downstream_val.AsHeapObject()) : nullptr;
+            queue.Enqueue([on_rejected, reason, downstream, &queue]() {
+                if (!on_rejected.IsEmpty() && !on_rejected.IsUndefined()) {
+                    TaggedValue res = CallFunction(on_rejected, TaggedValue::Undefined(), {reason});
+                    if (downstream) downstream->Fulfill(res, queue);
+                } else {
+                    if (downstream) downstream->Reject(reason, queue);
+                }
+            }, {on_rejected, reason, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
+        }
+        reactions_ = nullptr;
     }
-    reactions_.clear();
 }
 
 void JSPromise::AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, JSPromise* downstream, MicrotaskQueue& queue) {
@@ -1054,13 +1066,54 @@ void JSPromise::AddReaction(TaggedValue on_fulfilled, TaggedValue on_rejected, J
             }
         }, {on_rejected, reason, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Undefined()});
     } else {
-        detail::ReserveStorage(reactions_, reactions_storage_, reactions_.size() + 1);
-        reactions_.push_back({on_fulfilled, on_rejected, downstream});
-        if (AETHER_UNLIKELY(IsOld())) {
-            if (on_fulfilled.IsHeapObject()) RecordWriteBarrier(this, on_fulfilled);
-            if (on_rejected.IsHeapObject()) RecordWriteBarrier(this, on_rejected);
-            if (downstream) RecordWriteBarrier(this, TaggedValue::FromHeapObject(downstream));
+        size_t current_count = ReactionCount();
+        if (AETHER_UNLIKELY(current_count >= kMaxObjectProperties)) {
+            throw std::length_error("promise reaction limit exceeded");
         }
+
+        IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+        if (!heap) heap = IsolateHeap::Current();
+        if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+        HandleScope scope(*heap);
+        if (heap->Contains(this)) {
+            scope.CreateHandle(this);
+        }
+        if (on_fulfilled.IsHeapObject() && heap->Contains(on_fulfilled.AsHeapObject())) {
+            scope.CreateHandle(on_fulfilled.AsHeapObject());
+        }
+        if (on_rejected.IsHeapObject() && heap->Contains(on_rejected.AsHeapObject())) {
+            scope.CreateHandle(on_rejected.AsHeapObject());
+        }
+        if (downstream && heap->Contains(downstream)) {
+            scope.CreateHandle(downstream);
+        }
+        if (reactions_ && heap->Contains(reactions_)) {
+            scope.CreateHandle(reactions_);
+        }
+
+        uint32_t new_len = static_cast<uint32_t>((current_count + 1) * 3);
+        uint32_t current_cap = reactions_ ? reactions_->Capacity() : 0;
+
+        if (!reactions_ || new_len > current_cap) {
+            uint32_t new_cap = std::max(uint32_t(6), std::max(new_len, current_cap * 2));
+            FixedArray* new_arr = AllocateRuntimeFixedArrayFor(this, new_len, new_cap, TaggedValue::Empty());
+            if (reactions_) {
+                for (uint32_t i = 0; i < reactions_->Length(); ++i) {
+                    new_arr->Set(i, reactions_->Get(i));
+                }
+            }
+            reactions_ = new_arr;
+            if (AETHER_UNLIKELY(IsOld() && reactions_->IsYoung())) {
+                RecordWriteBarrier(this, TaggedValue::FromHeapObject(reactions_));
+            }
+        } else {
+            reactions_->SetLength(new_len);
+        }
+
+        uint32_t base = static_cast<uint32_t>(current_count * 3);
+        reactions_->Set(base + 0, on_fulfilled);
+        reactions_->Set(base + 1, on_rejected);
+        reactions_->Set(base + 2, downstream ? TaggedValue::FromHeapObject(downstream) : TaggedValue::Null());
     }
 }
 

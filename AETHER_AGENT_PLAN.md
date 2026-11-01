@@ -225,7 +225,7 @@ Goal: trivially relocatable objects, no per-object destructors, real evacuation.
 
 ### T2.1 GC-allocated array types
 - Introduce `FixedArray<TaggedValue>`, `ByteArray`, `PropertyArray`, `ElementsArray` as heap objects (some exist: `HeapObjectType::FixedArray`; check `heap_object.h` before adding).
-- Migrate in order of volume: `JSObject` property slots [x] → `JSArray` elements [x] → `LexicalEnvironment` slots [x] → `JSFunction` captured data [x] → `JSMap/JSSet` tables [x] → promise reaction lists.
+- Migrate in order of volume: `JSObject` property slots [x] → `JSArray` elements [x] → `LexicalEnvironment` slots [x] → `JSFunction` captured data [x] → `JSMap/JSSet` tables [x] → promise reaction lists [x].
 - Each migration PR removes the matching `std::vector`/`std::unordered_map` and `MemoryCharge` for that field.
 - **Acceptance:** per type, `sizeof` and RSS benches improve; destructor of migrated type becomes trivial.
 
