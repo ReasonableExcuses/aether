@@ -198,6 +198,9 @@ struct alignas(64) ImmixBlock {
     uint8_t live_lines_count{0};                      // 1 byte    (offset 835)
     uint8_t _padding[kHeaderSize - 836];              // 188 bytes (offset 836..1023)
 
+    static constexpr uint16_t kBlockFlagEvacuate = 1 << 0;
+    static constexpr uint8_t kEvacuationLineThreshold = 124;
+
     // 31,744-byte Payload (Lines 8..255)
     alignas(kObjectAlignment) uint8_t payload[kPayloadSize];
 
@@ -296,6 +299,13 @@ public:
     bool IsValidObjectStart(const void* ptr) const noexcept;
     size_t BlockCount() const noexcept { return all_blocks_.size(); }
     std::mutex& GetMarkMutex() const noexcept { return mark_mutex_; }
+
+    std::vector<ImmixBlock*> SelectEvacuationCandidates();
+    void* AllocateForEvacuation(size_t bytes);
+    void ResetActiveBlock() noexcept;
+    size_t ActiveCommittedBytes() const noexcept;
+    size_t FreeBlockCount() const noexcept;
+    const std::vector<ImmixBlock*>& GetAllBlocks() const noexcept { return all_blocks_; }
 
 private:
     bool AllocateBlock();

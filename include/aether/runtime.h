@@ -232,6 +232,7 @@ public:
     TaggedValue GetSymbolHasInstance() const noexcept { return symbol_hasInstance_; }
     TaggedValue GetSymbolToPrimitive() const noexcept { return symbol_toPrimitive_; }
     TaggedValue GetSymbolUnscopables() const noexcept { return symbol_unscopables_; }
+    void UpdatePointers(const std::function<HeapObject*(HeapObject*)>& resolve);
 
 private:
     void InitializeIntrinsics(Heap& heap);

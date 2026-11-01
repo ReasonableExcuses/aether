@@ -39,6 +39,7 @@
 #include <pthread.h>
 #endif
 #include "aether/advanced_intrinsics.h"
+#include "aether/runtime.h"
 #include "aether/wasm.h"
 #include "aether/heap_verifier.h"
 #include "aether/options.h"
@@ -380,6 +381,10 @@ void IsolateHeap::MinorGC() {
             TaggedValue val = *slot;
             if (val.IsHeapObject()) {
                 HeapObject* obj = val.AsHeapObject();
+                if (obj && obj->IsForwarded()) {
+                    obj = obj->GetForwardedAddress();
+                    *slot = TaggedValue::FromHeapObject(obj);
+                }
                 if (obj && obj->IsYoung() && !obj->IsMarked()) {
                     obj->SetMarked(true);
                     mark_stack_.push_back(obj);
@@ -398,6 +403,9 @@ void IsolateHeap::MinorGC() {
     // 2. Visit native stack conservatively (pinned roots)
     ScanStack([&](HeapObject* obj) {
         if (!obj) return;
+        if (obj->IsForwarded()) {
+            obj = obj->GetForwardedAddress();
+        }
         obj->SetPinned(true);
         if (obj->IsYoung() && !obj->IsMarked()) {
             obj->SetMarked(true);
@@ -645,17 +653,182 @@ void IsolateHeap::FinalizeConcurrentGC() {
     if (concurrent_marker_) concurrent_marker_->Stop();
 }
 
+namespace {
+bool CanEvacuate(const HeapObject* obj) noexcept {
+    if (!obj || obj->IsPinned() || obj->IsStable() || obj->IsForwarded()) return false;
+    switch (obj->GetType()) {
+        case HeapObjectType::String:
+        case HeapObjectType::ByteArray:
+        case HeapObjectType::FixedArray:
+        case HeapObjectType::JSArray:
+        case HeapObjectType::JSMap:
+        case HeapObjectType::JSSet:
+        case HeapObjectType::LexicalEnvironment:
+            return true;
+        case HeapObjectType::JSObject:
+            return obj->GetAllocatedSize() == 0 || obj->GetAllocatedSize() == sizeof(JSObject);
+        default:
+            return false;
+    }
+}
+} // namespace
+
+void IsolateHeap::Defragment(const std::vector<ImmixBlock*>& candidates, std::vector<HeapObject*>& live) {
+    if (candidates.empty()) return;
+
+    struct EvacuatedPair {
+        HeapObject* old_obj;
+        HeapObject* new_obj;
+        ImmixBlock* old_block;
+    };
+    std::vector<EvacuatedPair> evacuated;
+
+    // Phase 1: Evacuate unpinned, relocatable objects from candidate blocks
+    for (auto* block : candidates) {
+        block->ForEachObject([&](HeapObject* obj) {
+            if (!obj->IsMarked()) return;
+            if (!CanEvacuate(obj)) return;
+
+            size_t bytes = obj->GetAllocatedSize();
+            if (bytes == 0) bytes = obj->ObjectSize();
+            bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+
+            void* dst = old_gen_.AllocateForEvacuation(bytes);
+            if (!dst) return;
+
+            HeapObject* new_obj = obj->RelocateTo(dst);
+            new_obj->SetMarked(true);
+            new_obj->SetOld(true);
+            new_obj->SetPinned(false);
+            new_obj->SetAllocatedSize(static_cast<uint32_t>(bytes));
+            if (obj->IsCharged()) new_obj->SetCharged(true);
+
+            // Register new_obj in dst block
+            ImmixBlock* dst_block = ImmixBlock::BlockFor(new_obj);
+            dst_block->SetObjectStart(new_obj);
+            size_t start_line = dst_block->LineFor(new_obj);
+            size_t end_line = dst_block->LineFor(reinterpret_cast<const uint8_t*>(new_obj) + bytes - 1);
+            for (size_t l = start_line; l <= end_line && l < kLinesPerBlock; ++l) {
+                dst_block->line_marks[l] = 1;
+                dst_block->line_allocated.set(l);
+            }
+
+            // Remove from candidate block's object starts
+            block->ClearObjectStart(obj);
+
+            // Overwrite old header with forwarding address
+            obj->SetForwardedAddress(new_obj);
+            evacuated.push_back({obj, new_obj, block});
+        });
+    }
+
+    if (evacuated.empty()) {
+        for (auto* block : candidates) {
+            block->flags &= ~ImmixBlock::kBlockFlagEvacuate;
+        }
+        return;
+    }
+
+    // Phase 2: Pointer fixup across all roots and live heap objects
+    class FixupVisitor final : public SlotVisitor {
+    public:
+        void Visit(TaggedValue* slot) override {
+            if (!slot) return;
+            if (slot->IsHeapObject()) {
+                HeapObject* target = slot->AsHeapObject();
+                if (target && target->IsForwarded()) {
+                    *slot = TaggedValue::FromHeapObject(target->GetForwardedAddress());
+                }
+            }
+        }
+    } fixup;
+
+    // (a) Fix roots
+    VisitRoots(&fixup);
+
+    // (b) Fix all live objects in the heap (both young and old)
+    for (HeapObject* obj : live) {
+        if (obj && !obj->IsForwarded()) {
+            obj->IteratePointers(&fixup);
+        }
+    }
+
+    // Newly evacuated objects
+    for (const auto& pair : evacuated) {
+        pair.new_obj->IteratePointers(&fixup);
+    }
+
+    // Large objects
+    for (auto* lobj = old_gen_.large_objects_head_; lobj; lobj = lobj->next) {
+        if (lobj->constructed && (lobj->marked || lobj->Object()->IsMarked())) {
+            lobj->Object()->IteratePointers(&fixup);
+        }
+    }
+
+    // (c) Fix containers and registries
+    for (auto*& obj : remembered_set_) {
+        if (obj && obj->IsForwarded()) { obj = obj->GetForwardedAddress(); card_table_.MarkCard(obj); }
+    }
+    for (auto*& obj : weak_containers_) { if (obj && obj->IsForwarded()) obj = obj->GetForwardedAddress(); }
+    for (auto*& obj : young_objects_) { if (obj && obj->IsForwarded()) obj = obj->GetForwardedAddress(); }
+    for (auto*& obj : live) { if (obj && obj->IsForwarded()) obj = obj->GetForwardedAddress(); }
+
+    if (Realm* realm = Realm::Current()) {
+        realm->UpdatePointers([](HeapObject* obj) -> HeapObject* {
+            if (!obj) return nullptr;
+            if (obj->IsForwarded()) return obj->GetForwardedAddress();
+            return obj;
+        });
+    }
+
+    WasmRegistryRelocate([this](JSObject* obj) -> JSObject* {
+        if (!obj || !Contains(obj)) return obj;
+        if (obj->IsForwarded()) return static_cast<JSObject*>(obj->GetForwardedAddress());
+        return obj;
+    });
+
+    // Phase 3: Cleanup candidate blocks
+    for (auto* block : candidates) {
+        std::memset(block->line_marks, 0, sizeof(block->line_marks));
+    }
+
+    for (const auto& pair : evacuated) {
+        size_t bytes = pair.old_obj->GetAllocatedSize();
+        if (bytes == 0) bytes = pair.old_obj->ObjectSize();
+        if (Options::Get().gc_verify) {
+            std::memset(static_cast<void*>(pair.old_obj), kOldGenPoisonByte, bytes);
+        }
+    }
+
+    for (auto* block : candidates) {
+        block->flags &= ~ImmixBlock::kBlockFlagEvacuate;
+    }
+}
+
 void IsolateHeap::MajorGC() {
     AssertOwnerThread();
     if (!GCAllowed()) return;
     HeapVerifier::VerifyBeforeGC(*this);
     CollectionScope collecting(collecting_);
     auto live = Trace({});
+
+    // Opportunistic Immix Defragmentation (T2.3)
+    auto candidates = old_gen_.SelectEvacuationCandidates();
+    if (!candidates.empty()) {
+        Defragment(candidates, live);
+    }
+
     // Liveness is tracked directly in object mark bits.
     ProcessWeak(live, [&](HeapObject* obj) -> HeapObject* {
+        if (!obj) return nullptr;
+        if (obj->IsForwarded()) obj = obj->GetForwardedAddress();
         return (obj && obj->IsMarked()) ? obj : nullptr;
     });
-    WasmRegistryPruneDead([&](JSObject* obj) { return obj && Contains(obj) && obj->IsMarked(); });
+    WasmRegistryPruneDead([&](JSObject* obj) {
+        if (!obj || !Contains(obj)) return false;
+        if (obj->IsForwarded()) obj = static_cast<JSObject*>(obj->GetForwardedAddress());
+        return obj && obj->IsMarked();
+    });
 
     // In Major GC, any live young object promotes to old
     for (auto* obj : young_objects_) {
@@ -681,6 +854,7 @@ void IsolateHeap::MajorGC() {
     remembered_set_.clear();
 
     old_gen_.Sweep();
+    old_gen_.ResetActiveBlock();
     card_table_.Clear();
     ++major_gc_count_;
 
@@ -701,7 +875,8 @@ void IsolateHeap::MajorGC() {
 
     HeapVerifier::VerifyAfterGC(*this);
     if (Options::Get().trace_gc) {
-        std::cout << "[GC] MajorGC #" << major_gc_count_ << ": live=" << live.size() << " objects, usage=" << (budget_->ChargedBytes() / 1024) << "KB" << std::endl;
+        std::cout << "[GC] MajorGC #" << major_gc_count_ << ": live=" << live.size() << " objects, usage=" << (budget_->ChargedBytes() / 1024) << "KB"
+                  << ", frag=" << FragmentationRatio() << "x" << std::endl;
     }
 }
 

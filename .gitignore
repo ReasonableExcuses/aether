@@ -17,6 +17,7 @@ out/
 # Compiler and CMake Cache
 CMakeCache.txt
 CMakeFiles/
+Testing/
 cmake_install.cmake
 PASSOVER.md
 AETHER_AGENT_PLAN.md

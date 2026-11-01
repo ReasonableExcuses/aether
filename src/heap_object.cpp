@@ -1205,6 +1205,19 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
 }
 
 void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id) {
+    PinnedScope pin_this(this);
+    PinnedScope pin_val(value.IsHeapObject() ? value.AsHeapObject() : nullptr);
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap && value.IsHeapObject()) heap = IsolateHeap::HeapForObject(value.AsHeapObject());
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    if (value.IsHeapObject() && heap->Contains(value.AsHeapObject())) {
+        scope.CreateHandle(value.AsHeapObject());
+    }
     CheckPropertyGrowth(key);
     Shape* current_shape = GetShape();
     if (current_shape == nullptr) {
@@ -1396,6 +1409,9 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
 
 // JSMap Implementation
 void JSMap::Set(TaggedValue key, TaggedValue val) {
+    PinnedScope pin_this(this);
+    PinnedScope pin_k(key.IsHeapObject() ? key.AsHeapObject() : nullptr);
+    PinnedScope pin_v(val.IsHeapObject() ? val.AsHeapObject() : nullptr);
     size_t count = Size();
     if (table_) {
         for (size_t i = 0; i < count; ++i) {
@@ -1510,6 +1526,8 @@ std::vector<std::pair<TaggedValue, TaggedValue>> JSMap::Entries() const {
 
 // JSSet Implementation
 void JSSet::Add(TaggedValue val) {
+    PinnedScope pin_this(this);
+    PinnedScope pin_v(val.IsHeapObject() ? val.AsHeapObject() : nullptr);
     if (Has(val)) return;
 
     size_t count = Size();
@@ -2128,6 +2146,22 @@ void JSArray::SetLength(size_t len) {
 }
 
 void JSArray::SetElement(size_t index, TaggedValue val) {
+    PinnedScope pin_this(this);
+    PinnedScope pin_val(val.IsHeapObject() ? val.AsHeapObject() : nullptr);
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap && val.IsHeapObject()) heap = IsolateHeap::HeapForObject(val.AsHeapObject());
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    if (val.IsHeapObject() && heap->Contains(val.AsHeapObject())) {
+        scope.CreateHandle(val.AsHeapObject());
+    }
+    if (elements_ && heap->Contains(elements_)) {
+        scope.CreateHandle(elements_);
+    }
     if (AETHER_UNLIKELY(index >= kMaxArrayLength)) {
         throw std::length_error("array index exceeds the maximum length");
     }

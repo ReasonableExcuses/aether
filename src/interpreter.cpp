@@ -224,6 +224,7 @@ void Interpreter::IterateRoots(SlotVisitor* visitor) {
         }
     }
     for (ExecutionFrame* frame = current_frame_; frame; frame = frame->GetPrevFrame()) {
+        const_cast<BytecodeArray&>(frame->GetBytecode()).IterateConstants(visitor);
         TaggedValue this_val = frame->GetThis();
         visitor->Visit(&this_val);
         frame->SetThis(this_val);

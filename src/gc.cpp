@@ -1,4 +1,5 @@
 #include "aether/gc.h"
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -567,6 +568,98 @@ bool ImmixSpace::IsValidObjectStart(const void* ptr) const noexcept {
         }
     }
     return false;
+}
+
+std::vector<ImmixBlock*> ImmixSpace::SelectEvacuationCandidates() {
+    std::vector<ImmixBlock*> candidates;
+    size_t active_block_count = 0;
+    for (auto* block : all_blocks_) {
+        if (block && block->state != BlockState::Free) ++active_block_count;
+    }
+    if (active_block_count <= 1) return candidates;
+
+    for (auto* block : all_blocks_) {
+        if (!block || block->state == BlockState::Free) continue;
+        size_t live_bytes = 0, live_objects = 0;
+        block->ForEachObject([&](HeapObject* obj) {
+            if (obj && obj->IsMarked()) {
+                live_bytes += obj->GetAllocatedSize() ? obj->GetAllocatedSize() : obj->ObjectSize();
+                ++live_objects;
+            }
+        });
+        if (live_objects > 0 && live_bytes <= (kPayloadSize / 2)) {
+            block->flags |= ImmixBlock::kBlockFlagEvacuate;
+            candidates.push_back(block);
+        }
+    }
+    return candidates;
+}
+
+void* ImmixSpace::AllocateForEvacuation(size_t bytes) {
+    if (bytes == 0 || bytes > kPayloadSize) return nullptr;
+    bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
+
+    // 1. Try non-candidate recyclable blocks first
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Recyclable && !(block->flags & ImmixBlock::kBlockFlagEvacuate)) {
+            void* mem = block->Allocate(bytes);
+            if (mem) {
+                last_allocation_ptr_ = mem;
+                last_allocation_bytes_ = bytes;
+                return mem;
+            }
+        }
+    }
+
+    // 2. Try non-candidate free blocks
+    for (auto* block : all_blocks_) {
+        if (block->state == BlockState::Free && !(block->flags & ImmixBlock::kBlockFlagEvacuate)) {
+            block->state = BlockState::Recyclable;
+            void* mem = block->Allocate(bytes);
+            if (mem) {
+                last_allocation_ptr_ = mem;
+                last_allocation_bytes_ = bytes;
+                return mem;
+            }
+        }
+    }
+
+    // 3. Allocate fresh block from reservation if space remains
+    try {
+        AllocateBlock();
+        auto* new_block = all_blocks_.back();
+        void* mem = new_block->Allocate(bytes);
+        if (mem) {
+            last_allocation_ptr_ = mem;
+            last_allocation_bytes_ = bytes;
+            return mem;
+        }
+    } catch (...) {
+        return nullptr;
+    }
+    return nullptr;
+}
+
+void ImmixSpace::ResetActiveBlock() noexcept {
+    for (size_t i = 0; i < all_blocks_.size(); ++i) {
+        if (all_blocks_[i]->state == BlockState::Recyclable || all_blocks_[i]->state == BlockState::Free) {
+            active_block_index_ = i;
+            return;
+        }
+    }
+}
+
+size_t ImmixSpace::ActiveCommittedBytes() const noexcept {
+    size_t count = 0;
+    for (const auto* b : all_blocks_) if (b && b->state != BlockState::Free) count += kImmixBlockSize;
+    for (const auto* lobj = large_objects_head_; lobj; lobj = lobj->next) count += lobj->size;
+    return count;
+}
+
+size_t ImmixSpace::FreeBlockCount() const noexcept {
+    size_t count = 0;
+    for (const auto* b : all_blocks_) if (b && b->state == BlockState::Free) ++count;
+    return count;
 }
 
 } // namespace aether

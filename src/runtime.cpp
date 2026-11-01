@@ -7735,4 +7735,19 @@ TaggedValue Agent::EvaluateModuleWithEventLoop(std::string_view source, std::str
     return result;
 }
 
+void Realm::UpdatePointers(const std::function<HeapObject*(HeapObject*)>& resolve) {
+    auto fix = [&](JSObject*& ptr) { if (ptr) if (auto* f = resolve(ptr)) ptr = static_cast<JSObject*>(f); };
+    fix(global_object_); fix(math_object_); fix(console_object_); fix(json_object_);
+    fix(object_prototype_); fix(function_prototype_); fix(array_prototype_); fix(string_prototype_);
+    fix(map_prototype_); fix(set_prototype_); fix(promise_prototype_); fix(regexp_prototype_);
+    fix(array_buffer_prototype_); fix(typed_array_prototype_); fix(data_view_prototype_);
+    fix(generator_prototype_); fix(async_generator_prototype_); fix(number_prototype_);
+    fix(boolean_prototype_); fix(date_prototype_); fix(symbol_prototype_); fix(bigint_prototype_);
+    auto fix_val = [&](TaggedValue& val) {
+        if (val.IsHeapObject()) if (auto* f = resolve(val.AsHeapObject())) val = TaggedValue::FromHeapObject(f);
+    };
+    fix_val(symbol_iterator_); fix_val(symbol_asyncIterator_); fix_val(symbol_toStringTag_);
+    fix_val(symbol_hasInstance_); fix_val(symbol_toPrimitive_); fix_val(symbol_unscopables_);
+}
+
 } // namespace aether

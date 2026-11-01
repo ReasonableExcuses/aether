@@ -135,7 +135,9 @@ public:
     template <typename T, typename... Args>
     T* AllocateStable(Args&&... args) {
         NoGCScope guard(*this);
-        return AllocateOld<T>(std::forward<Args>(args)...);
+        auto* obj = AllocateOld<T>(std::forward<Args>(args)...);
+        if (obj) obj->SetStable(true);
+        return obj;
     }
 
     FixedArray* AllocateFixedArray(uint32_t length, uint32_t capacity, TaggedValue init, bool old) {
@@ -259,6 +261,13 @@ public:
     double HeapPressure() const noexcept {
         return HeapBudget() > 0 ? static_cast<double>(TotalAllocatedBytes()) / static_cast<double>(HeapBudget()) * 100.0 : 0.0;
     }
+    size_t ActiveCommittedBytes() const noexcept { return old_gen_.ActiveCommittedBytes(); }
+    size_t LastMajorLiveBytes() const noexcept { return last_major_live_bytes_; }
+    double FragmentationRatio() const noexcept {
+        size_t live = last_major_live_bytes_;
+        if (live == 0) return 1.0;
+        return static_cast<double>(ActiveCommittedBytes()) / static_cast<double>(live);
+    }
     bool IsSafepointRequested() const noexcept { return safepoint_requested_; }
     void RequestSafepoint() noexcept { safepoint_requested_ = true; }
     void ClearSafepointRequest() noexcept { safepoint_requested_ = false; }
@@ -310,7 +319,7 @@ private:
                     }
                 } else {
                     MajorGC();
-                }
+                    }
             }
         }
         const bool budget_pressure = (HeapBudget() > 0 && TotalAllocatedBytes() >= HeapBudget() * 75 / 100);
@@ -431,6 +440,7 @@ private:
     void VisitRoots(SlotVisitor* visitor);
     void VisitRoots(const std::function<void(TaggedValue&)>& visitor);
     std::vector<HeapObject*> Trace(const std::vector<HeapObject*>& roots);
+    void Defragment(const std::vector<ImmixBlock*>& candidates, std::vector<HeapObject*>& live);
     void ProcessWeak(const std::vector<HeapObject*>& live,
                      const std::function<HeapObject*(HeapObject*)>& resolve);
 
@@ -516,24 +526,36 @@ using Heap = IsolateHeap;
  */
 template <typename T, typename... Args>
 inline T* AllocateRuntime(Args&&... args) {
+    T* obj = nullptr;
     if (IsolateHeap* h = IsolateHeap::Current()) {
-        return h->Allocate<T>(std::forward<Args>(args)...);
+        obj = h->Allocate<T>(std::forward<Args>(args)...);
+    } else {
+        obj = IsolateHeap::RuntimeFallbackHeap().Allocate<T>(std::forward<Args>(args)...);
     }
-    return IsolateHeap::RuntimeFallbackHeap().Allocate<T>(std::forward<Args>(args)...);
+    if (obj) obj->SetStable(true);
+    return obj;
 }
 
 inline FixedArray* AllocateRuntimeFixedArray(uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {
+    FixedArray* arr = nullptr;
     if (IsolateHeap* h = IsolateHeap::Current()) {
-        return h->AllocateFixedArray(length, capacity, init);
+        arr = h->AllocateFixedArray(length, capacity, init);
+    } else {
+        arr = IsolateHeap::RuntimeFallbackHeap().AllocateFixedArray(length, capacity, init);
     }
-    return IsolateHeap::RuntimeFallbackHeap().AllocateFixedArray(length, capacity, init);
+    if (arr) arr->SetStable(true);
+    return arr;
 }
 
 inline ByteArray* AllocateRuntimeByteArray(uint32_t length) {
+    ByteArray* arr = nullptr;
     if (IsolateHeap* h = IsolateHeap::Current()) {
-        return h->AllocateByteArray(length);
+        arr = h->AllocateByteArray(length);
+    } else {
+        arr = IsolateHeap::RuntimeFallbackHeap().AllocateByteArray(length);
     }
-    return IsolateHeap::RuntimeFallbackHeap().AllocateByteArray(length);
+    if (arr) arr->SetStable(true);
+    return arr;
 }
 
 inline FixedArray* AllocateRuntimeFixedArrayFor(const void* owner, uint32_t length, uint32_t capacity = 0, TaggedValue init = TaggedValue::Empty()) {

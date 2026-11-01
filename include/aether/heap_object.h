@@ -315,6 +315,13 @@ public:
     static constexpr uint16_t kExtensibleBit  = 1 << 10;
     static constexpr uint16_t kSealedBit      = 1 << 11;
     static constexpr uint16_t kFrozenBit      = 1 << 12;
+    static constexpr uint16_t kStableBit      = 1 << 13;
+
+    AETHER_ALWAYS_INLINE bool IsStable() const noexcept { return (gc_metadata_ & kStableBit) != 0; }
+    AETHER_ALWAYS_INLINE void SetStable(bool s) noexcept {
+        if (s) gc_metadata_ |= kStableBit;
+        else   gc_metadata_ &= ~kStableBit;
+    }
 
     AETHER_ALWAYS_INLINE bool IsExtensible() const noexcept { return (gc_metadata_ & kExtensibleBit) != 0; }
     AETHER_ALWAYS_INLINE void SetExtensible(bool e) noexcept {
@@ -435,6 +442,27 @@ private:
 };
 
 static_assert(sizeof(HeapObject) == 24, "sizeof(HeapObject) must be 24 bytes (8B vptr + 8B shape + 2B type + 2B gc_metadata + 4B allocated_size)");
+
+struct PinnedScope {
+    HeapObject* obj_{nullptr};
+    bool was_stable_{false};
+
+    explicit PinnedScope(HeapObject* obj) noexcept : obj_(obj) {
+        if (obj_) {
+            was_stable_ = obj_->IsStable();
+            obj_->SetStable(true);
+        }
+    }
+
+    ~PinnedScope() noexcept {
+        if (obj_ && !was_stable_) {
+            obj_->SetStable(false);
+        }
+    }
+
+    PinnedScope(const PinnedScope&) = delete;
+    PinnedScope& operator=(const PinnedScope&) = delete;
+};
 
 /**
  * @brief Managed JavaScript String object on the heap.
@@ -633,6 +661,7 @@ public:
     HeapObject* RelocateTo(void* dst) override {
         auto* new_arr = new (dst) FixedArray(length_, capacity_);
         std::memcpy(new_arr->elements(), elements(), capacity_ * sizeof(TaggedValue));
+        new_arr->SetAllocatedSize(GetAllocatedSize());
         return new_arr;
     }
 
@@ -688,6 +717,7 @@ public:
     HeapObject* RelocateTo(void* dst) override {
         auto* new_arr = new (dst) ByteArray(length_);
         std::memcpy(new_arr->data(), data(), length_);
+        new_arr->SetAllocatedSize(GetAllocatedSize());
         return new_arr;
     }
 

@@ -234,7 +234,7 @@ Goal: trivially relocatable objects, no per-object destructors, real evacuation.
 - `s += "ab"` loop must be O(n) total.
 - **Acceptance:** `str.js 80000` < 0.3 s (-O2) and RSS < 64 MB; `"😀".length === 2`, `"😀".charCodeAt(0) === 0xD83D`, lone surrogates preserved.
 
-### T2.3 Opportunistic Immix defragmentation
+### T2.3 Opportunistic Immix defragmentation [x]
 - During major marking, compute per-block live-line histograms; select sparsely used blocks as evacuation candidates; evacuate **unpinned** objects (those not hit by conservative stack scan), install forwarding pointers, fix references, update the remembered set.
 - Objects with non-trivial C++ state are excluded until migrated (T2.1).
 - **Acceptance:** fragmentation (committed bytes / live bytes) after a churn benchmark ≤ 1.3×; verifier clean under `--gc-stress`.
