@@ -5428,15 +5428,17 @@ static TaggedValue Map_entries(TaggedValue this_val, const std::vector<TaggedVal
     auto idx_ptr = std::make_shared<size_t>(0);
     auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
-        if (map && *idx_ptr < map->Entries().size()) {
+        if (map && *idx_ptr < map->Size()) {
             size_t idx = (*idx_ptr)++;
-            const auto& entry = map->Entries()[idx];
+            FixedArray* tbl = map->Table();
+            TaggedValue k = tbl ? tbl->Get(static_cast<uint32_t>(idx * 2)) : TaggedValue::Undefined();
+            TaggedValue v = tbl ? tbl->Get(static_cast<uint32_t>(idx * 2 + 1)) : TaggedValue::Undefined();
             auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
             if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
                 pair->SetPrototype(Realm::Current()->GetArrayPrototype());
             }
-            pair->SetElement(0, entry.first);
-            pair->SetElement(1, entry.second);
+            pair->SetElement(0, k);
+            pair->SetElement(1, v);
             return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::FromHeapObject(pair), false));
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
@@ -5457,9 +5459,11 @@ static TaggedValue Map_keys(TaggedValue this_val, const std::vector<TaggedValue>
     auto idx_ptr = std::make_shared<size_t>(0);
     auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
-        if (map && *idx_ptr < map->Entries().size()) {
+        if (map && *idx_ptr < map->Size()) {
             size_t idx = (*idx_ptr)++;
-            return TaggedValue::FromHeapObject(CreateIterResult(map->Entries()[idx].first, false));
+            FixedArray* tbl = map->Table();
+            TaggedValue k = tbl ? tbl->Get(static_cast<uint32_t>(idx * 2)) : TaggedValue::Undefined();
+            return TaggedValue::FromHeapObject(CreateIterResult(k, false));
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
@@ -5479,9 +5483,11 @@ static TaggedValue Map_values(TaggedValue this_val, const std::vector<TaggedValu
     auto idx_ptr = std::make_shared<size_t>(0);
     auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [map, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
-        if (map && *idx_ptr < map->Entries().size()) {
+        if (map && *idx_ptr < map->Size()) {
             size_t idx = (*idx_ptr)++;
-            return TaggedValue::FromHeapObject(CreateIterResult(map->Entries()[idx].second, false));
+            FixedArray* tbl = map->Table();
+            TaggedValue v = tbl ? tbl->Get(static_cast<uint32_t>(idx * 2 + 1)) : TaggedValue::Undefined();
+            return TaggedValue::FromHeapObject(CreateIterResult(v, false));
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
@@ -5501,9 +5507,11 @@ static TaggedValue Set_values(TaggedValue this_val, const std::vector<TaggedValu
     auto idx_ptr = std::make_shared<size_t>(0);
     auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [set, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
-        if (set && *idx_ptr < set->Values().size()) {
+        if (set && *idx_ptr < set->Size()) {
             size_t idx = (*idx_ptr)++;
-            return TaggedValue::FromHeapObject(CreateIterResult(set->Values()[idx], false));
+            FixedArray* tbl = set->Table();
+            TaggedValue v = tbl ? tbl->Get(static_cast<uint32_t>(idx)) : TaggedValue::Undefined();
+            return TaggedValue::FromHeapObject(CreateIterResult(v, false));
         }
         return TaggedValue::FromHeapObject(CreateIterResult(TaggedValue::Undefined(), true));
     });
@@ -5523,9 +5531,10 @@ static TaggedValue Set_entries(TaggedValue this_val, const std::vector<TaggedVal
     auto idx_ptr = std::make_shared<size_t>(0);
     auto* iter_obj = AllocateRuntime<JSObject>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr);
     auto* next_fn = AllocateRuntime<JSNativeFunction>("next", [set, idx_ptr](const std::vector<TaggedValue>&) -> TaggedValue {
-        if (set && *idx_ptr < set->Values().size()) {
+        if (set && *idx_ptr < set->Size()) {
             size_t idx = (*idx_ptr)++;
-            TaggedValue val = set->Values()[idx];
+            FixedArray* tbl = set->Table();
+            TaggedValue val = tbl ? tbl->Get(static_cast<uint32_t>(idx)) : TaggedValue::Undefined();
             auto* pair = AllocateRuntime<JSArray>(Realm::Current() ? Realm::Current()->GetRootShape() : nullptr, 2);
             if (Realm::Current() && Realm::Current()->GetArrayPrototype()) {
                 pair->SetPrototype(Realm::Current()->GetArrayPrototype());

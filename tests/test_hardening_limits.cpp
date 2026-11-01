@@ -362,6 +362,7 @@ void TestManagedSizesAndCollectionCharges() {
     auto state = CurrentMemoryBudgetState();
     const size_t before_clear = state->ChargedBytes();
     map.Clear(); set.Clear();
+    heap.MajorGC();
     assert(state->ChargedBytes() < before_clear);
 }
 

@@ -1012,29 +1012,35 @@ public:
 
     JSMap(JSMap&& other) noexcept
         : JSObject(std::move(other)),
-          entries_storage_(std::move(other.entries_storage_)),
-          entries_(std::move(other.entries_)) {}
+          table_(other.table_) {
+        other.table_ = nullptr;
+    }
 
-    size_t Size() const noexcept { return entries_.size(); }
+    ~JSMap() override = default;
+
+    size_t Size() const noexcept { return table_ ? (table_->Length() / 2) : 0; }
+    FixedArray* Table() const noexcept { return table_; }
 
     void Set(TaggedValue key, TaggedValue val);
     TaggedValue Get(TaggedValue key) const;
     bool Has(TaggedValue key) const;
     bool Delete(TaggedValue key);
     void Clear() {
-        std::vector<std::pair<TaggedValue, TaggedValue>>().swap(entries_);
-        entries_storage_.Resize(0);
+        table_ = nullptr;
     }
 
-    const std::vector<std::pair<TaggedValue, TaggedValue>>& Entries() const noexcept { return entries_; }
+    std::vector<std::pair<TaggedValue, TaggedValue>> Entries() const;
 
     size_t ObjectSize() const override { return sizeof(JSMap); }
 
     void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        for (auto& [k, v] : entries_) {
-            if (!k.IsEmpty()) visitor->Visit(&k);
-            if (!v.IsEmpty()) visitor->Visit(&v);
+        if (table_ != nullptr) {
+            TaggedValue tbl_val = TaggedValue::FromHeapObject(table_);
+            visitor->Visit(&tbl_val);
+            if (tbl_val.IsHeapObject()) {
+                table_ = tbl_val.As<FixedArray>();
+            }
         }
     }
 
@@ -1043,9 +1049,10 @@ public:
     }
 
 private:
-    MemoryCharge entries_storage_;
-    std::vector<std::pair<TaggedValue, TaggedValue>> entries_;
+    FixedArray* table_{nullptr};
 };
+
+static_assert(sizeof(JSMap) == 64, "sizeof(JSMap) must be 64 bytes");
 
 /**
  * @brief Managed ECMAScript Set collection preserving insertion order.
@@ -1057,27 +1064,34 @@ public:
 
     JSSet(JSSet&& other) noexcept
         : JSObject(std::move(other)),
-          values_storage_(std::move(other.values_storage_)),
-          values_(std::move(other.values_)) {}
+          table_(other.table_) {
+        other.table_ = nullptr;
+    }
 
-    size_t Size() const noexcept { return values_.size(); }
+    ~JSSet() override = default;
+
+    size_t Size() const noexcept { return table_ ? table_->Length() : 0; }
+    FixedArray* Table() const noexcept { return table_; }
 
     void Add(TaggedValue val);
     bool Has(TaggedValue val) const;
     bool Delete(TaggedValue val);
     void Clear() {
-        std::vector<TaggedValue>().swap(values_);
-        values_storage_.Resize(0);
+        table_ = nullptr;
     }
 
-    const std::vector<TaggedValue>& Values() const noexcept { return values_; }
+    std::vector<TaggedValue> Values() const;
 
     size_t ObjectSize() const override { return sizeof(JSSet); }
 
     void IteratePointers(SlotVisitor* visitor) override {
         JSObject::IteratePointers(visitor);
-        for (auto& v : values_) {
-            if (!v.IsEmpty()) visitor->Visit(&v);
+        if (table_ != nullptr) {
+            TaggedValue tbl_val = TaggedValue::FromHeapObject(table_);
+            visitor->Visit(&tbl_val);
+            if (tbl_val.IsHeapObject()) {
+                table_ = tbl_val.As<FixedArray>();
+            }
         }
     }
 
@@ -1086,9 +1100,10 @@ public:
     }
 
 private:
-    MemoryCharge values_storage_;
-    std::vector<TaggedValue> values_;
+    FixedArray* table_{nullptr};
 };
+
+static_assert(sizeof(JSSet) == 64, "sizeof(JSSet) must be 64 bytes");
 
 enum class PromiseState : uint8_t {
     Pending   = 0,

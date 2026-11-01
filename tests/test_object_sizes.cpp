@@ -20,6 +20,8 @@ static_assert(sizeof(JSFunction) == 64, "JSFunction size must be exactly 64 byte
 static_assert(sizeof(FixedArray) == 32, "FixedArray size must be exactly 32 bytes");
 static_assert(sizeof(ByteArray) == 32, "ByteArray size must be exactly 32 bytes");
 static_assert(sizeof(LexicalEnvironment) == 40, "LexicalEnvironment size must be exactly 40 bytes (<= 48 B)");
+static_assert(sizeof(JSMap) == 64, "JSMap size must be exactly 64 bytes (<= 64 B)");
+static_assert(sizeof(JSSet) == 64, "JSSet size must be exactly 64 bytes (<= 64 B)");
 
 void TestObjectInObjectStorage() {
     Heap heap;
@@ -243,6 +245,91 @@ void TestLexicalEnvironmentDiet() {
     std::cout << "  -> LexicalEnvironment memory diet & GC slots verified.\n";
 }
 
+void TestMapSetMemoryDiet() {
+    Heap heap;
+    IsolateScope isolate(heap);
+
+    // JSMap memory diet and GC FixedArray table
+    JSMap map(nullptr);
+    assert(map.ObjectSize() == sizeof(JSMap));
+    assert(map.Size() == 0);
+    assert(map.Table() == nullptr);
+
+    TaggedValue k1 = TaggedValue::FromHeapObject(AllocateRuntime<JSString>("alpha"));
+    TaggedValue v1 = TaggedValue::FromSmi(100);
+    TaggedValue k2 = TaggedValue::FromHeapObject(AllocateRuntime<JSString>("beta"));
+    TaggedValue v2 = TaggedValue::FromSmi(200);
+
+    map.Set(k1, v1);
+    assert(map.Size() == 1);
+    assert(map.Table() != nullptr);
+    assert(map.Has(k1));
+    assert(map.Get(k1).AsSmi() == 100);
+    assert(!map.Has(k2));
+
+    // Update existing key
+    map.Set(k1, TaggedValue::FromSmi(999));
+    assert(map.Size() == 1);
+    assert(map.Get(k1).AsSmi() == 999);
+
+    // Insert second key
+    map.Set(k2, v2);
+    assert(map.Size() == 2);
+    assert(map.Has(k2));
+    assert(map.Get(k2).AsSmi() == 200);
+    assert(map.Entries().size() == 2);
+
+    // Delete first key
+    assert(map.Delete(k1));
+    assert(map.Size() == 1);
+    assert(!map.Has(k1));
+    assert(map.Get(k1).IsUndefined());
+    assert(map.Has(k2));
+
+    // Clear map
+    map.Clear();
+    assert(map.Size() == 0);
+    assert(map.Table() == nullptr);
+
+    // JSSet memory diet and GC FixedArray table
+    JSSet set(nullptr);
+    assert(set.ObjectSize() == sizeof(JSSet));
+    assert(set.Size() == 0);
+    assert(set.Table() == nullptr);
+
+    TaggedValue s1 = TaggedValue::FromHeapObject(AllocateRuntime<JSString>("val1"));
+    TaggedValue s2 = TaggedValue::FromHeapObject(AllocateRuntime<JSString>("val2"));
+
+    set.Add(s1);
+    assert(set.Size() == 1);
+    assert(set.Table() != nullptr);
+    assert(set.Has(s1));
+    assert(!set.Has(s2));
+
+    // Duplicate add is a no-op
+    set.Add(s1);
+    assert(set.Size() == 1);
+
+    // Add second value
+    set.Add(s2);
+    assert(set.Size() == 2);
+    assert(set.Has(s2));
+    assert(set.Values().size() == 2);
+
+    // Delete first value
+    assert(set.Delete(s1));
+    assert(set.Size() == 1);
+    assert(!set.Has(s1));
+    assert(set.Has(s2));
+
+    // Clear set
+    set.Clear();
+    assert(set.Size() == 0);
+    assert(set.Table() == nullptr);
+
+    std::cout << "  -> JSMap & JSSet memory diet & GC tables verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "   AetherVM T1.7 Per-Object Memory Diet Test Suite\n";
@@ -254,6 +341,7 @@ int main() {
     TestFunctionMemoryDiet();
     TestGCAllocatedArrays();
     TestLexicalEnvironmentDiet();
+    TestMapSetMemoryDiet();
 
     std::cout << "\n[PASS] All per-object memory diet tests passed successfully.\n";
     return 0;

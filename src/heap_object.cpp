@@ -789,35 +789,80 @@ void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_
 
 // JSMap Implementation
 void JSMap::Set(TaggedValue key, TaggedValue val) {
-    for (auto& entry : entries_) {
-        if (SameValueZero(entry.first, key)) {
-            entry.second = val;
-            if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
-                RecordWriteBarrier(this, val);
+    size_t count = Size();
+    if (table_) {
+        for (size_t i = 0; i < count; ++i) {
+            TaggedValue k = table_->Get(static_cast<uint32_t>(i * 2));
+            if (SameValueZero(k, key)) {
+                table_->Set(static_cast<uint32_t>(i * 2 + 1), val);
+                return;
             }
-            return;
         }
     }
-    detail::ReserveStorage(entries_, entries_storage_, entries_.size() + 1);
-    entries_.emplace_back(key, val);
-    if (AETHER_UNLIKELY(IsOld())) {
-        if (key.IsHeapObject()) RecordWriteBarrier(this, key);
-        if (val.IsHeapObject()) RecordWriteBarrier(this, val);
+
+    if (AETHER_UNLIKELY(count >= kMaxObjectProperties)) {
+        throw std::length_error("map capacity limit exceeded");
     }
+
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    if (key.IsHeapObject() && heap->Contains(key.AsHeapObject())) {
+        scope.CreateHandle(key.AsHeapObject());
+    }
+    if (val.IsHeapObject() && heap->Contains(val.AsHeapObject())) {
+        scope.CreateHandle(val.AsHeapObject());
+    }
+    if (table_ && heap->Contains(table_)) {
+        scope.CreateHandle(table_);
+    }
+
+    uint32_t new_len = static_cast<uint32_t>((count + 1) * 2);
+    uint32_t current_cap = table_ ? table_->Capacity() : 0;
+
+    if (!table_ || new_len > current_cap) {
+        uint32_t new_cap = std::max(uint32_t(8), std::max(new_len, current_cap * 2));
+        FixedArray* new_table = AllocateRuntimeFixedArrayFor(this, new_len, new_cap, TaggedValue::Empty());
+        if (table_) {
+            for (uint32_t i = 0; i < table_->Length(); ++i) {
+                new_table->Set(i, table_->Get(i));
+            }
+        }
+        table_ = new_table;
+        if (AETHER_UNLIKELY(IsOld() && table_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(table_));
+        }
+    } else {
+        table_->SetLength(new_len);
+    }
+
+    uint32_t base = static_cast<uint32_t>(count * 2);
+    table_->Set(base + 0, key);
+    table_->Set(base + 1, val);
 }
 
 TaggedValue JSMap::Get(TaggedValue key) const {
-    for (const auto& entry : entries_) {
-        if (SameValueZero(entry.first, key)) {
-            return entry.second;
+    if (!table_) return TaggedValue::Undefined();
+    size_t count = Size();
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue k = table_->Get(static_cast<uint32_t>(i * 2));
+        if (SameValueZero(k, key)) {
+            return table_->Get(static_cast<uint32_t>(i * 2 + 1));
         }
     }
     return TaggedValue::Undefined();
 }
 
 bool JSMap::Has(TaggedValue key) const {
-    for (const auto& entry : entries_) {
-        if (SameValueZero(entry.first, key)) {
+    if (!table_) return false;
+    size_t count = Size();
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue k = table_->Get(static_cast<uint32_t>(i * 2));
+        if (SameValueZero(k, key)) {
             return true;
         }
     }
@@ -825,32 +870,87 @@ bool JSMap::Has(TaggedValue key) const {
 }
 
 bool JSMap::Delete(TaggedValue key) {
-    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-        if (SameValueZero(it->first, key)) {
-            entries_.erase(it);
+    if (!table_) return false;
+    size_t count = Size();
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue k = table_->Get(static_cast<uint32_t>(i * 2));
+        if (SameValueZero(k, key)) {
+            for (size_t j = i; j + 1 < count; ++j) {
+                table_->Set(static_cast<uint32_t>(j * 2), table_->Get(static_cast<uint32_t>((j + 1) * 2)));
+                table_->Set(static_cast<uint32_t>(j * 2 + 1), table_->Get(static_cast<uint32_t>((j + 1) * 2 + 1)));
+            }
+            uint32_t new_len = static_cast<uint32_t>((count - 1) * 2);
+            table_->SetLength(new_len);
+            table_->Set(new_len + 0, TaggedValue::Empty());
+            table_->Set(new_len + 1, TaggedValue::Empty());
             return true;
         }
     }
     return false;
 }
 
+std::vector<std::pair<TaggedValue, TaggedValue>> JSMap::Entries() const {
+    std::vector<std::pair<TaggedValue, TaggedValue>> result;
+    if (!table_) return result;
+    size_t count = Size();
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        result.emplace_back(table_->Get(static_cast<uint32_t>(i * 2)),
+                            table_->Get(static_cast<uint32_t>(i * 2 + 1)));
+    }
+    return result;
+}
+
 // JSSet Implementation
 void JSSet::Add(TaggedValue val) {
-    for (const auto& v : values_) {
-        if (SameValueZero(v, val)) {
-            return;
+    if (Has(val)) return;
+
+    size_t count = Size();
+    if (AETHER_UNLIKELY(count >= kMaxObjectProperties)) {
+        throw std::length_error("set capacity limit exceeded");
+    }
+
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    if (val.IsHeapObject() && heap->Contains(val.AsHeapObject())) {
+        scope.CreateHandle(val.AsHeapObject());
+    }
+    if (table_ && heap->Contains(table_)) {
+        scope.CreateHandle(table_);
+    }
+
+    uint32_t new_len = static_cast<uint32_t>(count + 1);
+    uint32_t current_cap = table_ ? table_->Capacity() : 0;
+
+    if (!table_ || new_len > current_cap) {
+        uint32_t new_cap = std::max(uint32_t(4), std::max(new_len, current_cap * 2));
+        FixedArray* new_table = AllocateRuntimeFixedArrayFor(this, new_len, new_cap, TaggedValue::Empty());
+        if (table_) {
+            for (uint32_t i = 0; i < table_->Length(); ++i) {
+                new_table->Set(i, table_->Get(i));
+            }
         }
+        table_ = new_table;
+        if (AETHER_UNLIKELY(IsOld() && table_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(table_));
+        }
+    } else {
+        table_->SetLength(new_len);
     }
-    detail::ReserveStorage(values_, values_storage_, values_.size() + 1);
-    values_.push_back(val);
-    if (AETHER_UNLIKELY(IsOld() && val.IsHeapObject())) {
-        RecordWriteBarrier(this, val);
-    }
+
+    table_->Set(static_cast<uint32_t>(count), val);
 }
 
 bool JSSet::Has(TaggedValue val) const {
-    for (const auto& v : values_) {
-        if (SameValueZero(v, val)) {
+    if (!table_) return false;
+    size_t count = Size();
+    for (size_t i = 0; i < count; ++i) {
+        if (SameValueZero(table_->Get(static_cast<uint32_t>(i)), val)) {
             return true;
         }
     }
@@ -858,13 +958,31 @@ bool JSSet::Has(TaggedValue val) const {
 }
 
 bool JSSet::Delete(TaggedValue val) {
-    for (auto it = values_.begin(); it != values_.end(); ++it) {
-        if (SameValueZero(*it, val)) {
-            values_.erase(it);
+    if (!table_) return false;
+    size_t count = Size();
+    for (size_t i = 0; i < count; ++i) {
+        if (SameValueZero(table_->Get(static_cast<uint32_t>(i)), val)) {
+            for (size_t j = i; j + 1 < count; ++j) {
+                table_->Set(static_cast<uint32_t>(j), table_->Get(static_cast<uint32_t>(j + 1)));
+            }
+            uint32_t new_len = static_cast<uint32_t>(count - 1);
+            table_->SetLength(new_len);
+            table_->Set(new_len, TaggedValue::Empty());
             return true;
         }
     }
     return false;
+}
+
+std::vector<TaggedValue> JSSet::Values() const {
+    std::vector<TaggedValue> result;
+    if (!table_) return result;
+    size_t count = Size();
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        result.push_back(table_->Get(static_cast<uint32_t>(i)));
+    }
+    return result;
 }
 
 // JSPromise Implementation
