@@ -42,7 +42,15 @@ double TaggedValue::ToDouble() const {
     if (IsHeapObject()) {
         HeapObject* obj = AsHeapObject();
         if (obj->IsString()) {
-            std::string_view sv = static_cast<JSString*>(obj)->View();
+            auto* str = static_cast<JSString*>(obj);
+            std::string utf8_holder;
+            std::string_view sv;
+            if (str->IsOneByte()) {
+                sv = str->View();
+            } else {
+                utf8_holder = str->ToUtf8();
+                sv = utf8_holder;
+            }
             size_t start = sv.find_first_not_of(" \t\n\r");
             if (start == std::string_view::npos) return 0.0;
             size_t end = sv.find_last_not_of(" \t\n\r");

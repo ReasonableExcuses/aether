@@ -2513,6 +2513,25 @@ static TaggedValue Array_isArray(const std::vector<TaggedValue>& args) {
 }
 
 // String Prototype Methods
+static JSString* GetJSStringFromThis(TaggedValue this_val) {
+    if (this_val.IsHeapObject()) {
+        HeapObject* ho = this_val.AsHeapObject();
+        if (ho->IsString()) {
+            return static_cast<JSString*>(ho);
+        }
+        if (ho->IsJSObject()) {
+            auto* jso = static_cast<JSObject*>(ho);
+            if (jso->HasNamedProperty("__string_data__")) {
+                TaggedValue d = jso->GetNamedProperty("__string_data__");
+                if (d.IsHeapObject() && d.AsHeapObject()->IsString()) {
+                    return static_cast<JSString*>(d.AsHeapObject());
+                }
+            }
+        }
+    }
+    return AllocateRuntime<JSString>(this_val.ToString());
+}
+
 static std::string GetStringFromThis(TaggedValue this_val) {
     if (this_val.IsHeapObject()) {
         HeapObject* ho = this_val.AsHeapObject();
@@ -2530,19 +2549,19 @@ static std::string GetStringFromThis(TaggedValue this_val) {
 }
 
 static TaggedValue String_charAt(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    std::string s = GetStringFromThis(this_val);
+    JSString* s = GetJSStringFromThis(this_val);
     int32_t idx = args.empty() ? 0 : (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int32_t>(args[0].AsNumber()));
-    if (idx >= 0 && static_cast<size_t>(idx) < s.length()) {
-        return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s.substr(idx, 1)));
+    if (idx >= 0 && static_cast<size_t>(idx) < s->Length()) {
+        return TaggedValue::FromHeapObject(s->CharAt(static_cast<uint32_t>(idx)));
     }
     return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
 }
 
 static TaggedValue String_charCodeAt(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    std::string s = GetStringFromThis(this_val);
+    JSString* s = GetJSStringFromThis(this_val);
     int32_t idx = args.empty() ? 0 : (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int32_t>(args[0].AsNumber()));
-    if (idx >= 0 && static_cast<size_t>(idx) < s.length()) {
-        return TaggedValue::FromSmi(static_cast<uint8_t>(s[idx]));
+    if (idx >= 0 && static_cast<size_t>(idx) < s->Length()) {
+        return TaggedValue::FromSmi(s->CharCodeAt(static_cast<uint32_t>(idx)));
     }
     return TaggedValue::FromDouble(std::nan(""));
 }

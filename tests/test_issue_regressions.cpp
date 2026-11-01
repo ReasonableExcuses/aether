@@ -729,6 +729,44 @@ static void Test14_AtomicsBigIntOperationsAndStress() {
 }
 
 // ============================================================================
+// [Regression 15] UTF-16 String Conformance & Surrogate Pair Indexing (T6.1 / T2.2)
+// ============================================================================
+static void Test15_Utf16StringConformanceAndSurrogates() {
+    std::cout << "[Regression 15] Verifying UTF-16 string semantics, surrogate pairs, and code unit indexing (T6.1)..." << std::endl;
+
+    Agent agent;
+
+    TaggedValue res = agent.EvaluateScript(R"(
+        const emoji = "\uD83D\uDE00"; // 😀
+        const accent = "\u00E9";      // é
+
+        const emoji_len = emoji.length;
+        const emoji_cu0 = emoji.charCodeAt(0);
+        const emoji_cu1 = emoji.charCodeAt(1);
+        const emoji_ch0 = emoji.charAt(0).charCodeAt(0);
+        const emoji_idx0 = emoji[0].charCodeAt(0);
+        const emoji_idx1 = emoji[1].charCodeAt(0);
+
+        const accent_len = accent.length;
+        const accent_cu0 = accent.charCodeAt(0);
+
+        const pass = (emoji_len === 2) &&
+                     (emoji_cu0 === 55357) &&
+                     (emoji_cu1 === 56832) &&
+                     (emoji_ch0 === 55357) &&
+                     (emoji_idx0 === 55357) &&
+                     (emoji_idx1 === 56832) &&
+                     (accent_len === 1) &&
+                     (accent_cu0 === 233);
+        pass;
+    )");
+
+    assert(res.IsBoolean() && res.ToBoolean());
+
+    std::cout << "  -> PASSED: UTF-16 code units, emoji length=2, charCodeAt, charAt, and bracket indexing verified." << std::endl;
+}
+
+// ============================================================================
 // Main Regression Test Runner
 // ============================================================================
 int main() {
@@ -750,9 +788,10 @@ int main() {
     Test12_BackgroundCompilerOwnerDestructionSafety();
     Test13_WasmRegistryPruneDeadUnderGC();
     Test14_AtomicsBigIntOperationsAndStress();
+    Test15_Utf16StringConformanceAndSurrogates();
 
     std::cout << "========================================================\n";
-    std::cout << "ALL 14 REGRESSION TESTS PASSED CLEANLY (14/14)!\n";
+    std::cout << "ALL 15 REGRESSION TESTS PASSED CLEANLY (15/15)!\n";
     std::cout << "========================================================\n";
 
     return 0;

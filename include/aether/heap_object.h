@@ -439,43 +439,90 @@ static_assert(sizeof(HeapObject) == 24, "sizeof(HeapObject) must be 24 bytes (8B
 /**
  * @brief Managed JavaScript String object on the heap.
  */
+enum class StringKind : uint8_t {
+    FlatLatin1 = 0,
+    FlatUtf16 = 1,
+    Cons = 2,
+    Sliced = 3
+};
+
+class ByteArray;
+
+/**
+ * @brief Managed JavaScript String object on the heap.
+ *
+ * Header Layout (56 bytes):
+ * - Base HeapObject: 24 bytes (Header 8B, Shape* 8B, type_id 4B, flags 4B)
+ * - length_: 4 bytes (UTF-16 code units)
+ * - hash_: 4 bytes (cached FNV-1a hash)
+ * - kind_: 1 byte (StringKind)
+ * - str_flags_: 1 byte
+ * - reserved_: 2 bytes
+ * - slice_offset_: 4 bytes
+ * - payload_/left_/parent_: 8 bytes
+ * - right_: 8 bytes
+ */
 class JSString : public HeapObject {
 public:
-    explicit JSString(std::string_view str, Shape* shape = nullptr)
-        : HeapObject(HeapObjectType::String, shape),
-          external_storage_(),
-          data_(detail::ChargedString(str, external_storage_)) {
-        ComputeHash();
-    }
-    JSString(JSString&& other) noexcept = default;
+    explicit JSString(std::string_view str, Shape* shape = nullptr);
+    JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape = nullptr);
+    JSString(JSString* left, JSString* right, Shape* shape = nullptr);
+    JSString(JSString* parent, uint32_t offset, uint32_t length, Shape* shape = nullptr);
 
-    const std::string& Value() const noexcept { return data_; }
-    std::string_view View() const noexcept { return data_; }
-    size_t Length() const noexcept { return data_.length(); }
-    uint32_t Hash() const noexcept { return hash_; }
+    JSString(JSString&& other) noexcept = default;
+    ~JSString() override = default;
+
+    size_t Length() const noexcept { return length_; }
+    uint32_t Hash() const noexcept {
+        if (hash_ == 0) ComputeHash();
+        return hash_;
+    }
+
+    StringKind Kind() const noexcept { return kind_; }
+    bool IsOneByte() const noexcept { return kind_ == StringKind::FlatLatin1; }
+    bool IsCons() const noexcept { return kind_ == StringKind::Cons; }
+    bool IsSliced() const noexcept { return kind_ == StringKind::Sliced; }
+
+    uint16_t CharCodeAt(uint32_t index) const noexcept;
+    JSString* CharAt(uint32_t index) const;
+
+    bool Equals(const JSString* other) const noexcept;
+    int Compare(const JSString* other) const noexcept;
+
+    std::string ToUtf8() const;
+    std::string Value() const { return ToUtf8(); }
+    inline std::string_view View() const noexcept;
 
     size_t ObjectSize() const override { return sizeof(JSString); }
-    void IteratePointers(SlotVisitor* visitor) override { (void)visitor; }
+    void IteratePointers(SlotVisitor* visitor) override;
 
     HeapObject* RelocateTo(void* dst) override {
         return new (dst) JSString(std::move(*this));
     }
 
-private:
-    void ComputeHash() noexcept {
-        // FNV-1a 32-bit hash
-        uint32_t h = 2166136261u;
-        for (char c : data_) {
-            h ^= static_cast<uint8_t>(c);
-            h *= 16777619u;
-        }
-        hash_ = h;
+    ByteArray* GetPayload() const noexcept {
+        return (kind_ == StringKind::FlatLatin1 || kind_ == StringKind::FlatUtf16) ? payload_ : nullptr;
     }
 
-    MemoryCharge external_storage_;
-    std::string data_;
-    uint32_t hash_{0};
+private:
+    void ComputeHash() const noexcept;
+    void InitializeFromUtf8(std::string_view utf8_str);
+
+    uint32_t length_{0};
+    mutable uint32_t hash_{0};
+    StringKind kind_{StringKind::FlatLatin1};
+    uint8_t str_flags_{0};
+    uint16_t reserved_{0};
+    uint32_t slice_offset_{0};
+    union {
+        ByteArray* payload_{nullptr};
+        JSString* left_;
+        JSString* parent_;
+    };
+    JSString* right_{nullptr};
 };
+
+static_assert(sizeof(JSString) == 56, "sizeof(JSString) must be 56 bytes");
 
 /**
  * @brief Managed JavaScript Symbol primitive object on the heap.
@@ -644,6 +691,13 @@ private:
 };
 
 static_assert(sizeof(ByteArray) == 32, "sizeof(ByteArray) must be 32 bytes");
+
+inline std::string_view JSString::View() const noexcept {
+    if (kind_ == StringKind::FlatLatin1 && payload_ != nullptr) {
+        return std::string_view(reinterpret_cast<const char*>(payload_->data()), length_);
+    }
+    return std::string_view("");
+}
 
 using PropertyArray = FixedArray;
 using ElementsArray = FixedArray;

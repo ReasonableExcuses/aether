@@ -51,11 +51,385 @@ static bool SameValueZero(TaggedValue a, TaggedValue b) {
         HeapObject* ha = a.AsHeapObject();
         HeapObject* hb = b.AsHeapObject();
         if (ha->IsString() && hb->IsString()) {
-            return static_cast<JSString*>(ha)->View() == static_cast<JSString*>(hb)->View();
+            return static_cast<JSString*>(ha)->Equals(static_cast<JSString*>(hb));
         }
         return ha == hb;
     }
     return false;
+}
+
+// ============================================================================
+// JSString Implementation
+// ============================================================================
+
+JSString::JSString(std::string_view str, Shape* shape)
+    : HeapObject(HeapObjectType::String, shape) {
+    InitializeFromUtf8(str);
+}
+
+JSString::JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape)
+    : HeapObject(HeapObjectType::String, shape),
+      length_(length),
+      right_(nullptr) {
+    if (length == 0 || !utf16_data) {
+        length_ = 0;
+        kind_ = StringKind::FlatLatin1;
+        payload_ = nullptr;
+        hash_ = 2166136261u;
+        return;
+    }
+    CheckedStringLength(length);
+    bool fits_latin1 = true;
+    for (uint32_t i = 0; i < length; ++i) {
+        if (utf16_data[i] > 255) {
+            fits_latin1 = false;
+            break;
+        }
+    }
+    if (fits_latin1) {
+        kind_ = StringKind::FlatLatin1;
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, length + 1);
+        for (uint32_t i = 0; i < length; ++i) {
+            ba->data()[i] = static_cast<uint8_t>(utf16_data[i]);
+        }
+        ba->data()[length] = '\0';
+        payload_ = ba;
+    } else {
+        kind_ = StringKind::FlatUtf16;
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, (length + 1) * static_cast<uint32_t>(sizeof(uint16_t)));
+        uint16_t* dst = reinterpret_cast<uint16_t*>(ba->data());
+        std::memcpy(dst, utf16_data, length * sizeof(uint16_t));
+        dst[length] = 0;
+        payload_ = ba;
+    }
+    if (AETHER_UNLIKELY(IsOld() && payload_ && payload_->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(payload_));
+    }
+    ComputeHash();
+}
+
+JSString::JSString(JSString* left, JSString* right, Shape* shape)
+    : HeapObject(HeapObjectType::String, shape),
+      kind_(StringKind::Cons),
+      left_(left),
+      right_(right) {
+    length_ = (left ? static_cast<uint32_t>(left->Length()) : 0) +
+              (right ? static_cast<uint32_t>(right->Length()) : 0);
+    slice_offset_ = 0;
+    hash_ = 0;
+    if (AETHER_UNLIKELY(IsOld())) {
+        if (left_ && left_->IsYoung()) RecordWriteBarrier(this, TaggedValue::FromHeapObject(left_));
+        if (right_ && right_->IsYoung()) RecordWriteBarrier(this, TaggedValue::FromHeapObject(right_));
+    }
+}
+
+JSString::JSString(JSString* parent, uint32_t offset, uint32_t length, Shape* shape)
+    : HeapObject(HeapObjectType::String, shape),
+      length_(length),
+      kind_(StringKind::Sliced),
+      slice_offset_(offset),
+      parent_(parent),
+      right_(nullptr) {
+    hash_ = 0;
+    if (AETHER_UNLIKELY(IsOld() && parent_ && parent_->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(parent_));
+    }
+}
+
+namespace {
+static inline uint32_t DecodeNextCodePoint(const uint8_t*& ptr, const uint8_t* end) noexcept {
+    uint8_t b0 = *ptr++;
+    if (b0 < 0x80) return b0;
+    if ((b0 & 0xE0) == 0xC0 && ptr < end) return ((b0 & 0x1F) << 6) | (*ptr++ & 0x3F);
+    if ((b0 & 0xF0) == 0xE0 && ptr + 1 < end) {
+        uint32_t cp = ((b0 & 0x0F) << 12) | ((ptr[0] & 0x3F) << 6) | (ptr[1] & 0x3F);
+        ptr += 2;
+        return cp;
+    }
+    if ((b0 & 0xF8) == 0xF0 && ptr + 2 < end) {
+        uint32_t cp = ((b0 & 0x07) << 18) | ((ptr[0] & 0x3F) << 12) | ((ptr[1] & 0x3F) << 6) | (ptr[2] & 0x3F);
+        ptr += 3;
+        return cp;
+    }
+    return b0;
+}
+
+static inline void AppendUtf16CodeUnitToUtf8(std::string& out, uint16_t cu, const uint16_t* next_cu) {
+    if (cu >= 0xD800 && cu <= 0xDBFF && next_cu && *next_cu >= 0xDC00 && *next_cu <= 0xDFFF) {
+        uint32_t cp = 0x10000 + (((cu - 0xD800) << 10) | (*next_cu - 0xDC00));
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cu < 0x80) {
+        out.push_back(static_cast<char>(cu));
+    } else if (cu < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cu >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cu & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xE0 | (cu >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cu >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cu & 0x3F)));
+    }
+}
+} // namespace
+
+void JSString::InitializeFromUtf8(std::string_view utf8_str) {
+    CheckedStringLength(utf8_str.length());
+    slice_offset_ = 0;
+    right_ = nullptr;
+    if (utf8_str.empty()) {
+        length_ = 0;
+        kind_ = StringKind::FlatLatin1;
+        payload_ = nullptr;
+        hash_ = 2166136261u;
+        return;
+    }
+
+    bool is_ascii = true;
+    for (unsigned char c : utf8_str) {
+        if (c >= 0x80) { is_ascii = false; break; }
+    }
+
+    if (is_ascii) {
+        length_ = static_cast<uint32_t>(utf8_str.length());
+        kind_ = StringKind::FlatLatin1;
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, length_ + 1);
+        std::memcpy(ba->data(), utf8_str.data(), length_);
+        ba->data()[length_] = '\0';
+        payload_ = ba;
+        if (AETHER_UNLIKELY(IsOld() && payload_->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(payload_));
+        }
+        ComputeHash();
+        return;
+    }
+
+    bool fits_latin1 = true;
+    uint32_t u16_len = 0;
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(utf8_str.data());
+    const uint8_t* end = ptr + utf8_str.length();
+    const uint8_t* scan = ptr;
+    while (scan < end) {
+        uint32_t cp = DecodeNextCodePoint(scan, end);
+        u16_len += (cp > 0xFFFF) ? 2 : 1;
+        if (cp > 255) fits_latin1 = false;
+    }
+
+    length_ = u16_len;
+    if (fits_latin1) {
+        kind_ = StringKind::FlatLatin1;
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, length_ + 1);
+        uint8_t* dst = ba->data();
+        scan = ptr;
+        for (uint32_t idx = 0; scan < end && idx < length_; ++idx) {
+            dst[idx] = static_cast<uint8_t>(DecodeNextCodePoint(scan, end));
+        }
+        dst[length_] = '\0';
+        payload_ = ba;
+    } else {
+        kind_ = StringKind::FlatUtf16;
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, (length_ + 1) * static_cast<uint32_t>(sizeof(uint16_t)));
+        uint16_t* dst = reinterpret_cast<uint16_t*>(ba->data());
+        scan = ptr;
+        uint32_t idx = 0;
+        while (scan < end && idx < length_) {
+            uint32_t cp = DecodeNextCodePoint(scan, end);
+            if (cp > 0xFFFF) {
+                dst[idx++] = static_cast<uint16_t>(0xD800 + ((cp - 0x10000) >> 10));
+                dst[idx++] = static_cast<uint16_t>(0xDC00 + ((cp - 0x10000) & 0x3FF));
+            } else {
+                dst[idx++] = static_cast<uint16_t>(cp);
+            }
+        }
+        dst[length_] = 0;
+        payload_ = ba;
+    }
+
+    if (AETHER_UNLIKELY(IsOld() && payload_->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(payload_));
+    }
+    ComputeHash();
+}
+
+void JSString::ComputeHash() const noexcept {
+    uint32_t h = 2166136261u;
+    if (kind_ == StringKind::FlatLatin1 && payload_ != nullptr) {
+        const uint8_t* p = payload_->data();
+        for (uint32_t i = 0; i < length_; ++i) {
+            h ^= p[i];
+            h *= 16777619u;
+        }
+    } else {
+        for (uint32_t i = 0; i < length_; ++i) {
+            uint16_t cu = CharCodeAt(i);
+            if (cu <= 0xFF) {
+                h ^= static_cast<uint8_t>(cu);
+                h *= 16777619u;
+            } else {
+                h ^= static_cast<uint8_t>(cu & 0xFF);
+                h *= 16777619u;
+                h ^= static_cast<uint8_t>(cu >> 8);
+                h *= 16777619u;
+            }
+        }
+    }
+    if (h == 0) h = 1;
+    hash_ = h;
+}
+
+uint16_t JSString::CharCodeAt(uint32_t index) const noexcept {
+    if (index >= length_) return 0;
+    switch (kind_) {
+        case StringKind::FlatLatin1:
+            return payload_ ? payload_->data()[index] : 0;
+        case StringKind::FlatUtf16: {
+            const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload_->data());
+            return u16[index];
+        }
+        case StringKind::Cons: {
+            uint32_t left_len = left_ ? static_cast<uint32_t>(left_->Length()) : 0;
+            if (index < left_len) return left_->CharCodeAt(index);
+            return right_ ? right_->CharCodeAt(index - left_len) : 0;
+        }
+        case StringKind::Sliced:
+            return parent_ ? parent_->CharCodeAt(slice_offset_ + index) : 0;
+    }
+    return 0;
+}
+
+JSString* JSString::CharAt(uint32_t index) const {
+    if (index >= length_) {
+        return AllocateRuntime<JSString>("");
+    }
+    uint16_t cu = CharCodeAt(index);
+    if (cu <= 255) {
+        char c = static_cast<char>(cu);
+        return AllocateRuntime<JSString>(std::string_view(&c, 1));
+    }
+    return AllocateRuntime<JSString>(&cu, 1);
+}
+
+bool JSString::Equals(const JSString* other) const noexcept {
+    if (this == other) return true;
+    if (!other) return false;
+    if (length_ != other->length_) return false;
+    if (hash_ != 0 && other->hash_ != 0 && hash_ != other->hash_) return false;
+    if (length_ == 0) return true;
+    if (kind_ == StringKind::FlatLatin1 && other->kind_ == StringKind::FlatLatin1) {
+        if (payload_ && other->payload_) {
+            return std::memcmp(payload_->data(), other->payload_->data(), length_) == 0;
+        }
+        return payload_ == other->payload_;
+    }
+    for (uint32_t i = 0; i < length_; ++i) {
+        if (CharCodeAt(i) != other->CharCodeAt(i)) return false;
+    }
+    return true;
+}
+
+int JSString::Compare(const JSString* other) const noexcept {
+    if (this == other) return 0;
+    if (!other) return 1;
+    if (kind_ == StringKind::FlatLatin1 && other->kind_ == StringKind::FlatLatin1 && payload_ && other->payload_) {
+        uint32_t min_len = std::min(length_, other->length_);
+        int cmp = std::memcmp(payload_->data(), other->payload_->data(), min_len);
+        if (cmp != 0) return cmp < 0 ? -1 : 1;
+        if (length_ == other->length_) return 0;
+        return length_ < other->length_ ? -1 : 1;
+    }
+    uint32_t min_len = std::min(length_, other->length_);
+    for (uint32_t i = 0; i < min_len; ++i) {
+        uint16_t c1 = CharCodeAt(i);
+        uint16_t c2 = other->CharCodeAt(i);
+        if (c1 != c2) return c1 < c2 ? -1 : 1;
+    }
+    if (length_ == other->length_) return 0;
+    return length_ < other->length_ ? -1 : 1;
+}
+
+std::string JSString::ToUtf8() const {
+    if (length_ == 0) return "";
+    std::string out;
+    if (kind_ == StringKind::FlatLatin1) {
+        if (!payload_) return "";
+        out.reserve(length_);
+        const uint8_t* data = payload_->data();
+        for (uint32_t i = 0; i < length_; ++i) {
+            uint8_t c = data[i];
+            if (c < 0x80) {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+                out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+            }
+        }
+        return out;
+    }
+    if (kind_ == StringKind::FlatUtf16) {
+        if (!payload_) return "";
+        out.reserve(length_ * 2);
+        const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload_->data());
+        uint32_t i = 0;
+        while (i < length_) {
+            uint16_t cu = u16[i++];
+            const uint16_t* next = (i < length_) ? &u16[i] : nullptr;
+            AppendUtf16CodeUnitToUtf8(out, cu, next);
+            if (cu >= 0xD800 && cu <= 0xDBFF && next && *next >= 0xDC00 && *next <= 0xDFFF) ++i;
+        }
+        return out;
+    }
+    if (kind_ == StringKind::Cons) {
+        std::string l = left_ ? left_->ToUtf8() : "";
+        std::string r = right_ ? right_->ToUtf8() : "";
+        return l + r;
+    }
+    if (kind_ == StringKind::Sliced) {
+        if (!parent_) return "";
+        out.reserve(length_ * 2);
+        uint32_t i = 0;
+        while (i < length_) {
+            uint16_t cu = parent_->CharCodeAt(slice_offset_ + i++);
+            uint16_t next_val = (i < length_) ? parent_->CharCodeAt(slice_offset_ + i) : 0;
+            const uint16_t* next = (i < length_) ? &next_val : nullptr;
+            AppendUtf16CodeUnitToUtf8(out, cu, next);
+            if (cu >= 0xD800 && cu <= 0xDBFF && next && *next >= 0xDC00 && *next <= 0xDFFF) ++i;
+        }
+        return out;
+    }
+    return "";
+}
+
+void JSString::IteratePointers(SlotVisitor* visitor) {
+    switch (kind_) {
+        case StringKind::FlatLatin1:
+        case StringKind::FlatUtf16:
+            if (payload_ != nullptr) {
+                TaggedValue val = TaggedValue::FromHeapObject(payload_);
+                visitor->Visit(&val);
+                if (val.IsHeapObject()) payload_ = val.As<ByteArray>();
+            }
+            break;
+        case StringKind::Cons:
+            if (left_ != nullptr) {
+                TaggedValue val = TaggedValue::FromHeapObject(left_);
+                visitor->Visit(&val);
+                if (val.IsHeapObject()) left_ = val.As<JSString>();
+            }
+            if (right_ != nullptr) {
+                TaggedValue val = TaggedValue::FromHeapObject(right_);
+                visitor->Visit(&val);
+                if (val.IsHeapObject()) right_ = val.As<JSString>();
+            }
+            break;
+        case StringKind::Sliced:
+            if (parent_ != nullptr) {
+                TaggedValue val = TaggedValue::FromHeapObject(parent_);
+                visitor->Visit(&val);
+                if (val.IsHeapObject()) parent_ = val.As<JSString>();
+            }
+            break;
+    }
 }
 
 void JSObject::PrepareFastSlot(uint32_t slot_index, bool in_object) {

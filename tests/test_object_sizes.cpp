@@ -23,6 +23,7 @@ static_assert(sizeof(LexicalEnvironment) == 40, "LexicalEnvironment size must be
 static_assert(sizeof(JSMap) == 64, "JSMap size must be exactly 64 bytes (<= 64 B)");
 static_assert(sizeof(JSSet) == 64, "JSSet size must be exactly 64 bytes (<= 64 B)");
 static_assert(sizeof(JSPromise) == 80, "JSPromise size must be exactly 80 bytes (<= 80 B)");
+static_assert(sizeof(JSString) == 56, "JSString size must be exactly 56 bytes (<= 64 B)");
 
 void TestObjectInObjectStorage() {
     Heap heap;
@@ -382,6 +383,66 @@ void TestPromiseMemoryDiet() {
     std::cout << "  -> JSPromise memory diet & GC reactions verified.\n";
 }
 
+void TestStringMemoryDiet() {
+    Heap heap;
+    IsolateScope isolate(heap);
+
+    static_assert(sizeof(JSString) == 56, "sizeof(JSString) must be 56 bytes");
+
+    // 1. Empty string
+    JSString empty("");
+    assert(empty.ObjectSize() == sizeof(JSString));
+    assert(empty.Length() == 0);
+    assert(empty.IsOneByte());
+    assert(empty.Hash() != 0);
+    assert(empty.Value() == "");
+    assert(empty.View() == "");
+
+    // 2. Flat Latin-1 (ASCII)
+    JSString s1("hello");
+    assert(s1.ObjectSize() == sizeof(JSString));
+    assert(s1.Length() == 5);
+    assert(s1.IsOneByte());
+    assert(s1.View() == "hello");
+    assert(s1.Value() == "hello");
+    assert(s1.CharCodeAt(0) == 'h');
+    assert(s1.CharCodeAt(4) == 'o');
+    assert(s1.CharAt(1)->Value() == "e");
+
+    // 3. Flat Latin-1 Extended (é = 0xE9 / 233, length = 1)
+    JSString s_acc("\xC3\xA9"); // UTF-8 for 'é' (U+00E9)
+    assert(s_acc.Length() == 1);
+    assert(s_acc.IsOneByte());
+    assert(s_acc.CharCodeAt(0) == 233);
+    assert(s_acc.Value() == "\xC3\xA9");
+
+    // 4. Flat UTF-16 (Emoji 😀: U+1F600 => surrogate pair 0xD83D, 0xDE00, length = 2)
+    JSString s_emoji("\xF0\x9F\x98\x80"); // UTF-8 for 😀
+    assert(s_emoji.Length() == 2);
+    assert(!s_emoji.IsOneByte());
+    assert(s_emoji.CharCodeAt(0) == 0xD83D); // High surrogate (55357)
+    assert(s_emoji.CharCodeAt(1) == 0xDE00); // Low surrogate (56832)
+    assert(s_emoji.Value() == "\xF0\x9F\x98\x80");
+
+    // 5. Lone surrogate preserved
+    uint16_t lone_surrogate = 0xD83D;
+    JSString s_lone(&lone_surrogate, 1);
+    assert(s_lone.Length() == 1);
+    assert(s_lone.CharCodeAt(0) == 0xD83D);
+    assert(s_lone.Value() == "\xED\xA0\xBD"); // 3-byte WTF-8
+
+    // 6. Equals and Compare
+    JSString s2("hello");
+    JSString s3("world");
+    assert(s1.Equals(&s2));
+    assert(!s1.Equals(&s3));
+    assert(s1.Compare(&s2) == 0);
+    assert(s1.Compare(&s3) < 0);
+    assert(s3.Compare(&s1) > 0);
+
+    std::cout << "  -> JSString memory diet & UTF-16 representation verified.\n";
+}
+
 int main() {
     std::cout << "========================================================\n";
     std::cout << "   AetherVM T1.7 Per-Object Memory Diet Test Suite\n";
@@ -395,6 +456,7 @@ int main() {
     TestLexicalEnvironmentDiet();
     TestMapSetMemoryDiet();
     TestPromiseMemoryDiet();
+    TestStringMemoryDiet();
 
     std::cout << "\n[PASS] All per-object memory diet tests passed successfully.\n";
     return 0;

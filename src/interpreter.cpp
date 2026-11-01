@@ -278,60 +278,7 @@ TaggedValue Interpreter::PublishResult(TaggedValue result) {
     return result;
 }
 
-static bool StringLessThanUtf16(std::string_view s1, std::string_view s2) {
-    bool has_high1 = false;
-    for (char c : s1) {
-        if (static_cast<uint8_t>(c) >= 0xF0) { has_high1 = true; break; }
-    }
-    bool has_high2 = false;
-    for (char c : s2) {
-        if (static_cast<uint8_t>(c) >= 0xF0) { has_high2 = true; break; }
-    }
-    if (!has_high1 && !has_high2) {
-        return s1 < s2;
-    }
-    auto to_u16 = [](std::string_view utf8) {
-        std::vector<uint16_t> u16;
-        size_t i = 0;
-        while (i < utf8.size()) {
-            uint8_t c = static_cast<uint8_t>(utf8[i++]);
-            uint32_t cp = 0;
-            if (c < 0x80) {
-                cp = c;
-            } else if ((c & 0xE0) == 0xC0) {
-                if (i < utf8.size()) {
-                    cp = ((c & 0x1F) << 6) | (static_cast<uint8_t>(utf8[i++]) & 0x3F);
-                }
-            } else if ((c & 0xF0) == 0xE0) {
-                if (i + 1 < utf8.size()) {
-                    cp = ((c & 0x0F) << 12) |
-                         ((static_cast<uint8_t>(utf8[i]) & 0x3F) << 6) |
-                         (static_cast<uint8_t>(utf8[i + 1]) & 0x3F);
-                    i += 2;
-                }
-            } else if ((c & 0xF8) == 0xF0) {
-                if (i + 2 < utf8.size()) {
-                    cp = ((c & 0x07) << 18) |
-                         ((static_cast<uint8_t>(utf8[i]) & 0x3F) << 12) |
-                         ((static_cast<uint8_t>(utf8[i + 1]) & 0x3F) << 6) |
-                         (static_cast<uint8_t>(utf8[i + 2]) & 0x3F);
-                    i += 3;
-                }
-            }
-            if (cp < 0x10000) {
-                u16.push_back(static_cast<uint16_t>(cp));
-            } else {
-                cp -= 0x10000;
-                u16.push_back(static_cast<uint16_t>(0xD800 + (cp >> 10)));
-                u16.push_back(static_cast<uint16_t>(0xDC00 + (cp & 0x3FF)));
-            }
-        }
-        return u16;
-    };
-    std::vector<uint16_t> u1 = to_u16(s1);
-    std::vector<uint16_t> u2 = to_u16(s2);
-    return u1 < u2;
-}
+
 
 static JSBigInt* StringToBigInt(std::string_view s) {
     while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\n' || s.front() == '\r' || s.front() == '\f' || s.front() == '\v')) {
@@ -609,9 +556,9 @@ Interpreter::RelationalResult Interpreter::AbstractRelationalComparison(TaggedVa
 
     if (px.IsHeapObject() && px.AsHeapObject()->IsString() &&
         py.IsHeapObject() && py.AsHeapObject()->IsString()) {
-        std::string_view s1 = static_cast<JSString*>(px.AsHeapObject())->View();
-        std::string_view s2 = static_cast<JSString*>(py.AsHeapObject())->View();
-        return StringLessThanUtf16(s1, s2) ? RelationalResult::True : RelationalResult::False;
+        auto* s1 = static_cast<JSString*>(px.AsHeapObject());
+        auto* s2 = static_cast<JSString*>(py.AsHeapObject());
+        return s1->Compare(s2) < 0 ? RelationalResult::True : RelationalResult::False;
     }
 
     if (px.IsBigInt() && py.IsHeapObject() && py.AsHeapObject()->IsString()) {
@@ -681,7 +628,7 @@ bool Interpreter::IsStrictlyEqual(TaggedValue x, TaggedValue y) {
         HeapObject* h2 = y.AsHeapObject();
         if (h1 == h2) return true;
         if (h1->IsString() && h2->IsString()) {
-            return static_cast<JSString*>(h1)->View() == static_cast<JSString*>(h2)->View();
+            return static_cast<JSString*>(h1)->Equals(static_cast<JSString*>(h2));
         }
         if (h1->IsBigInt() && h2->IsBigInt()) {
             return static_cast<JSBigInt*>(h1)->Equals(*static_cast<JSBigInt*>(h2));
@@ -4848,7 +4795,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         if (d >= 0.0 && std::floor(d) == d) idx = static_cast<int32_t>(d);
                     }
                     if (idx >= 0 && static_cast<size_t>(idx) < str_obj->Length()) {
-                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str_obj->View().substr(idx, 1)));
+                        acc_ = TaggedValue::FromHeapObject(str_obj->CharAt(static_cast<uint32_t>(idx)));
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
                         std::string_view k = static_cast<JSString*>(key_val.AsHeapObject())->View();
                         if (k == "length") {
