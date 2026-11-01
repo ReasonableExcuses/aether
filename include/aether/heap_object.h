@@ -464,6 +464,9 @@ class ByteArray;
  */
 class JSString : public HeapObject {
 public:
+    static constexpr uint8_t kFlagIsLatin1 = 1 << 0;
+    static constexpr uint8_t kMaxConsDepth = 32;
+
     explicit JSString(std::string_view str, Shape* shape = nullptr);
     JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape = nullptr);
     JSString(JSString* left, JSString* right, Shape* shape = nullptr);
@@ -482,12 +485,17 @@ public:
     bool IsOneByte() const noexcept { return kind_ == StringKind::FlatLatin1; }
     bool IsCons() const noexcept { return kind_ == StringKind::Cons; }
     bool IsSliced() const noexcept { return kind_ == StringKind::Sliced; }
+    bool IsLatin1() const noexcept { return (str_flags_ & kFlagIsLatin1) != 0 || kind_ == StringKind::FlatLatin1; }
 
     uint16_t CharCodeAt(uint32_t index) const noexcept;
     JSString* CharAt(uint32_t index) const;
 
     bool Equals(const JSString* other) const noexcept;
     int Compare(const JSString* other) const noexcept;
+
+    static JSString* Concat(JSString* left, JSString* right);
+    static JSString* Slice(JSString* str, uint32_t offset, uint32_t length);
+    void EnsureFlat() const noexcept;
 
     std::string ToUtf8() const;
     std::string Value() const { return ToUtf8(); }
@@ -507,19 +515,22 @@ public:
 private:
     void ComputeHash() const noexcept;
     void InitializeFromUtf8(std::string_view utf8_str);
+    void FlattenToLatin1(uint8_t* dst) const noexcept;
+    void FlattenToUtf16(uint16_t* dst) const noexcept;
 
     uint32_t length_{0};
     mutable uint32_t hash_{0};
-    StringKind kind_{StringKind::FlatLatin1};
-    uint8_t str_flags_{0};
-    uint16_t reserved_{0};
+    mutable StringKind kind_{StringKind::FlatLatin1};
+    mutable uint8_t str_flags_{0};
+    mutable uint8_t depth_{0};
+    uint8_t reserved_{0};
     uint32_t slice_offset_{0};
     union {
-        ByteArray* payload_{nullptr};
-        JSString* left_;
-        JSString* parent_;
+        mutable ByteArray* payload_{nullptr};
+        mutable JSString* left_;
+        mutable JSString* parent_;
     };
-    JSString* right_{nullptr};
+    mutable JSString* right_{nullptr};
 };
 
 static_assert(sizeof(JSString) == 56, "sizeof(JSString) must be 56 bytes");
@@ -693,6 +704,9 @@ private:
 static_assert(sizeof(ByteArray) == 32, "sizeof(ByteArray) must be 32 bytes");
 
 inline std::string_view JSString::View() const noexcept {
+    if (kind_ != StringKind::FlatLatin1 && kind_ != StringKind::FlatUtf16) {
+        EnsureFlat();
+    }
     if (kind_ == StringKind::FlatLatin1 && payload_ != nullptr) {
         return std::string_view(reinterpret_cast<const char*>(payload_->data()), length_);
     }

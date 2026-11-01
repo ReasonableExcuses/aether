@@ -2567,11 +2567,17 @@ static TaggedValue String_charCodeAt(TaggedValue this_val, const std::vector<Tag
 }
 
 static TaggedValue String_concat(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    std::string str = this_val.ToString();
+    JSString* res = GetJSStringFromThis(this_val);
     for (const auto& a : args) {
-        str += a.ToString();
+        JSString* next_str = nullptr;
+        if (a.IsHeapObject() && a.AsHeapObject()->IsString()) {
+            next_str = static_cast<JSString*>(a.AsHeapObject());
+        } else {
+            next_str = AllocateRuntime<JSString>(a.ToString());
+        }
+        res = JSString::Concat(res, next_str);
     }
-    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(str));
+    return TaggedValue::FromHeapObject(res);
 }
 
 static TaggedValue String_indexOf(TaggedValue this_val, const std::vector<TaggedValue>& args) {
@@ -2592,8 +2598,8 @@ static TaggedValue String_lastIndexOf(TaggedValue this_val, const std::vector<Ta
 }
 
 static TaggedValue String_slice(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    std::string s = GetStringFromThis(this_val);
-    int64_t len = static_cast<int64_t>(s.length());
+    JSString* str = GetJSStringFromThis(this_val);
+    int64_t len = static_cast<int64_t>(str->Length());
     int64_t start = args.size() > 0 ? (args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
     int64_t end = args.size() > 1 ? (args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : len;
 
@@ -2604,12 +2610,12 @@ static TaggedValue String_slice(TaggedValue this_val, const std::vector<TaggedVa
     else end = std::min<int64_t>(len, end);
 
     if (start >= end) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
-    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s.substr(start, end - start)));
+    return TaggedValue::FromHeapObject(JSString::Slice(str, static_cast<uint32_t>(start), static_cast<uint32_t>(end - start)));
 }
 
 static TaggedValue String_substring(TaggedValue this_val, const std::vector<TaggedValue>& args) {
-    std::string s = GetStringFromThis(this_val);
-    int64_t len = static_cast<int64_t>(s.length());
+    JSString* str = GetJSStringFromThis(this_val);
+    int64_t len = static_cast<int64_t>(str->Length());
     int64_t start = args.size() > 0 ? std::max<int64_t>(0, args[0].IsSmi() ? args[0].AsSmi() : static_cast<int64_t>(args[0].AsNumber())) : 0;
     int64_t end = args.size() > 1 ? std::max<int64_t>(0, args[1].IsSmi() ? args[1].AsSmi() : static_cast<int64_t>(args[1].AsNumber())) : len;
 
@@ -2617,7 +2623,8 @@ static TaggedValue String_substring(TaggedValue this_val, const std::vector<Tagg
     end = std::min<int64_t>(len, end);
     if (start > end) std::swap(start, end);
 
-    return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s.substr(start, end - start)));
+    if (start >= end) return TaggedValue::FromHeapObject(AllocateRuntime<JSString>(""));
+    return TaggedValue::FromHeapObject(JSString::Slice(str, static_cast<uint32_t>(start), static_cast<uint32_t>(end - start)));
 }
 
 static TaggedValue String_toLowerCase(TaggedValue this_val, const std::vector<TaggedValue>& args) {

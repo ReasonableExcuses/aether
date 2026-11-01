@@ -440,6 +440,39 @@ void TestStringMemoryDiet() {
     assert(s1.Compare(&s3) < 0);
     assert(s3.Compare(&s1) > 0);
 
+    // 7. Cons Strings (Ropes) & Lazy Flattening
+    auto* a = AllocateRuntime<JSString>("Aether");
+    auto* b = AllocateRuntime<JSString>("VM");
+    auto* rope = JSString::Concat(a, b);
+    assert(rope->Length() == 8);
+    assert(rope->CharCodeAt(0) == 'A');
+    assert(rope->CharCodeAt(6) == 'V');
+    assert(rope->CharCodeAt(7) == 'M');
+    assert(rope->Value() == "AetherVM");
+
+    // Deep rope concatenation & flattening
+    auto* accum = AllocateRuntime<JSString>("");
+    for (int i = 0; i < 40; ++i) {
+        accum = JSString::Concat(accum, AllocateRuntime<JSString>("ab"));
+    }
+    assert(accum->Length() == 80);
+    accum->EnsureFlat();
+    assert(accum->IsOneByte());
+    assert(accum->View().length() == 80);
+
+    // 8. Sliced Strings
+    auto* orig = AllocateRuntime<JSString>("Hello, Beautiful World!");
+    auto* slice1 = JSString::Slice(orig, 7, 9); // "Beautiful"
+    assert(slice1->Length() == 9);
+    assert(slice1->CharCodeAt(0) == 'B');
+    assert(slice1->CharCodeAt(8) == 'l');
+    assert(slice1->Value() == "Beautiful");
+
+    // Nested slice collapses to parent
+    auto* slice2 = JSString::Slice(slice1, 4, 4); // "tifu"
+    assert(slice2->Length() == 4);
+    assert(slice2->Value() == "tifu");
+
     std::cout << "  -> JSString memory diet & UTF-16 representation verified.\n";
 }
 

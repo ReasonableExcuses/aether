@@ -74,11 +74,14 @@ JSString::JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape)
     if (length == 0 || !utf16_data) {
         length_ = 0;
         kind_ = StringKind::FlatLatin1;
+        str_flags_ = kFlagIsLatin1;
+        depth_ = 0;
         payload_ = nullptr;
         hash_ = 2166136261u;
         return;
     }
     CheckedStringLength(length);
+    depth_ = 0;
     bool fits_latin1 = true;
     for (uint32_t i = 0; i < length; ++i) {
         if (utf16_data[i] > 255) {
@@ -88,6 +91,7 @@ JSString::JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape)
     }
     if (fits_latin1) {
         kind_ = StringKind::FlatLatin1;
+        str_flags_ = kFlagIsLatin1;
         ByteArray* ba = AllocateRuntimeByteArrayFor(this, length + 1);
         for (uint32_t i = 0; i < length; ++i) {
             ba->data()[i] = static_cast<uint8_t>(utf16_data[i]);
@@ -96,6 +100,7 @@ JSString::JSString(const uint16_t* utf16_data, uint32_t length, Shape* shape)
         payload_ = ba;
     } else {
         kind_ = StringKind::FlatUtf16;
+        str_flags_ = 0;
         ByteArray* ba = AllocateRuntimeByteArrayFor(this, (length + 1) * static_cast<uint32_t>(sizeof(uint16_t)));
         uint16_t* dst = reinterpret_cast<uint16_t*>(ba->data());
         std::memcpy(dst, utf16_data, length * sizeof(uint16_t));
@@ -117,6 +122,10 @@ JSString::JSString(JSString* left, JSString* right, Shape* shape)
               (right ? static_cast<uint32_t>(right->Length()) : 0);
     slice_offset_ = 0;
     hash_ = 0;
+    depth_ = static_cast<uint8_t>(std::max<int>(left ? left->depth_ : 0, right ? right->depth_ : 0) + 1);
+    if (left && right && left->IsLatin1() && right->IsLatin1()) {
+        str_flags_ |= kFlagIsLatin1;
+    }
     if (AETHER_UNLIKELY(IsOld())) {
         if (left_ && left_->IsYoung()) RecordWriteBarrier(this, TaggedValue::FromHeapObject(left_));
         if (right_ && right_->IsYoung()) RecordWriteBarrier(this, TaggedValue::FromHeapObject(right_));
@@ -131,6 +140,10 @@ JSString::JSString(JSString* parent, uint32_t offset, uint32_t length, Shape* sh
       parent_(parent),
       right_(nullptr) {
     hash_ = 0;
+    depth_ = 0;
+    if (parent && parent->IsLatin1()) {
+        str_flags_ |= kFlagIsLatin1;
+    }
     if (AETHER_UNLIKELY(IsOld() && parent_ && parent_->IsYoung())) {
         RecordWriteBarrier(this, TaggedValue::FromHeapObject(parent_));
     }
@@ -178,9 +191,11 @@ void JSString::InitializeFromUtf8(std::string_view utf8_str) {
     CheckedStringLength(utf8_str.length());
     slice_offset_ = 0;
     right_ = nullptr;
+    depth_ = 0;
     if (utf8_str.empty()) {
         length_ = 0;
         kind_ = StringKind::FlatLatin1;
+        str_flags_ = kFlagIsLatin1;
         payload_ = nullptr;
         hash_ = 2166136261u;
         return;
@@ -194,6 +209,7 @@ void JSString::InitializeFromUtf8(std::string_view utf8_str) {
     if (is_ascii) {
         length_ = static_cast<uint32_t>(utf8_str.length());
         kind_ = StringKind::FlatLatin1;
+        str_flags_ = kFlagIsLatin1;
         ByteArray* ba = AllocateRuntimeByteArrayFor(this, length_ + 1);
         std::memcpy(ba->data(), utf8_str.data(), length_);
         ba->data()[length_] = '\0';
@@ -219,6 +235,7 @@ void JSString::InitializeFromUtf8(std::string_view utf8_str) {
     length_ = u16_len;
     if (fits_latin1) {
         kind_ = StringKind::FlatLatin1;
+        str_flags_ = kFlagIsLatin1;
         ByteArray* ba = AllocateRuntimeByteArrayFor(this, length_ + 1);
         uint8_t* dst = ba->data();
         scan = ptr;
@@ -229,6 +246,7 @@ void JSString::InitializeFromUtf8(std::string_view utf8_str) {
         payload_ = ba;
     } else {
         kind_ = StringKind::FlatUtf16;
+        str_flags_ = 0;
         ByteArray* ba = AllocateRuntimeByteArrayFor(this, (length_ + 1) * static_cast<uint32_t>(sizeof(uint16_t)));
         uint16_t* dst = reinterpret_cast<uint16_t*>(ba->data());
         scan = ptr;
@@ -252,7 +270,218 @@ void JSString::InitializeFromUtf8(std::string_view utf8_str) {
     ComputeHash();
 }
 
+void JSString::FlattenToLatin1(uint8_t* dst) const noexcept {
+    std::vector<const JSString*> stack;
+    stack.push_back(this);
+    uint32_t write_pos = 0;
+    while (!stack.empty()) {
+        const JSString* s = stack.back();
+        stack.pop_back();
+        if (!s || s->length_ == 0) continue;
+        if (s->kind_ == StringKind::FlatLatin1) {
+            if (s->payload_) {
+                std::memcpy(dst + write_pos, s->payload_->data(), s->length_);
+            }
+            write_pos += s->length_;
+        } else if (s->kind_ == StringKind::FlatUtf16) {
+            if (s->payload_) {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(s->payload_->data());
+                for (uint32_t i = 0; i < s->length_; ++i) {
+                    dst[write_pos++] = static_cast<uint8_t>(src[i]);
+                }
+            }
+        } else if (s->kind_ == StringKind::Cons) {
+            if (s->right_) stack.push_back(s->right_);
+            if (s->left_) stack.push_back(s->left_);
+        } else if (s->kind_ == StringKind::Sliced) {
+            if (s->parent_) {
+                if (s->parent_->kind_ == StringKind::FlatLatin1 && s->parent_->payload_) {
+                    std::memcpy(dst + write_pos, s->parent_->payload_->data() + s->slice_offset_, s->length_);
+                    write_pos += s->length_;
+                } else {
+                    for (uint32_t i = 0; i < s->length_; ++i) {
+                        dst[write_pos++] = static_cast<uint8_t>(s->CharCodeAt(i));
+                    }
+                }
+            }
+        }
+    }
+}
+
+void JSString::FlattenToUtf16(uint16_t* dst) const noexcept {
+    std::vector<const JSString*> stack;
+    stack.push_back(this);
+    uint32_t write_pos = 0;
+    while (!stack.empty()) {
+        const JSString* s = stack.back();
+        stack.pop_back();
+        if (!s || s->length_ == 0) continue;
+        if (s->kind_ == StringKind::FlatLatin1) {
+            if (s->payload_) {
+                const uint8_t* src = s->payload_->data();
+                for (uint32_t i = 0; i < s->length_; ++i) {
+                    dst[write_pos++] = static_cast<uint16_t>(src[i]);
+                }
+            } else {
+                write_pos += s->length_;
+            }
+        } else if (s->kind_ == StringKind::FlatUtf16) {
+            if (s->payload_) {
+                std::memcpy(dst + write_pos, s->payload_->data(), s->length_ * sizeof(uint16_t));
+            }
+            write_pos += s->length_;
+        } else if (s->kind_ == StringKind::Cons) {
+            if (s->right_) stack.push_back(s->right_);
+            if (s->left_) stack.push_back(s->left_);
+        } else if (s->kind_ == StringKind::Sliced) {
+            if (s->parent_) {
+                if (s->parent_->kind_ == StringKind::FlatLatin1 && s->parent_->payload_) {
+                    const uint8_t* src = s->parent_->payload_->data() + s->slice_offset_;
+                    for (uint32_t i = 0; i < s->length_; ++i) {
+                        dst[write_pos++] = static_cast<uint16_t>(src[i]);
+                    }
+                } else if (s->parent_->kind_ == StringKind::FlatUtf16 && s->parent_->payload_) {
+                    const uint16_t* src = reinterpret_cast<const uint16_t*>(s->parent_->payload_->data()) + s->slice_offset_;
+                    std::memcpy(dst + write_pos, src, s->length_ * sizeof(uint16_t));
+                    write_pos += s->length_;
+                } else {
+                    for (uint32_t i = 0; i < s->length_; ++i) {
+                        dst[write_pos++] = s->CharCodeAt(i);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void JSString::EnsureFlat() const noexcept {
+    if (kind_ == StringKind::FlatLatin1 || kind_ == StringKind::FlatUtf16) {
+        return;
+    }
+    auto* self = const_cast<JSString*>(this);
+    if (length_ == 0) {
+        self->kind_ = StringKind::FlatLatin1;
+        self->str_flags_ |= kFlagIsLatin1;
+        self->payload_ = nullptr;
+        self->right_ = nullptr;
+        self->depth_ = 0;
+        return;
+    }
+
+    bool is_latin1 = (str_flags_ & kFlagIsLatin1) != 0;
+    if (!is_latin1) {
+        bool check_latin1 = true;
+        for (uint32_t i = 0; i < length_; ++i) {
+            if (CharCodeAt(i) > 255) {
+                check_latin1 = false;
+                break;
+            }
+        }
+        if (check_latin1) {
+            is_latin1 = true;
+            self->str_flags_ |= kFlagIsLatin1;
+        }
+    }
+
+    if (is_latin1) {
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, length_ + 1);
+        uint8_t* dst = ba->data();
+        FlattenToLatin1(dst);
+        dst[length_] = '\0';
+        self->payload_ = ba;
+        self->kind_ = StringKind::FlatLatin1;
+        self->right_ = nullptr;
+        self->depth_ = 0;
+        if (AETHER_UNLIKELY(IsOld() && self->payload_->IsYoung())) {
+            RecordWriteBarrier(self, TaggedValue::FromHeapObject(self->payload_));
+        }
+    } else {
+        ByteArray* ba = AllocateRuntimeByteArrayFor(this, (length_ + 1) * static_cast<uint32_t>(sizeof(uint16_t)));
+        uint16_t* dst = reinterpret_cast<uint16_t*>(ba->data());
+        FlattenToUtf16(dst);
+        dst[length_] = 0;
+        self->payload_ = ba;
+        self->kind_ = StringKind::FlatUtf16;
+        self->right_ = nullptr;
+        self->depth_ = 0;
+        if (AETHER_UNLIKELY(IsOld() && self->payload_->IsYoung())) {
+            RecordWriteBarrier(self, TaggedValue::FromHeapObject(self->payload_));
+        }
+    }
+}
+
+JSString* JSString::Concat(JSString* left, JSString* right) {
+    if (!left || left->length_ == 0) return right ? right : AllocateRuntime<JSString>("");
+    if (!right || right->length_ == 0) return left;
+
+    uint64_t total = static_cast<uint64_t>(left->length_) + right->length_;
+    if (AETHER_UNLIKELY(total > kMaxStringLength)) {
+        throw std::length_error("String length exceeds maximum allowed length");
+    }
+
+    uint32_t total_len = static_cast<uint32_t>(total);
+    if (total_len <= 14 && left->IsLatin1() && right->IsLatin1()) {
+        ByteArray* ba = AllocateRuntimeByteArrayFor(nullptr, total_len + 1);
+        uint8_t* dst = ba->data();
+        for (uint32_t i = 0; i < left->length_; ++i) dst[i] = static_cast<uint8_t>(left->CharCodeAt(i));
+        for (uint32_t i = 0; i < right->length_; ++i) dst[left->length_ + i] = static_cast<uint8_t>(right->CharCodeAt(i));
+        dst[total_len] = '\0';
+        auto* res = AllocateRuntime<JSString>("");
+        res->length_ = total_len;
+        res->kind_ = StringKind::FlatLatin1;
+        res->str_flags_ = kFlagIsLatin1;
+        res->payload_ = ba;
+        res->ComputeHash();
+        return res;
+    }
+
+    if (left->depth_ >= kMaxConsDepth) {
+        left->EnsureFlat();
+    }
+    if (right->depth_ >= kMaxConsDepth) {
+        right->EnsureFlat();
+    }
+
+    return AllocateRuntime<JSString>(left, right);
+}
+
+JSString* JSString::Slice(JSString* str, uint32_t offset, uint32_t length) {
+    if (!str || length == 0 || offset >= str->length_) return AllocateRuntime<JSString>("");
+    if (offset + length > str->length_) length = str->length_ - offset;
+    if (offset == 0 && length == str->length_) return str;
+
+    if (length <= 8 && str->IsLatin1()) {
+        ByteArray* ba = AllocateRuntimeByteArrayFor(nullptr, length + 1);
+        uint8_t* dst = ba->data();
+        for (uint32_t i = 0; i < length; ++i) dst[i] = static_cast<uint8_t>(str->CharCodeAt(offset + i));
+        dst[length] = '\0';
+        auto* res = AllocateRuntime<JSString>("");
+        res->length_ = length;
+        res->kind_ = StringKind::FlatLatin1;
+        res->str_flags_ = kFlagIsLatin1;
+        res->payload_ = ba;
+        res->ComputeHash();
+        return res;
+    }
+
+    JSString* root = str;
+    uint32_t root_offset = offset;
+    if (root->kind_ == StringKind::Sliced) {
+        root_offset += root->slice_offset_;
+        root = root->parent_;
+    }
+
+    if (root && root->kind_ == StringKind::Cons) {
+        root->EnsureFlat();
+    }
+
+    return AllocateRuntime<JSString>(root, root_offset, length);
+}
+
 void JSString::ComputeHash() const noexcept {
+    if (kind_ != StringKind::FlatLatin1 && kind_ != StringKind::FlatUtf16) {
+        EnsureFlat();
+    }
     uint32_t h = 2166136261u;
     if (kind_ == StringKind::FlatLatin1 && payload_ != nullptr) {
         const uint8_t* p = payload_->data();
@@ -260,18 +489,14 @@ void JSString::ComputeHash() const noexcept {
             h ^= p[i];
             h *= 16777619u;
         }
-    } else {
+    } else if (kind_ == StringKind::FlatUtf16 && payload_ != nullptr) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(payload_->data());
         for (uint32_t i = 0; i < length_; ++i) {
-            uint16_t cu = CharCodeAt(i);
-            if (cu <= 0xFF) {
-                h ^= static_cast<uint8_t>(cu);
-                h *= 16777619u;
-            } else {
-                h ^= static_cast<uint8_t>(cu & 0xFF);
-                h *= 16777619u;
-                h ^= static_cast<uint8_t>(cu >> 8);
-                h *= 16777619u;
-            }
+            uint16_t cu = p[i];
+            h ^= static_cast<uint8_t>(cu & 0xFF);
+            h *= 16777619u;
+            h ^= static_cast<uint8_t>(cu >> 8);
+            h *= 16777619u;
         }
     }
     if (h == 0) h = 1;
@@ -280,20 +505,32 @@ void JSString::ComputeHash() const noexcept {
 
 uint16_t JSString::CharCodeAt(uint32_t index) const noexcept {
     if (index >= length_) return 0;
-    switch (kind_) {
-        case StringKind::FlatLatin1:
-            return payload_ ? payload_->data()[index] : 0;
-        case StringKind::FlatUtf16: {
-            const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload_->data());
-            return u16[index];
+    const JSString* curr = this;
+    uint32_t idx = index;
+    while (curr) {
+        switch (curr->kind_) {
+            case StringKind::FlatLatin1:
+                return curr->payload_ ? curr->payload_->data()[idx] : 0;
+            case StringKind::FlatUtf16: {
+                const uint16_t* u16 = reinterpret_cast<const uint16_t*>(curr->payload_->data());
+                return u16[idx];
+            }
+            case StringKind::Cons: {
+                uint32_t left_len = curr->left_ ? curr->left_->length_ : 0;
+                if (idx < left_len) {
+                    curr = curr->left_;
+                } else {
+                    idx -= left_len;
+                    curr = curr->right_;
+                }
+                break;
+            }
+            case StringKind::Sliced: {
+                idx += curr->slice_offset_;
+                curr = curr->parent_;
+                break;
+            }
         }
-        case StringKind::Cons: {
-            uint32_t left_len = left_ ? static_cast<uint32_t>(left_->Length()) : 0;
-            if (index < left_len) return left_->CharCodeAt(index);
-            return right_ ? right_->CharCodeAt(index - left_len) : 0;
-        }
-        case StringKind::Sliced:
-            return parent_ ? parent_->CharCodeAt(slice_offset_ + index) : 0;
     }
     return 0;
 }
@@ -316,9 +553,17 @@ bool JSString::Equals(const JSString* other) const noexcept {
     if (length_ != other->length_) return false;
     if (hash_ != 0 && other->hash_ != 0 && hash_ != other->hash_) return false;
     if (length_ == 0) return true;
+    EnsureFlat();
+    other->EnsureFlat();
     if (kind_ == StringKind::FlatLatin1 && other->kind_ == StringKind::FlatLatin1) {
         if (payload_ && other->payload_) {
             return std::memcmp(payload_->data(), other->payload_->data(), length_) == 0;
+        }
+        return payload_ == other->payload_;
+    }
+    if (kind_ == StringKind::FlatUtf16 && other->kind_ == StringKind::FlatUtf16) {
+        if (payload_ && other->payload_) {
+            return std::memcmp(payload_->data(), other->payload_->data(), length_ * sizeof(uint16_t)) == 0;
         }
         return payload_ == other->payload_;
     }
@@ -331,6 +576,8 @@ bool JSString::Equals(const JSString* other) const noexcept {
 int JSString::Compare(const JSString* other) const noexcept {
     if (this == other) return 0;
     if (!other) return 1;
+    EnsureFlat();
+    other->EnsureFlat();
     if (kind_ == StringKind::FlatLatin1 && other->kind_ == StringKind::FlatLatin1 && payload_ && other->payload_) {
         uint32_t min_len = std::min(length_, other->length_);
         int cmp = std::memcmp(payload_->data(), other->payload_->data(), min_len);
@@ -350,9 +597,12 @@ int JSString::Compare(const JSString* other) const noexcept {
 
 std::string JSString::ToUtf8() const {
     if (length_ == 0) return "";
-    std::string out;
+    if (kind_ != StringKind::FlatLatin1 && kind_ != StringKind::FlatUtf16) {
+        EnsureFlat();
+    }
     if (kind_ == StringKind::FlatLatin1) {
         if (!payload_) return "";
+        std::string out;
         out.reserve(length_);
         const uint8_t* data = payload_->data();
         for (uint32_t i = 0; i < length_; ++i) {
@@ -368,30 +618,13 @@ std::string JSString::ToUtf8() const {
     }
     if (kind_ == StringKind::FlatUtf16) {
         if (!payload_) return "";
+        std::string out;
         out.reserve(length_ * 2);
         const uint16_t* u16 = reinterpret_cast<const uint16_t*>(payload_->data());
         uint32_t i = 0;
         while (i < length_) {
             uint16_t cu = u16[i++];
             const uint16_t* next = (i < length_) ? &u16[i] : nullptr;
-            AppendUtf16CodeUnitToUtf8(out, cu, next);
-            if (cu >= 0xD800 && cu <= 0xDBFF && next && *next >= 0xDC00 && *next <= 0xDFFF) ++i;
-        }
-        return out;
-    }
-    if (kind_ == StringKind::Cons) {
-        std::string l = left_ ? left_->ToUtf8() : "";
-        std::string r = right_ ? right_->ToUtf8() : "";
-        return l + r;
-    }
-    if (kind_ == StringKind::Sliced) {
-        if (!parent_) return "";
-        out.reserve(length_ * 2);
-        uint32_t i = 0;
-        while (i < length_) {
-            uint16_t cu = parent_->CharCodeAt(slice_offset_ + i++);
-            uint16_t next_val = (i < length_) ? parent_->CharCodeAt(slice_offset_ + i) : 0;
-            const uint16_t* next = (i < length_) ? &next_val : nullptr;
             AppendUtf16CodeUnitToUtf8(out, cu, next);
             if (cu >= 0xD800 && cu <= 0xDBFF && next && *next >= 0xDC00 && *next <= 0xDFFF) ++i;
         }

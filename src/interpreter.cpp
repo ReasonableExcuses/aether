@@ -1546,10 +1546,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             }
                             break;
                         }
-                        std::string s1 = static_cast<JSString*>(s1_val.AsHeapObject())->Value();
-                        std::string s2 = static_cast<JSString*>(s2_val.AsHeapObject())->Value();
-                        // Enterprise: prevent string bomb attacks
-                        if (AETHER_UNLIKELY(s1.size() + s2.size() > kMaxStringLength)) {
+                        JSString* s1 = static_cast<JSString*>(s1_val.AsHeapObject());
+                        JSString* s2 = static_cast<JSString*>(s2_val.AsHeapObject());
+                        if (AETHER_UNLIKELY(static_cast<uint64_t>(s1->Length()) + s2->Length() > kMaxStringLength)) {
                             SetPendingException(TaggedValue::FromHeapObject(
                                 AllocateRuntime<JSError>("RangeError", "String length exceeds maximum allowed length")));
                             if (frame.HasExceptionHandler()) {
@@ -1563,7 +1562,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             }
                             break;
                         }
-                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s1 + s2));
+                        acc_ = TaggedValue::FromHeapObject(JSString::Concat(s1, s2));
                     } else {
                         if (lval.IsSymbol() || rval.IsSymbol()) {
                             SetPendingException(TaggedValue::FromHeapObject(
@@ -2394,9 +2393,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             }
                             break;
                         }
-                        std::string s1 = static_cast<JSString*>(s1_val.AsHeapObject())->Value();
+                        JSString* s1 = static_cast<JSString*>(s1_val.AsHeapObject());
                         std::string s2 = std::to_string(imm);
-                        if (AETHER_UNLIKELY(s1.size() + s2.size() > kMaxStringLength)) {
+                        if (AETHER_UNLIKELY(static_cast<uint64_t>(s1->Length()) + s2.size() > kMaxStringLength)) {
                             SetPendingException(TaggedValue::FromHeapObject(
                                 AllocateRuntime<JSError>("RangeError", "String length exceeds maximum allowed length")));
                             if (frame.HasExceptionHandler()) {
@@ -2410,7 +2409,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             }
                             break;
                         }
-                        acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(s1 + s2));
+                        JSString* s2_obj = AllocateRuntime<JSString>(s2);
+                        acc_ = TaggedValue::FromHeapObject(JSString::Concat(s1, s2_obj));
                     } else {
                         TaggedValue lnum = ToNumeric(lval);
                         if (has_pending_exception_) {
