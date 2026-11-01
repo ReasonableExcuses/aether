@@ -159,6 +159,14 @@ uint16_t BytecodeArray::AddConstant(TaggedValue val) {
         if (constants_[i] == val) {
             return static_cast<uint16_t>(i);
         }
+        if (val.IsHeapObject() && val.AsHeapObject()->IsString() &&
+            constants_[i].IsHeapObject() && constants_[i].AsHeapObject()->IsString()) {
+            auto* s1 = static_cast<const JSString*>(val.AsHeapObject());
+            auto* s2 = static_cast<const JSString*>(constants_[i].AsHeapObject());
+            if (s1->Equals(s2)) {
+                return static_cast<uint16_t>(i);
+            }
+        }
     }
     size_t idx = constants_.size();
     assert(idx <= UINT16_MAX && "Constant pool overflow");

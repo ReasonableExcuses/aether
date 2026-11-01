@@ -229,7 +229,7 @@ Goal: trivially relocatable objects, no per-object destructors, real evacuation.
 - Each migration PR removes the matching `std::vector`/`std::unordered_map` and `MemoryCharge` for that field.
 - **Acceptance:** per type, `sizeof` and RSS benches improve; destructor of migrated type becomes trivial.
 
-### T2.2 Strings (also fixes UTF-16 conformance; coordinate with T6.1)
+### T2.2 Strings (also fixes UTF-16 conformance; coordinate with T6.1) [x]
 - New string representation: flat **Latin-1 or UTF-16**, hash cached, interning table for property keys, **ropes** for concatenation (flatten lazily), sliced strings for `substring`.
 - `s += "ab"` loop must be O(n) total.
 - **Acceptance:** `str.js 80000` < 0.3 s (-O2) and RSS < 64 MB; `"😀".length === 2`, `"😀".charCodeAt(0) === 0xD83D`, lone surrogates preserved.
@@ -338,7 +338,7 @@ Interpreter implements all 121. Tier 1: 61. Tier 2: ~41.
 
 | ID | Probe | Observed | Expected |
 |---|---|---|---|
-| T6.1 | `"😀".length`, `.charCodeAt(0)`, `"é".length` | 4, 240, 2 | 2, 55357, 1 (UTF-16 semantics; see T2.2) |
+| T6.1 | `"😀".length`, `.charCodeAt(0)`, `"é".length` | 4, 240, 2 | [x] 2, 55357, 1 (UTF-16 semantics; see T2.2 & ADR 017) |
 | T6.2 | `JSON.stringify({a:[1,{b:2}],c:"x"})` | `{"c":"x","a":…}` | `{"a":[…],"c":"x"}`. Own-property order must be: integer keys ascending, then strings in insertion order, then symbols. Fix in property storage (T1.7). |
 | T6.3 | `a: for(…){ for(;;){ continue a } }` | SyntaxError | labeled statements, `break/continue label` |
 | T6.4 | `try{ x; let x=1 }catch(e){…}` | no throw | `ReferenceError` (TDZ) |

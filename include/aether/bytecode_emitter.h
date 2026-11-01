@@ -168,6 +168,9 @@ private:
         if (parent_emitter_) return parent_emitter_->LookupSuperProto();
         return nullptr;
     }
+    JSString* InternString(std::string_view name);
+
+    std::unordered_map<std::string, JSString*> interned_strings_;
     std::unordered_set<std::string> uninitialized_params_;
     std::unordered_set<std::string> const_bindings_;
     std::string nfe_name_;

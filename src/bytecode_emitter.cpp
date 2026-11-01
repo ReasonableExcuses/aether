@@ -444,6 +444,16 @@ BytecodeEmitter::VarResolution BytecodeEmitter::ResolveVariable(std::string_view
     return VarResolution{VarResolution::GlobalProperty, 0, 0, 0, nullptr, TaggedValue::Undefined()};
 }
 
+JSString* BytecodeEmitter::InternString(std::string_view name) {
+    if (parent_emitter_) return parent_emitter_->InternString(name);
+    std::string s(name);
+    auto it = interned_strings_.find(s);
+    if (it != interned_strings_.end()) return it->second;
+    JSString* str_obj = AllocateRuntime<JSString>(name);
+    interned_strings_[s] = str_obj;
+    return str_obj;
+}
+
 std::unique_ptr<BytecodeArray> BytecodeEmitter::Emit(ASTNode* root) {
     NoGCScope compilation;
     bytecode_ = std::make_unique<BytecodeArray>();
@@ -788,7 +798,7 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(obj_reg);
 
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
             uint16_t slot = next_feedback_slot_++;
             bytecode_->EmitOpcode(Opcode::LdaNamed);
             bytecode_->EmitU8(obj_reg);
@@ -806,7 +816,7 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(obj_reg);
 
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
         bytecode_->EmitU8(obj_reg);
@@ -817,7 +827,7 @@ void BytecodeEmitter::VisitIdentifier(IdentifierExpr* node) {
     }
 
     if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Name())));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Name())));
         bytecode_->EmitOpcode(Opcode::LdaGlobal);
         bytecode_->EmitU16(name_idx);
         return;
@@ -831,7 +841,7 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
         if (auto* id = dynamic_cast<IdentifierExpr*>(node->GetExpr())) {
             auto res = ResolveVariable(id->Name());
             if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
-                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(id->Name())));
+                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(id->Name())));
                 bytecode_->EmitOpcode(Opcode::TypeOfGlobal);
                 bytecode_->EmitU16(name_idx);
                 return;
@@ -853,7 +863,7 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
             uint8_t obj_reg = AllocateRegister();
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(obj_reg);
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(mem->Property())));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(mem->Property())));
             bytecode_->EmitOpcode(Opcode::DeleteNamed);
             bytecode_->EmitU8(obj_reg);
             bytecode_->EmitU16(name_idx);
@@ -886,7 +896,7 @@ void BytecodeEmitter::VisitUnary(UnaryExpr* node) {
             return;
         }
         if (auto* id = dynamic_cast<IdentifierExpr*>(node->GetExpr())) {
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(id->Name())));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(id->Name())));
             bytecode_->EmitOpcode(Opcode::DeleteGlobal);
             bytecode_->EmitU16(name_idx);
             return;
@@ -970,7 +980,7 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(env_reg);
 
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
         uint16_t slot = next_feedback_slot_++;
 
         bytecode_->EmitOpcode(Opcode::Ldar);
@@ -985,7 +995,7 @@ void BytecodeEmitter::VisitAssign(AssignExpr* node) {
         return;
     }
     if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Target())));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Target())));
         bytecode_->EmitOpcode(Opcode::StaGlobal);
         bytecode_->EmitU16(name_idx);
         return;
@@ -1038,7 +1048,7 @@ void BytecodeEmitter::VisitArrayDestructureAssign(ArrayDestructureAssignExpr* no
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(env_reg);
 
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
             uint16_t m_slot = next_feedback_slot_++;
 
             bytecode_->EmitOpcode(Opcode::Ldar);
@@ -1084,7 +1094,7 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(obj_reg);
 
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
         bytecode_->EmitU8(obj_reg);
@@ -1092,7 +1102,7 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         bytecode_->EmitU16(slot);
         FreeRegister(obj_reg);
     } else if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Name())));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Name())));
         bytecode_->EmitOpcode(Opcode::LdaGlobal);
         bytecode_->EmitU16(name_idx);
     } else {
@@ -1133,7 +1143,7 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(env_reg);
 
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
         uint16_t slot = next_feedback_slot_++;
 
         bytecode_->EmitOpcode(Opcode::Ldar);
@@ -1146,7 +1156,7 @@ void BytecodeEmitter::VisitUpdate(UpdateExpr* node) {
         FreeRegister(env_reg);
         FreeRegister(val_reg);
     } else if (res.kind == VarResolution::GlobalProperty || res.kind == VarResolution::NotFound) {
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Name())));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Name())));
         bytecode_->EmitOpcode(Opcode::StaGlobal);
         bytecode_->EmitU16(name_idx);
     }
@@ -1173,7 +1183,7 @@ void BytecodeEmitter::VisitPropertyAccess(PropertyAccessExpr* node) {
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    auto* s = AllocateRuntime<JSString>(node->Property());
+    auto* s = InternString(node->Property());
     uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
     uint16_t slot = next_feedback_slot_++;
 
@@ -1201,7 +1211,7 @@ void BytecodeEmitter::VisitPropertyAssign(PropertyAssignExpr* node) {
         std::string raw = prop.substr(11);
         prop = "__private__" + LookupPrivateName(raw);
     }
-    auto* s = AllocateRuntime<JSString>(prop);
+    auto* s = InternString(prop);
     uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
     uint16_t slot = next_feedback_slot_++;
 
@@ -1293,7 +1303,7 @@ void BytecodeEmitter::VisitCall(CallExpr* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(super_reg);
 
-            auto* s = AllocateRuntime<JSString>(prop->Property());
+            auto* s = InternString(prop->Property());
             uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
             uint16_t slot = next_feedback_slot_++;
             bytecode_->EmitOpcode(Opcode::LdaNamed);
@@ -1338,7 +1348,7 @@ void BytecodeEmitter::VisitCall(CallExpr* node) {
         bytecode_->EmitU8(this_reg);
 
         // 2. Load property from this_reg into callee_reg
-        auto* s = AllocateRuntime<JSString>(prop->Property());
+        auto* s = InternString(prop->Property());
         uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
@@ -1571,7 +1581,7 @@ void BytecodeEmitter::VisitObjectLiteral(ObjectLiteralExpr* node) {
             FreeRegister(src_reg);
         } else {
             prop.value->Accept(this);
-            auto* s = AllocateRuntime<JSString>(prop.key);
+            auto* s = InternString(prop.key);
             uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
             if (prop.is_getter) {
                 bytecode_->EmitOpcode(Opcode::DefineGetter);
@@ -1870,7 +1880,7 @@ void BytecodeEmitter::VisitCompoundPropertyAssign(CompoundPropertyAssignExpr* no
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Property())));
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Property())));
     uint16_t lda_slot = next_feedback_slot_++;
     bytecode_->EmitOpcode(Opcode::LdaNamed);
     bytecode_->EmitU8(obj_reg);
@@ -2111,7 +2121,7 @@ void BytecodeEmitter::VisitBinary(BinaryExpr* node) {
         if (auto* priv = dynamic_cast<PrivateIdentifierExpr*>(node->Lhs())) {
             node->Rhs()->Accept(this);
             std::string mangled = LookupPrivateName(priv->Name());
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(mangled)));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(mangled)));
             bytecode_->EmitOpcode(Opcode::TestPrivateIn);
             bytecode_->EmitU16(name_idx);
             return;
@@ -2378,7 +2388,7 @@ void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(env_reg);
 
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Name())));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Name())));
             uint16_t slot = next_feedback_slot_++;
 
             bytecode_->EmitOpcode(Opcode::Ldar);
@@ -3382,7 +3392,7 @@ void BytecodeEmitter::VisitOptionalPropertyAccess(OptionalPropertyAccessExpr* no
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    auto* s = AllocateRuntime<JSString>(node->Property());
+    auto* s = InternString(node->Property());
     uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
     uint16_t slot = next_feedback_slot_++;
 
@@ -3453,7 +3463,7 @@ void BytecodeEmitter::VisitOptionalCall(OptionalCallExpr* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(super_reg);
 
-            auto* s = AllocateRuntime<JSString>(prop->Property());
+            auto* s = InternString(prop->Property());
             uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
             uint16_t slot = next_feedback_slot_++;
             bytecode_->EmitOpcode(Opcode::LdaNamed);
@@ -3510,7 +3520,7 @@ void BytecodeEmitter::VisitOptionalCall(OptionalCallExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(this_reg);
 
-        auto* s = AllocateRuntime<JSString>(prop->Property());
+        auto* s = InternString(prop->Property());
         uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
@@ -3571,7 +3581,7 @@ void BytecodeEmitter::VisitOptionalCall(OptionalCallExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(this_reg);
 
-        auto* s = AllocateRuntime<JSString>(opt_prop->Property());
+        auto* s = InternString(opt_prop->Property());
         uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(s));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
@@ -3859,7 +3869,7 @@ void BytecodeEmitter::VisitDynamicImport(DynamicImportExpr* node) {
     bytecode_->EmitU8(spec_reg);
 
     uint8_t global_reg = AllocateRegister();
-    uint16_t fn_name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>("__aether_dynamic_import")));
+    uint16_t fn_name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString("__aether_dynamic_import")));
     uint16_t slot1 = next_feedback_slot_++;
     uint16_t slot2 = next_feedback_slot_++;
 
@@ -3923,7 +3933,7 @@ void BytecodeEmitter::VisitExportDecl(ExportDeclStmt* node) {
                 bytecode_->EmitOpcode(Opcode::Star);
                 bytecode_->EmitU8(env_reg);
 
-                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>("default")));
+                uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString("default")));
                 uint16_t slot = next_feedback_slot_++;
 
                 bytecode_->EmitOpcode(Opcode::Ldar);
@@ -3968,7 +3978,7 @@ void BytecodeEmitter::VisitPrivateAccess(PrivateAccessExpr* node) {
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(LookupPrivateName(node->Name()))));
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(LookupPrivateName(node->Name()))));
     bytecode_->EmitOpcode(Opcode::LdaPrivate);
     bytecode_->EmitU8(obj_reg);
     bytecode_->EmitU16(name_idx);
@@ -4011,7 +4021,7 @@ void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(obj_reg);
 
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
         uint16_t slot = next_feedback_slot_++;
         bytecode_->EmitOpcode(Opcode::LdaNamed);
         bytecode_->EmitU8(obj_reg);
@@ -4019,7 +4029,7 @@ void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
         bytecode_->EmitU16(slot);
         FreeRegister(obj_reg);
     } else {
-        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Target())));
+        uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Target())));
         bytecode_->EmitOpcode(Opcode::LdaGlobal);
         bytecode_->EmitU16(name_idx);
     }
@@ -4044,7 +4054,7 @@ void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
             bytecode_->EmitOpcode(Opcode::Star);
             bytecode_->EmitU8(env_reg);
 
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(res.property_name)));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(res.property_name)));
             uint16_t slot = next_feedback_slot_++;
             bytecode_->EmitOpcode(Opcode::Ldar);
             bytecode_->EmitU8(val_reg);
@@ -4055,7 +4065,7 @@ void BytecodeEmitter::VisitCompoundAssign(CompoundAssignExpr* node) {
             FreeRegister(env_reg);
             FreeRegister(val_reg);
         } else {
-            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Target())));
+            uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Target())));
             bytecode_->EmitOpcode(Opcode::StaGlobal);
             bytecode_->EmitU16(name_idx);
         }
@@ -4108,7 +4118,7 @@ void BytecodeEmitter::VisitCompoundPrivateAssign(CompoundPrivateAssignExpr* node
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(LookupPrivateName(node->Name()))));
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(LookupPrivateName(node->Name()))));
     bytecode_->EmitOpcode(Opcode::LdaPrivate);
     bytecode_->EmitU8(obj_reg);
     bytecode_->EmitU16(name_idx);
@@ -4195,7 +4205,7 @@ void BytecodeEmitter::VisitUpdateProperty(UpdatePropertyExpr* node) {
     bytecode_->EmitOpcode(Opcode::Star);
     bytecode_->EmitU8(obj_reg);
 
-    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(node->Property())));
+    uint16_t name_idx = bytecode_->AddConstant(TaggedValue::FromHeapObject(InternString(node->Property())));
     uint16_t lda_slot = next_feedback_slot_++;
     bytecode_->EmitOpcode(Opcode::LdaNamed);
     bytecode_->EmitU8(obj_reg);
