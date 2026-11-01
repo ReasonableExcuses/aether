@@ -1277,19 +1277,13 @@ private:
 class JSFunction : public JSObject {
 public:
     struct InstanceField {
-        MemoryCharge name_storage;
         std::string name;
         TaggedValue initial_value{TaggedValue::Undefined()};
         bool is_method{false};
 
         InstanceField() = default;
         InstanceField(std::string_view field_name, TaggedValue value, bool method = false)
-            : name(detail::ChargedString(field_name, name_storage)),
-              initial_value(value), is_method(method) {}
-        InstanceField(InstanceField&&) noexcept = default;
-        InstanceField& operator=(InstanceField&&) noexcept = default;
-        InstanceField(const InstanceField&) = delete;
-        InstanceField& operator=(const InstanceField&) = delete;
+            : name(field_name), initial_value(value), is_method(method) {}
     };
 
     struct FunctionData {
@@ -1299,16 +1293,14 @@ public:
         const BytecodeArray* bytecode{nullptr};
         LexicalEnvironment* environment{nullptr};
         TaggedValue ctor_prototype{TaggedValue::Empty()};
-        MemoryCharge fields_storage;
-        std::vector<InstanceField> instance_fields;
+        FixedArray* instance_fields{nullptr};
         bool is_generator{false};
         bool is_async{false};
         bool is_arrow{false};
         bool is_method{false};
         TaggedValue lexical_this{TaggedValue::Undefined()};
         TaggedValue lexical_new_target{TaggedValue::Undefined()};
-        MemoryCharge with_storage;
-        std::vector<JSObject*> with_stack;
+        FixedArray* with_stack{nullptr};
     };
 
     JSFunction(std::string_view name, std::shared_ptr<const BytecodeArray> bytecode, LexicalEnvironment* env = nullptr, Shape* shape = nullptr);
@@ -1384,18 +1376,20 @@ public:
 
     JSObject* GetOrCreateConstructorPrototype();
 
-    void AddInstanceField(std::string_view name, TaggedValue initial_val = TaggedValue::Undefined(), bool is_method = false) {
-        auto& d = EnsureFnData();
-        detail::ReserveStorage(d.instance_fields, d.fields_storage, d.instance_fields.size() + 1, kMaxObjectProperties);
-        d.instance_fields.emplace_back(name, initial_val, is_method);
-        if (IsOld() && initial_val.IsHeapObject()) {
-            RecordWriteBarrier(this, initial_val);
-        }
+    void AddInstanceField(std::string_view name, TaggedValue initial_val = TaggedValue::Undefined(), bool is_method = false);
+    std::vector<InstanceField> InstanceFields() const noexcept;
+    FixedArray* InstanceFieldsArray() const noexcept { return fn_data_ ? fn_data_->instance_fields : nullptr; }
+    bool HasInstanceFields() const noexcept {
+        return fn_data_ && fn_data_->instance_fields && fn_data_->instance_fields->Length() > 0;
     }
-    const std::vector<InstanceField>& InstanceFields() const noexcept;
-    const std::vector<JSObject*>& GetWithStack() const noexcept;
-    void SetWithStack(std::vector<JSObject*> ws);
-    bool HasWithStack() const noexcept { return fn_data_ && !fn_data_->with_stack.empty(); }
+
+    std::vector<JSObject*> GetWithStack() const;
+    FixedArray* GetWithStackArray() const noexcept { return fn_data_ ? fn_data_->with_stack : nullptr; }
+    void SetWithStack(const std::vector<JSObject*>& ws);
+    void SetWithStack(FixedArray* ws);
+    bool HasWithStack() const noexcept {
+        return fn_data_ && fn_data_->with_stack && fn_data_->with_stack->Length() > 0;
+    }
 
     size_t ObjectSize() const override { return sizeof(JSFunction); }
     void IteratePointers(SlotVisitor* visitor) override;

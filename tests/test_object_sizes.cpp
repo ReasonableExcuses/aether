@@ -135,7 +135,42 @@ void TestFunctionMemoryDiet() {
     fn.SetConstructorPrototype(proto);
     assert(fn.GetConstructorPrototype() == proto);
 
-    std::cout << "  -> Function memory diet verified.\n";
+    // Verify captured with_stack migration to GC-allocated FixedArray
+    assert(!fn.HasWithStack());
+    assert(fn.GetWithStackArray() == nullptr);
+    assert(fn.GetWithStack().empty());
+
+    auto* obj1 = AllocateRuntime<JSObject>(nullptr);
+    auto* obj2 = AllocateRuntime<JSObject>(nullptr);
+    fn.SetWithStack({obj1, obj2});
+    assert(fn.HasWithStack());
+    assert(fn.GetWithStackArray() != nullptr);
+    assert(fn.GetWithStackArray()->Length() == 2);
+    auto ws_vec = fn.GetWithStack();
+    assert(ws_vec.size() == 2);
+    assert(ws_vec[0] == obj1);
+    assert(ws_vec[1] == obj2);
+
+    // Verify captured instance_fields migration to GC-allocated FixedArray
+    assert(!fn.HasInstanceFields());
+    assert(fn.InstanceFieldsArray() == nullptr);
+    assert(fn.InstanceFields().empty());
+
+    fn.AddInstanceField("field1", TaggedValue::FromSmi(42), false);
+    fn.AddInstanceField("method1", TaggedValue::Null(), true);
+    assert(fn.HasInstanceFields());
+    assert(fn.InstanceFieldsArray() != nullptr);
+    assert(fn.InstanceFieldsArray()->Length() == 6); // 2 fields * 3 slots
+    auto fields = fn.InstanceFields();
+    assert(fields.size() == 2);
+    assert(fields[0].name == "field1");
+    assert(fields[0].initial_value.AsSmi() == 42);
+    assert(!fields[0].is_method);
+    assert(fields[1].name == "method1");
+    assert(fields[1].initial_value.IsNull());
+    assert(fields[1].is_method);
+
+    std::cout << "  -> Function memory diet & captured FixedArray data verified.\n";
 }
 
 void TestGCAllocatedArrays() {

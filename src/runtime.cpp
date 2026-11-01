@@ -732,12 +732,14 @@ TaggedValue ConstructObject(TaggedValue ctor, const std::vector<TaggedValue>& ar
         }
         TaggedValue inst_val = TaggedValue::FromHeapObject(instance);
         uint32_t field_sid = 11000;
-        for (const auto& f : fn->InstanceFields()) {
-            std::string property = f.name.size() > 0 && f.name[0] == '#'
-                ? "__private__" + f.name.substr(1) : f.name;
-            instance->SetNamedProperty(property, f.initial_value, field_sid);
-            if (f.is_method) {
-                instance->SetOwnPropertyAttributes(property, PropertyAttributes::None);
+        if (fn->HasInstanceFields()) {
+            for (const auto& f : fn->InstanceFields()) {
+                std::string property = f.name.size() > 0 && f.name[0] == '#'
+                    ? "__private__" + f.name.substr(1) : f.name;
+                instance->SetNamedProperty(property, f.initial_value, field_sid);
+                if (f.is_method) {
+                    instance->SetOwnPropertyAttributes(property, PropertyAttributes::None);
+                }
             }
         }
         TaggedValue ret = CallFunction(ctor, inst_val, args, target);

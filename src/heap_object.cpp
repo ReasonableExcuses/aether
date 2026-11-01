@@ -956,24 +956,130 @@ const std::string& JSFunction::Name() const noexcept {
     return fn_data_ ? fn_data_->name : kEmpty;
 }
 
-const std::vector<JSFunction::InstanceField>& JSFunction::InstanceFields() const noexcept {
-    static const std::vector<InstanceField> kEmptyFields;
-    return fn_data_ ? fn_data_->instance_fields : kEmptyFields;
-}
-
-const std::vector<JSObject*>& JSFunction::GetWithStack() const noexcept {
-    static const std::vector<JSObject*> kEmptyStack;
-    return fn_data_ ? fn_data_->with_stack : kEmptyStack;
-}
-
-void JSFunction::SetWithStack(std::vector<JSObject*> ws) {
-    auto& d = EnsureFnData();
-    d.with_storage.Resize(CheckedStorageBytes(ws.capacity(), sizeof(JSObject*)));
-    d.with_stack = std::move(ws);
-    if (IsOld()) {
-        for (auto* obj : d.with_stack) {
-            if (obj) RecordWriteBarrier(this, TaggedValue::FromHeapObject(obj));
+std::vector<JSFunction::InstanceField> JSFunction::InstanceFields() const noexcept {
+    std::vector<InstanceField> result;
+    if (!fn_data_ || !fn_data_->instance_fields) return result;
+    size_t count = fn_data_->instance_fields->Length() / 3;
+    result.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        TaggedValue name_val = fn_data_->instance_fields->Get(static_cast<uint32_t>(i * 3));
+        TaggedValue init_val = fn_data_->instance_fields->Get(static_cast<uint32_t>(i * 3 + 1));
+        TaggedValue method_val = fn_data_->instance_fields->Get(static_cast<uint32_t>(i * 3 + 2));
+        std::string name;
+        if (name_val.IsHeapObject() && name_val.AsHeapObject()->IsString()) {
+            name = name_val.As<JSString>()->Value();
         }
+        bool is_method = method_val.IsBoolean() ? method_val.AsBoolean() : false;
+        result.emplace_back(std::move(name), init_val, is_method);
+    }
+    return result;
+}
+
+void JSFunction::AddInstanceField(std::string_view name, TaggedValue initial_val, bool is_method) {
+    auto& d = EnsureFnData();
+    size_t current_count = d.instance_fields ? (d.instance_fields->Length() / 3) : 0;
+    if (AETHER_UNLIKELY(current_count >= kMaxObjectProperties)) {
+        throw std::length_error("instance field limit exceeded");
+    }
+
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    if (initial_val.IsHeapObject() && heap->Contains(initial_val.AsHeapObject())) {
+        scope.CreateHandle(initial_val.AsHeapObject());
+    }
+    if (d.instance_fields && heap->Contains(d.instance_fields)) {
+        scope.CreateHandle(d.instance_fields);
+    }
+
+    auto* name_str = AllocateRuntime<JSString>(name);
+    if (name_str && heap->Contains(name_str)) {
+        scope.CreateHandle(name_str);
+    }
+    TaggedValue name_val = TaggedValue::FromHeapObject(name_str);
+
+    size_t new_count = current_count + 1;
+    uint32_t new_len = static_cast<uint32_t>(new_count * 3);
+    uint32_t current_cap = d.instance_fields ? d.instance_fields->Capacity() : 0;
+
+    if (!d.instance_fields || new_len > current_cap) {
+        uint32_t new_cap = std::max(uint32_t(6), std::max(new_len, current_cap * 2));
+        FixedArray* new_arr = AllocateRuntimeFixedArrayFor(this, new_len, new_cap, TaggedValue::Empty());
+        if (d.instance_fields) {
+            for (uint32_t i = 0; i < d.instance_fields->Length(); ++i) {
+                new_arr->Set(i, d.instance_fields->Get(i));
+            }
+        }
+        d.instance_fields = new_arr;
+        if (AETHER_UNLIKELY(IsOld() && d.instance_fields->IsYoung())) {
+            RecordWriteBarrier(this, TaggedValue::FromHeapObject(d.instance_fields));
+        }
+    } else {
+        d.instance_fields->SetLength(new_len);
+    }
+
+    uint32_t base = static_cast<uint32_t>(current_count * 3);
+    d.instance_fields->Set(base + 0, name_val);
+    d.instance_fields->Set(base + 1, initial_val);
+    d.instance_fields->Set(base + 2, TaggedValue::FromBoolean(is_method));
+}
+
+std::vector<JSObject*> JSFunction::GetWithStack() const {
+    std::vector<JSObject*> result;
+    if (!fn_data_ || !fn_data_->with_stack) return result;
+    result.reserve(fn_data_->with_stack->Length());
+    for (uint32_t i = 0; i < fn_data_->with_stack->Length(); ++i) {
+        TaggedValue val = fn_data_->with_stack->Get(i);
+        if (val.IsHeapObject() && val.AsHeapObject()->IsJSObject()) {
+            result.push_back(val.As<JSObject>());
+        }
+    }
+    return result;
+}
+
+void JSFunction::SetWithStack(const std::vector<JSObject*>& ws) {
+    if (ws.empty()) {
+        if (fn_data_) fn_data_->with_stack = nullptr;
+        return;
+    }
+    auto& d = EnsureFnData();
+
+    IsolateHeap* heap = IsolateHeap::HeapForObject(this);
+    if (!heap) heap = IsolateHeap::Current();
+    if (!heap) heap = &IsolateHeap::RuntimeFallbackHeap();
+    HandleScope scope(*heap);
+    if (heap->Contains(this)) {
+        scope.CreateHandle(this);
+    }
+    for (auto* obj : ws) {
+        if (obj && heap->Contains(obj)) {
+            scope.CreateHandle(obj);
+        }
+    }
+
+    d.with_stack = AllocateRuntimeFixedArrayFor(this, static_cast<uint32_t>(ws.size()), static_cast<uint32_t>(ws.size()), TaggedValue::Empty());
+    for (size_t i = 0; i < ws.size(); ++i) {
+        TaggedValue obj_val = ws[i] ? TaggedValue::FromHeapObject(ws[i]) : TaggedValue::Null();
+        d.with_stack->Set(static_cast<uint32_t>(i), obj_val);
+    }
+    if (AETHER_UNLIKELY(IsOld() && d.with_stack->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(d.with_stack));
+    }
+}
+
+void JSFunction::SetWithStack(FixedArray* ws) {
+    if (!ws || ws->Length() == 0) {
+        if (fn_data_) fn_data_->with_stack = nullptr;
+        return;
+    }
+    auto& d = EnsureFnData();
+    d.with_stack = ws;
+    if (AETHER_UNLIKELY(IsOld() && d.with_stack->IsYoung())) {
+        RecordWriteBarrier(this, TaggedValue::FromHeapObject(d.with_stack));
     }
 }
 
@@ -999,18 +1105,18 @@ void JSFunction::IteratePointers(SlotVisitor* visitor) {
     if (fn_data_->bytecode) {
         const_cast<BytecodeArray*>(fn_data_->bytecode)->IterateConstants(visitor);
     }
-    for (auto*& obj : fn_data_->with_stack) {
-        if (obj) {
-            TaggedValue obj_val = TaggedValue::FromHeapObject(obj);
-            visitor->Visit(&obj_val);
-            if (obj_val.IsHeapObject() && obj_val.AsHeapObject()->IsJSObject()) {
-                obj = static_cast<JSObject*>(obj_val.AsHeapObject());
-            }
+    if (fn_data_->with_stack != nullptr) {
+        TaggedValue ws_val = TaggedValue::FromHeapObject(fn_data_->with_stack);
+        visitor->Visit(&ws_val);
+        if (ws_val.IsHeapObject()) {
+            fn_data_->with_stack = ws_val.As<FixedArray>();
         }
     }
-    for (auto& f : fn_data_->instance_fields) {
-        if (f.initial_value.IsHeapObject()) {
-            visitor->Visit(&f.initial_value);
+    if (fn_data_->instance_fields != nullptr) {
+        TaggedValue if_val = TaggedValue::FromHeapObject(fn_data_->instance_fields);
+        visitor->Visit(&if_val);
+        if (if_val.IsHeapObject()) {
+            fn_data_->instance_fields = if_val.As<FixedArray>();
         }
     }
 }

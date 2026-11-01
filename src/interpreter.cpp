@@ -1392,8 +1392,14 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
             } else {
                 size_t prev_with_size = with_stack_.size();
                 if (func->HasWithStack()) {
-                    for (auto* obj : func->GetWithStack()) {
-                        with_stack_.push_back(obj);
+                    FixedArray* ws = func->GetWithStackArray();
+                    if (ws) {
+                        for (uint32_t i = 0; i < ws->Length(); ++i) {
+                            TaggedValue obj_val = ws->Get(i);
+                            if (obj_val.IsHeapObject() && obj_val.AsHeapObject()->IsJSObject()) {
+                                with_stack_.push_back(obj_val.As<JSObject>());
+                            }
+                        }
                     }
                 }
                 TaggedValue prev_target = current_new_target_;
@@ -5425,12 +5431,14 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 TaggedValue instance_val = TaggedValue::FromHeapObject(instance);
                 uint32_t field_sid = 11000;
-                for (const auto& f : ctor_fn->InstanceFields()) {
-                    std::string property = f.name.size() > 0 && f.name[0] == '#'
-                        ? "__private__" + f.name.substr(1) : f.name;
-                    instance->SetNamedProperty(property, f.initial_value, field_sid);
-                    if (f.is_method) {
-                        instance->SetOwnPropertyAttributes(property, PropertyAttributes::None);
+                if (ctor_fn->HasInstanceFields()) {
+                    for (const auto& f : ctor_fn->InstanceFields()) {
+                        std::string property = f.name.size() > 0 && f.name[0] == '#'
+                            ? "__private__" + f.name.substr(1) : f.name;
+                        instance->SetNamedProperty(property, f.initial_value, field_sid);
+                        if (f.is_method) {
+                            instance->SetOwnPropertyAttributes(property, PropertyAttributes::None);
+                        }
                     }
                 }
 
