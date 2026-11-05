@@ -1,4 +1,5 @@
 #include "aether/gc.h"
+#include "aether/options.h"
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -104,6 +105,7 @@ void ImmixBlock::Sweep() noexcept {
     }
 
     std::memset(line_marks, 0, sizeof(line_marks));
+    flags &= ~kBlockFlagNeedsSweep;
 
     if (live_lines_count == 0) {
         state = BlockState::Free;
@@ -149,23 +151,24 @@ void ImmixSpace::SetReservation(uint8_t* reservation_start, size_t max_size) {
 }
 
 bool ImmixSpace::AllocateBlock() {
+    if (Options::Get().max_heap_mb > 0) {
+        size_t opt_limit = Options::Get().max_heap_mb * 1024 * 1024;
+        if ((all_blocks_.size() + 1) * kImmixBlockSize > opt_limit) return false;
+    }
+
     all_blocks_.reserve(all_blocks_.size() + 1);
     if (reservation_start_) {
-        if (reservation_padding_ > max_size_) throw std::bad_alloc();
+        if (reservation_padding_ > max_size_) return false;
         size_t available_blocks = (max_size_ - reservation_padding_) / kImmixBlockSize;
-        if (all_blocks_.size() >= available_blocks) throw std::bad_alloc();
+        if (all_blocks_.size() >= available_blocks) return false;
 
         size_t offset = reservation_padding_ + all_blocks_.size() * kImmixBlockSize;
         uint8_t* block_addr = reservation_start_ + offset;
 
 #ifdef _WIN32
-        if (!VirtualAlloc(block_addr, kImmixBlockSize, MEM_COMMIT, PAGE_READWRITE)) {
-            throw std::bad_alloc();
-        }
+        if (!VirtualAlloc(block_addr, kImmixBlockSize, MEM_COMMIT, PAGE_READWRITE)) return false;
 #else
-        if (mprotect(block_addr, kImmixBlockSize, PROT_READ | PROT_WRITE) != 0) {
-            throw std::bad_alloc();
-        }
+        if (mprotect(block_addr, kImmixBlockSize, PROT_READ | PROT_WRITE) != 0) return false;
 #endif
         auto* block = new (block_addr) ImmixBlock();
         block->space = this;
@@ -178,11 +181,9 @@ bool ImmixSpace::AllocateBlock() {
 #ifdef _WIN32
     mem = VirtualAlloc(nullptr, kImmixBlockSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    if (posix_memalign(&mem, kImmixBlockSize, kImmixBlockSize) != 0) {
-        mem = nullptr;
-    }
+    if (posix_memalign(&mem, kImmixBlockSize, kImmixBlockSize) != 0) mem = nullptr;
 #endif
-    if (!mem) throw std::bad_alloc();
+    if (!mem) return false;
 
     auto* block = new (mem) ImmixBlock();
     block->space = this;
@@ -204,13 +205,20 @@ void* ImmixSpace::AllocateLarge(size_t bytes, bool charged) {
 #endif
     total = (total + page - 1) / page * page;
 
+    if (Options::Get().max_heap_mb > 0) {
+        size_t opt_limit = Options::Get().max_heap_mb * 1024 * 1024;
+        size_t current_committed = all_blocks_.size() * kImmixBlockSize;
+        for (auto* l = large_objects_head_; l; l = l->next) current_committed += l->size;
+        if (current_committed + total > opt_limit) return nullptr;
+    }
+
 #ifdef _WIN32
     void* mem = VirtualAlloc(nullptr, total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
     void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) mem = nullptr;
 #endif
-    if (!mem) throw std::bad_alloc();
+    if (!mem) return nullptr;
 
     auto* header = new (mem) LargeObjectHeader();
     header->size = total;
@@ -289,9 +297,7 @@ ImmixBlock* ImmixSpace::BlockForPointer(const void* ptr) const noexcept {
 }
 
 void* ImmixSpace::Allocate(size_t bytes) {
-    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - kImmixLineSize) {
-        throw std::bad_alloc();
-    }
+    if (bytes == 0 || bytes > std::numeric_limits<size_t>::max() - kImmixLineSize) return nullptr;
     bytes = (bytes + kObjectAlignment - 1) & ~(kObjectAlignment - 1);
 
     if (bytes > kLargeObjectThreshold) {
@@ -302,21 +308,29 @@ void* ImmixSpace::Allocate(size_t bytes) {
     }
 
     if (all_blocks_.empty()) {
-        AllocateBlock();
+        if (!AllocateBlock()) return nullptr;
         active_block_index_ = 0;
     }
 
-    void* mem = all_blocks_[active_block_index_]->Allocate(bytes);
-    if (mem) {
-        last_allocation_ptr_ = mem;
-        last_allocation_bytes_ = bytes;
-        return mem;
+    if (active_block_index_ < all_blocks_.size()) {
+        auto* active = all_blocks_[active_block_index_];
+        if (active->flags & ImmixBlock::kBlockFlagNeedsSweep) SweepBlock(active);
+        if (active->state == BlockState::Recyclable || active->state == BlockState::Free) {
+            void* mem = active->Allocate(bytes);
+            if (mem) {
+                last_allocation_ptr_ = mem;
+                last_allocation_bytes_ = bytes;
+                return mem;
+            }
+        }
     }
 
     for (size_t i = 0; i < all_blocks_.size(); ++i) {
         if (i == active_block_index_) continue;
-        if (all_blocks_[i]->state == BlockState::Recyclable || all_blocks_[i]->state == BlockState::Free) {
-            mem = all_blocks_[i]->Allocate(bytes);
+        auto* block = all_blocks_[i];
+        if (block->flags & ImmixBlock::kBlockFlagNeedsSweep) SweepBlock(block);
+        if (block->state == BlockState::Recyclable || block->state == BlockState::Free) {
+            void* mem = block->Allocate(bytes);
             if (mem) {
                 active_block_index_ = i;
                 last_allocation_ptr_ = mem;
@@ -326,10 +340,10 @@ void* ImmixSpace::Allocate(size_t bytes) {
         }
     }
 
-    AllocateBlock();
+    if (!AllocateBlock()) return nullptr;
     active_block_index_ = all_blocks_.size() - 1;
-    mem = all_blocks_[active_block_index_]->Allocate(bytes);
-    if (!mem) throw std::bad_alloc();
+    void* mem = all_blocks_[active_block_index_]->Allocate(bytes);
+    if (!mem) return nullptr;
     last_allocation_ptr_ = mem;
     last_allocation_bytes_ = bytes;
     return mem;
@@ -408,12 +422,44 @@ void ImmixSpace::DiscardAllocation(void* ptr) noexcept {
     }
 }
 
-void ImmixSpace::Sweep() {
-    std::lock_guard<std::mutex> lock(mark_mutex_);
+void ImmixSpace::SweepBlock(ImmixBlock* block) {
+    if (!block || block->state == BlockState::Free) return;
+    if (block->flags & ImmixBlock::kBlockFlagNeedsSweep) {
+        block->flags &= ~ImmixBlock::kBlockFlagNeedsSweep;
+        block->Sweep();
+    }
+}
 
-    // 1. Destruct dead objects in Immix blocks
+void ImmixSpace::EnsureAllSwept() {
+    std::lock_guard<std::mutex> lock(mark_mutex_);
     for (auto* block : all_blocks_) {
-        if (block->state == BlockState::Free) continue;
+        if (block && (block->flags & ImmixBlock::kBlockFlagNeedsSweep)) {
+            SweepBlock(block);
+        }
+    }
+}
+
+void ImmixSpace::SweepLargeObjects() {
+    std::lock_guard<std::mutex> lock(mark_mutex_);
+    LargeObjectHeader* header = large_objects_head_;
+    while (header) {
+        LargeObjectHeader* next = header->next;
+        HeapObject* obj = header->Object();
+        if (header->constructed && !obj->IsMarked() && !header->marked) {
+            obj->~HeapObject();
+            if (header->charged && budget_) {
+                budget_->ReleaseManaged(header->size - LargeObjectHeader::HeaderSize());
+            }
+            FreeLarge(header);
+        }
+        header = next;
+    }
+}
+
+void ImmixSpace::PrepareLazySweep() {
+    std::lock_guard<std::mutex> lock(mark_mutex_);
+    for (auto* block : all_blocks_) {
+        if (!block || block->state == BlockState::Free) continue;
 
         block->ForEachObject([&](HeapObject* obj) {
             if (!obj->IsMarked()) {
@@ -433,31 +479,98 @@ void ImmixSpace::Sweep() {
                 }
             }
         });
-    }
 
-    // 2. Sweep each block's lines
-    for (auto* block : all_blocks_) {
-        if (block->state == BlockState::Free) continue;
-        block->Sweep();
-    }
-
-    // 3. Sweep Large Objects
-    LargeObjectHeader* header = large_objects_head_;
-    while (header) {
-        LargeObjectHeader* next = header->next;
-        HeapObject* obj = header->Object();
-        if (header->constructed && !obj->IsMarked() && !header->marked) {
-            obj->~HeapObject();
-            if (header->charged && budget_) {
-                budget_->ReleaseManaged(header->size - LargeObjectHeader::HeaderSize());
+        bool has_live = false;
+        for (size_t i = kHeaderLines; i < kLinesPerBlock; ++i) {
+            if (block->line_marks[i]) {
+                has_live = true;
+                break;
             }
-            FreeLarge(header);
         }
-        header = next;
+        if (!has_live) {
+            block->Sweep();
+        } else {
+            block->flags |= ImmixBlock::kBlockFlagNeedsSweep;
+        }
     }
+    ShrinkLocked();
+    ResetActiveBlock();
+}
+
+void ImmixSpace::Shrink() {
+    std::lock_guard<std::mutex> lock(mark_mutex_);
+    ShrinkLocked();
+}
+
+void ImmixSpace::ShrinkLocked() {
+    size_t free_kept = 0;
+    constexpr size_t kMaxCachedFreeBlocks = 1;
+
+    if (!reservation_start_) {
+        std::vector<ImmixBlock*> kept_standalone;
+        kept_standalone.reserve(standalone_blocks_.size());
+        for (auto* block : standalone_blocks_) {
+            if (block->state == BlockState::Free) {
+                if (free_kept < kMaxCachedFreeBlocks) {
+                    ++free_kept;
+                    kept_standalone.push_back(block);
+                } else {
+                    if (last_allocation_ptr_ && block->ContainsPayload(last_allocation_ptr_)) {
+                        last_allocation_ptr_ = nullptr;
+                        last_allocation_bytes_ = 0;
+                    }
+                    block->~ImmixBlock();
+#ifdef _WIN32
+                    VirtualFree(block, 0, MEM_RELEASE);
+#else
+                    free(block);
+#endif
+                }
+            } else {
+                kept_standalone.push_back(block);
+            }
+        }
+        standalone_blocks_ = std::move(kept_standalone);
+
+        std::vector<ImmixBlock*> kept_all;
+        kept_all.reserve(standalone_blocks_.size());
+        for (auto* block : standalone_blocks_) {
+            kept_all.push_back(block);
+        }
+        all_blocks_ = std::move(kept_all);
+    } else {
+        while (!all_blocks_.empty() && all_blocks_.back()->state == BlockState::Free) {
+            if (free_kept < kMaxCachedFreeBlocks) {
+                ++free_kept;
+                break;
+            }
+            ImmixBlock* block = all_blocks_.back();
+            all_blocks_.pop_back();
+            if (last_allocation_ptr_ && block->ContainsPayload(last_allocation_ptr_)) {
+                last_allocation_ptr_ = nullptr;
+                last_allocation_bytes_ = 0;
+            }
+            block->~ImmixBlock();
+#ifdef _WIN32
+            VirtualFree(block, kImmixBlockSize, MEM_DECOMMIT);
+#else
+            madvise(block, kImmixBlockSize, MADV_DONTNEED);
+#endif
+        }
+    }
+
+    ResetActiveBlock();
+}
+
+void ImmixSpace::Sweep() {
+    SweepLargeObjects();
+    PrepareLazySweep();
+    EnsureAllSwept();
+    Shrink();
 }
 
 void ImmixSpace::DestroyAll() noexcept {
+    EnsureAllSwept();
     for (auto* block : all_blocks_) {
         if (block->state == BlockState::Free) continue;
         block->ForEachObject([&](HeapObject* obj) {
@@ -482,6 +595,7 @@ void ImmixSpace::DestroyAll() noexcept {
 }
 
 std::vector<HeapObject*> ImmixSpace::Objects() const {
+    const_cast<ImmixSpace*>(this)->EnsureAllSwept();
     std::vector<HeapObject*> result;
     for (const auto* block : all_blocks_) {
         if (block->state == BlockState::Free) continue;
@@ -506,6 +620,7 @@ size_t ImmixSpace::AllocationSize(const void* obj) const noexcept {
 }
 
 void ImmixSpace::ClearMarks() noexcept {
+    EnsureAllSwept();
     for (auto* block : all_blocks_) {
         if (block->state == BlockState::Free) continue;
         std::memset(block->line_marks, 0, sizeof(block->line_marks));
@@ -642,11 +757,14 @@ void* ImmixSpace::AllocateForEvacuation(size_t bytes) {
 
 void ImmixSpace::ResetActiveBlock() noexcept {
     for (size_t i = 0; i < all_blocks_.size(); ++i) {
-        if (all_blocks_[i]->state == BlockState::Recyclable || all_blocks_[i]->state == BlockState::Free) {
+        if (all_blocks_[i]->state == BlockState::Recyclable ||
+            all_blocks_[i]->state == BlockState::Free ||
+            (all_blocks_[i]->flags & ImmixBlock::kBlockFlagNeedsSweep)) {
             active_block_index_ = i;
             return;
         }
     }
+    active_block_index_ = 0;
 }
 
 size_t ImmixSpace::ActiveCommittedBytes() const noexcept {
@@ -656,10 +774,23 @@ size_t ImmixSpace::ActiveCommittedBytes() const noexcept {
     return count;
 }
 
+size_t ImmixSpace::TotalCommittedBytes() const noexcept {
+    size_t count = all_blocks_.size() * kImmixBlockSize;
+    for (const auto* lobj = large_objects_head_; lobj; lobj = lobj->next) count += lobj->size;
+    return count;
+}
+
 size_t ImmixSpace::FreeBlockCount() const noexcept {
     size_t count = 0;
     for (const auto* b : all_blocks_) if (b && b->state == BlockState::Free) ++count;
     return count;
+}
+
+bool ImmixSpace::HasUnsweptBlocks() const noexcept {
+    for (const auto* b : all_blocks_) {
+        if (b && (b->flags & ImmixBlock::kBlockFlagNeedsSweep)) return true;
+    }
+    return false;
 }
 
 } // namespace aether

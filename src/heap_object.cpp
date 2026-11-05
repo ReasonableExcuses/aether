@@ -1205,6 +1205,8 @@ std::vector<std::string> JSObject::GetOwnPropertyNames() const {
 }
 
 void JSObject::SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id) {
+    std::string key_str(key);
+    key = key_str;
     PinnedScope pin_this(this);
     PinnedScope pin_val(value.IsHeapObject() ? value.AsHeapObject() : nullptr);
     IsolateHeap* heap = IsolateHeap::HeapForObject(this);

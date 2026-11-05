@@ -47,6 +47,10 @@ void Options::Parse(std::vector<std::string>& args) {
             try {
                 Get().max_heap_mb = static_cast<size_t>(std::stoull(arg.substr(11)));
             } catch (...) {}
+        } else if (arg == "--max-heap" && i + 1 < args.size()) {
+            try {
+                Get().max_heap_mb = static_cast<size_t>(std::stoull(args[++i]));
+            } catch (...) {}
         } else if (arg == "--interpreter-only") {
             Get().interpreter_only = true;
         } else if (arg == "--always-baseline") {

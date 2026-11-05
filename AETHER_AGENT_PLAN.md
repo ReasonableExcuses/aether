@@ -239,7 +239,7 @@ Goal: trivially relocatable objects, no per-object destructors, real evacuation.
 - Objects with non-trivial C++ state are excluded until migrated (T2.1).
 - **Acceptance:** fragmentation (committed bytes / live bytes) after a churn benchmark ≤ 1.3×; verifier clean under `--gc-stress`.
 
-### T2.4 Lazy sweeping and heap shrinking
+### T2.4 Lazy sweeping and heap shrinking [x]
 - Sweep blocks on demand during allocation; return fully free blocks to the OS (`madvise(MADV_DONTNEED)` / `VirtualFree(MEM_DECOMMIT)`).
 - Honor `--max-heap`; throw a catchable `RangeError`-style OOM (or terminate) deterministically.
 - **Acceptance:** RSS returns to < 2× idle after a large workload is released.

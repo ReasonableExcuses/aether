@@ -157,7 +157,7 @@ IsolateHeap::IsolateHeap(size_t nursery_size)
     }
     concurrent_marker_ = std::make_unique<ConcurrentMarker>(*this);
     if (Options::Get().max_heap_mb > 0) {
-        budget_->SetTotalLimit(Options::Get().max_heap_mb * 1024 * 1024);
+        SetHeapBudget(Options::Get().max_heap_mb * 1024 * 1024);
     }
     stack_base_ = nullptr;
     previous_current_heap_ = s_current_heap_;
@@ -853,7 +853,12 @@ void IsolateHeap::MajorGC() {
     }
     remembered_set_.clear();
 
-    old_gen_.Sweep();
+    old_gen_.SweepLargeObjects();
+    old_gen_.PrepareLazySweep();
+    if (Options::Get().gc_verify) {
+        old_gen_.EnsureAllSwept();
+        old_gen_.Shrink();
+    }
     old_gen_.ResetActiveBlock();
     card_table_.Clear();
     ++major_gc_count_;
@@ -878,6 +883,11 @@ void IsolateHeap::MajorGC() {
         std::cout << "[GC] MajorGC #" << major_gc_count_ << ": live=" << live.size() << " objects, usage=" << (budget_->ChargedBytes() / 1024) << "KB"
                   << ", frag=" << FragmentationRatio() << "x" << std::endl;
     }
+}
+
+void IsolateHeap::Shrink() {
+    old_gen_.EnsureAllSwept();
+    old_gen_.Shrink();
 }
 
 bool IsolateHeap::CollectAtSafepoint() {

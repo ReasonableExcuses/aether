@@ -3692,6 +3692,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                     Shape* new_shape = js_obj->GetShape();
                     if (new_shape) {
+                        prop_name_val = bytecode.Constants()[name_idx];
+                        prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
                         if (const PropertyDescriptor* desc = new_shape->LookupProperty(prop_key)) {
                             ic_slot.state = FeedbackSlot::State::Monomorphic;
                             ic_slot.cached_shape = new_shape;

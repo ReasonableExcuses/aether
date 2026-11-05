@@ -199,6 +199,7 @@ struct alignas(64) ImmixBlock {
     uint8_t _padding[kHeaderSize - 836];              // 188 bytes (offset 836..1023)
 
     static constexpr uint16_t kBlockFlagEvacuate = 1 << 0;
+    static constexpr uint16_t kBlockFlagNeedsSweep = 1 << 1;
     static constexpr uint8_t kEvacuationLineThreshold = 124;
 
     // 31,744-byte Payload (Lines 8..255)
@@ -282,6 +283,11 @@ public:
 
     void* Allocate(size_t bytes);
     void Sweep();
+    void PrepareLazySweep();
+    void SweepBlock(ImmixBlock* block);
+    void EnsureAllSwept();
+    void SweepLargeObjects();
+    void Shrink();
     // Allocate returns raw storage. Placement-new users must register only
     // after successful construction to enable destruction at sweep/shutdown.
     void RegisterObject(HeapObject* obj, bool charged = false, bool old = true);
@@ -304,10 +310,13 @@ public:
     void* AllocateForEvacuation(size_t bytes);
     void ResetActiveBlock() noexcept;
     size_t ActiveCommittedBytes() const noexcept;
+    size_t TotalCommittedBytes() const noexcept;
     size_t FreeBlockCount() const noexcept;
+    bool HasUnsweptBlocks() const noexcept;
     const std::vector<ImmixBlock*>& GetAllBlocks() const noexcept { return all_blocks_; }
 
 private:
+    void ShrinkLocked();
     bool AllocateBlock();
     void* AllocateLarge(size_t bytes, bool charged = false);
     void FreeLarge(LargeObjectHeader* header) noexcept;

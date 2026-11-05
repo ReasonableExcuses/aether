@@ -184,6 +184,7 @@ public:
     // GC Passes
     void MinorGC(); // Cheney Scavenge
     void MajorGC(); // Full Mark-Sweep
+    void Shrink();
     void StartConcurrentMark();
     void FinalizeConcurrentGC();
     // Owning thread only, all native temporaries published/rooted; nonmoving.
@@ -262,6 +263,7 @@ public:
         return HeapBudget() > 0 ? static_cast<double>(TotalAllocatedBytes()) / static_cast<double>(HeapBudget()) * 100.0 : 0.0;
     }
     size_t ActiveCommittedBytes() const noexcept { return old_gen_.ActiveCommittedBytes(); }
+    size_t TotalCommittedBytes() const noexcept { return old_gen_.TotalCommittedBytes(); }
     size_t LastMajorLiveBytes() const noexcept { return last_major_live_bytes_; }
     double FragmentationRatio() const noexcept {
         size_t live = last_major_live_bytes_;
@@ -352,15 +354,15 @@ private:
         void* mem = nullptr;
         T* obj = nullptr;
         try {
-            mem = old_gen_.Allocate(bytes);
+            try { mem = old_gen_.Allocate(bytes); } catch (const std::bad_alloc&) { mem = nullptr; }
             if (!mem && GCAllowed() && !collecting_) {
                 if (!young_objects_.empty()) {
                     MinorGC();
-                    mem = old_gen_.Allocate(bytes);
+                    try { mem = old_gen_.Allocate(bytes); } catch (const std::bad_alloc&) { mem = nullptr; }
                 }
                 if (!mem) {
                     MajorGC();
-                    mem = old_gen_.Allocate(bytes);
+                    try { mem = old_gen_.Allocate(bytes); } catch (const std::bad_alloc&) { mem = nullptr; }
                 }
             }
             if (!mem) throw std::bad_alloc();
