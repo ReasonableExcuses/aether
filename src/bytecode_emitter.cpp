@@ -1467,7 +1467,14 @@ void BytecodeEmitter::VisitCall(CallExpr* node) {
     }
 
     if (auto* id = dynamic_cast<IdentifierExpr*>(node->Callee()); id && id->Name() == "super") {
-        node->Callee()->Accept(this);
+        TaggedValue s_ctor = LookupSuperCtor();
+        if (!s_ctor.IsUndefined()) {
+            uint16_t c_idx = bytecode_->AddConstant(s_ctor);
+            bytecode_->EmitOpcode(Opcode::LdaConstant);
+            bytecode_->EmitU16(c_idx);
+        } else {
+            node->Callee()->Accept(this);
+        }
         uint8_t callee_reg = AllocateRegister();
         bytecode_->EmitOpcode(Opcode::Star);
         bytecode_->EmitU8(callee_reg);
@@ -2420,7 +2427,8 @@ void BytecodeEmitter::VisitVarDecl(VarDeclStmt* node) {
     } else {
         auto it = scope_.find(node->Name());
         uint8_t reg;
-        if (it != scope_.end()) {
+        bool is_shadowing = node->IsLexical() && !lexical_scopes_.empty() && (it != scope_.end());
+        if (it != scope_.end() && !is_shadowing) {
             reg = it->second;
             if (node->Initializer()) {
                 node->Initializer()->Accept(this);
@@ -3029,10 +3037,31 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
         proto_shape = &fallback_root;
     }
     auto* proto_obj = AllocateRuntime<JSObject>(proto_shape);
+    TaggedValue super_val = TaggedValue::Undefined();
     if (!node->SuperName().empty()) {
-        JSFunction* super_fn = LookupFunction(node->SuperName());
-        if (super_fn) {
-            proto_obj->SetPrototype(super_fn->GetOrCreateConstructorPrototype());
+        if (node->SuperName() == "null") {
+            proto_obj->SetPrototype(nullptr);
+            if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+                ctor_fn->SetPrototype(Realm::Current()->GetFunctionPrototype());
+            }
+        } else {
+            JSFunction* super_fn = LookupFunction(node->SuperName());
+            if (super_fn) {
+                super_val = TaggedValue::FromHeapObject(super_fn);
+                proto_obj->SetPrototype(super_fn->GetOrCreateConstructorPrototype());
+                ctor_fn->SetPrototype(super_fn);
+            } else if (Realm::Current()) {
+                TaggedValue g_val = Realm::Current()->GetGlobalProperty(node->SuperName());
+                if (g_val.IsHeapObject() && g_val.AsHeapObject()->IsFunction()) {
+                    super_val = g_val;
+                    auto* ctor_obj = static_cast<JSObject*>(g_val.AsHeapObject());
+                    TaggedValue p_val = ctor_obj->GetNamedProperty("prototype");
+                    if (p_val.IsHeapObject() && p_val.AsHeapObject()->IsJSObject()) {
+                        proto_obj->SetPrototype(static_cast<JSObject*>(p_val.AsHeapObject()));
+                    }
+                    ctor_fn->SetPrototype(ctor_obj);
+                }
+            }
         }
     } else if (Realm::Current() && Realm::Current()->GetObjectPrototype()) {
         proto_obj->SetPrototype(Realm::Current()->GetObjectPrototype());
@@ -3043,7 +3072,7 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
     ctor_fn->SetOwnPropertyAttributes("prototype", PropertyAttributes::None);
     proto_obj->SetNamedProperty("constructor", TaggedValue::FromHeapObject(ctor_fn), dummy_sid);
     proto_obj->SetOwnPropertyAttributes("constructor", PropertyAttributes::Writable | PropertyAttributes::Configurable);
-    if (Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
+    if (node->SuperName().empty() && Realm::Current() && Realm::Current()->GetFunctionPrototype()) {
         ctor_fn->SetPrototype(Realm::Current()->GetFunctionPrototype());
     }
 
@@ -3052,6 +3081,7 @@ JSFunction* BytecodeEmitter::EmitClassDefinition(TClassNode* node) {
     sub_emitter.private_names_map_ = this->private_names_map_;
     sub_emitter.is_strict_ = true;
     sub_emitter.super_proto_ = proto_obj->GetPrototype();
+    sub_emitter.super_ctor_val_ = super_val;
     if (!node->SuperName().empty()) {
         JSFunction* super_fn = LookupFunction(node->SuperName());
         if (super_fn) sub_emitter.functions_["super"] = super_fn;

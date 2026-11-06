@@ -563,7 +563,8 @@ Interpreter::RelationalResult Interpreter::AbstractRelationalComparison(TaggedVa
     }
 
     if (px.IsBigInt() && py.IsHeapObject() && py.AsHeapObject()->IsString()) {
-        std::string_view s = static_cast<JSString*>(py.AsHeapObject())->View();
+        std::string fallback;
+        std::string_view s = GetStringViewOrUtf8(static_cast<JSString*>(py.AsHeapObject()), fallback);
         JSBigInt* ny = StringToBigInt(s);
         if (!ny) return RelationalResult::Undefined;
         auto* bx = static_cast<JSBigInt*>(px.AsHeapObject());
@@ -572,7 +573,8 @@ Interpreter::RelationalResult Interpreter::AbstractRelationalComparison(TaggedVa
     }
 
     if (px.IsHeapObject() && px.AsHeapObject()->IsString() && py.IsBigInt()) {
-        std::string_view s = static_cast<JSString*>(px.AsHeapObject())->View();
+        std::string fallback;
+        std::string_view s = GetStringViewOrUtf8(static_cast<JSString*>(px.AsHeapObject()), fallback);
         JSBigInt* nx = StringToBigInt(s);
         if (!nx) return RelationalResult::Undefined;
         auto* by = static_cast<JSBigInt*>(py.AsHeapObject());
@@ -669,7 +671,8 @@ bool Interpreter::IsLooselyEqual(TaggedValue x, TaggedValue y) {
 
     // 7 & 8. BigInt and String
     if (x.IsBigInt() && y.IsHeapObject() && y.AsHeapObject()->IsString()) {
-        std::string_view s = static_cast<JSString*>(y.AsHeapObject())->View();
+        std::string fallback;
+        std::string_view s = GetStringViewOrUtf8(static_cast<JSString*>(y.AsHeapObject()), fallback);
         JSBigInt* n = StringToBigInt(s);
         if (!n) return false;
         bool res = static_cast<JSBigInt*>(x.AsHeapObject())->Equals(*n);
@@ -3257,7 +3260,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
 
                 if (!obj_val.IsHeapObject()) {
                     if (obj_val.IsNumber() && Realm::Current() && Realm::Current()->GetNumberPrototype()) {
@@ -3334,8 +3338,11 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
 
                 if (obj_val.AsHeapObject()->IsFunction()) {
+                    auto* fn_obj = static_cast<JSObject*>(obj_val.AsHeapObject());
                     if (prop_key == "name") {
-                        if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
+                        if (fn_obj->HasNamedProperty("name") || fn_obj->HasAccessor("name")) {
+                            // Fall through to normal object property lookup
+                        } else if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                             acc_ = TaggedValue::FromHeapObject(AllocateRuntime<JSString>(static_cast<JSFunction*>(obj_val.AsHeapObject())->Name()));
                             break;
                         } else if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSNativeFunction) {
@@ -3344,7 +3351,9 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         }
                     }
                     if (prop_key == "length") {
-                        if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
+                        if (fn_obj->HasNamedProperty("length") || fn_obj->HasAccessor("length")) {
+                            // Fall through to normal object property lookup
+                        } else if (obj_val.AsHeapObject()->GetType() == HeapObjectType::JSFunction) {
                             auto* fn = static_cast<JSFunction*>(obj_val.AsHeapObject());
                             uint32_t len = fn->GetBytecode() ? fn->GetBytecode()->Length() : 0;
                             acc_ = TaggedValue::FromSmi(static_cast<int32_t>(len));
@@ -3589,7 +3598,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 TaggedValue obj_val = frame.GetRegister(obj_reg);
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
 
                 if (!obj_val.IsHeapObject()) {
                     if (obj_val.IsNullOrUndefined()) {
@@ -3693,7 +3703,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     Shape* new_shape = js_obj->GetShape();
                     if (new_shape) {
                         prop_name_val = bytecode.Constants()[name_idx];
-                        prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                        prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
                         if (const PropertyDescriptor* desc = new_shape->LookupProperty(prop_key)) {
                             ic_slot.state = FeedbackSlot::State::Monomorphic;
                             ic_slot.cached_shape = new_shape;
@@ -3814,7 +3824,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
 
                 JSObject* glob = Realm::Current() ? Realm::Current()->GetGlobalObject() : nullptr;
                 bool has_prop = false;
@@ -3873,7 +3884,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
 
                 if (prop_key == "new.target") {
                     acc_ = current_new_target_;
@@ -3982,7 +3994,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
                 std::string key_str(prop_key);
 
                 if (last_lookup_base_ != nullptr && last_lookup_name_ == key_str) {
@@ -4125,7 +4138,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 pc += 2;
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string key_str(static_cast<JSString*>(prop_name_val.AsHeapObject())->View());
+                std::string key_str = static_cast<JSString*>(prop_name_val.AsHeapObject())->Value();
 
                 // 1. Check with-stack
                 bool found_in_with = false;
@@ -4439,7 +4452,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (src_ho && src_ho->IsString()) {
                         auto* src_str = static_cast<JSString*>(src_ho);
                         for (size_t i = 0; i < src_str->Length(); ++i) {
-                            target_arr->Push(TaggedValue::FromHeapObject(AllocateRuntime<JSString>(src_str->View().substr(i, 1))));
+                            target_arr->Push(TaggedValue::FromHeapObject(src_str->CharAt(static_cast<uint32_t>(i))));
                         }
                         break;
                     }
@@ -4690,7 +4703,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (key_val.IsSymbol()) {
                         key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                     } else if (key_val.IsSmi()) {
                         key_str = std::to_string(key_val.AsSmi());
                     } else {
@@ -4723,7 +4736,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (key_val.IsSymbol()) {
                         key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                     } else if (key_val.IsSmi()) {
                         key_str = std::to_string(key_val.AsSmi());
                     } else {
@@ -4797,7 +4810,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             acc_ = arr->GetNamedProperty(key_val.ToString());
                         }
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        acc_ = arr->GetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        std::string fallback_k;
+                        acc_ = arr->GetNamedProperty(GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k));
                     } else {
                         acc_ = arr->GetNamedProperty(key_val.ToString());
                     }
@@ -4812,7 +4826,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (idx >= 0 && static_cast<size_t>(idx) < str_obj->Length()) {
                         acc_ = TaggedValue::FromHeapObject(str_obj->CharAt(static_cast<uint32_t>(idx)));
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        std::string_view k = static_cast<JSString*>(key_val.AsHeapObject())->View();
+                        std::string fallback_k;
+                        std::string_view k = GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k);
                         if (k == "length") {
                             acc_ = TaggedValue::FromSmi(static_cast<int32_t>(str_obj->Length()));
                         } else if (Realm::Current() && Realm::Current()->GetStringPrototype()) {
@@ -4832,7 +4847,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         double d = key_val.AsNumber();
                         acc_ = (d >= 0.0 && std::floor(d) == d) ? t_arr->GetElement(static_cast<size_t>(d)) : TaggedValue::Undefined();
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        std::string_view k = static_cast<JSString*>(key_val.AsHeapObject())->View();
+                        std::string fallback_k;
+                        std::string_view k = GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k);
                         if (k == "length") {
                             acc_ = TaggedValue::FromSmi(static_cast<int32_t>(t_arr->Length()));
                         } else if (k == "byteLength") {
@@ -4852,7 +4868,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 } else if (h_obj->IsJSObject()) {
                     auto* js_obj = static_cast<JSObject*>(h_obj);
                     if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        acc_ = js_obj->GetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        std::string fallback_k;
+                        acc_ = js_obj->GetNamedProperty(GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k));
                     } else if (key_val.IsSmi()) {
                         acc_ = js_obj->GetNamedProperty(std::to_string(key_val.AsSmi()));
                     } else {
@@ -4912,7 +4929,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                         if (key_val.IsSymbol()) {
                             key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                         } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                            key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                            key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                         } else if (key_val.IsSmi()) {
                             key_str = std::to_string(key_val.AsSmi());
                         } else {
@@ -4970,7 +4987,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                                 arr->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
                             }
                         } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                            arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                            std::string fallback_k;
+                            arr->SetNamedProperty(GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k), acc_, next_shape_id_);
                         } else {
                             arr->SetNamedProperty(key_val.ToString(), acc_, next_shape_id_);
                         }
@@ -4983,12 +5001,14 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             double d = key_val.AsNumber();
                             if (d >= 0.0 && std::floor(d) == d) t_arr->SetElement(static_cast<size_t>(d), acc_);
                         } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                            t_arr->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                            std::string fallback_k;
+                            t_arr->SetNamedProperty(GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k), acc_, next_shape_id_);
                         }
                     } else if (h_obj->IsJSObject()) {
                         auto* js_obj = static_cast<JSObject*>(h_obj);
                         if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                            js_obj->SetNamedProperty(static_cast<JSString*>(key_val.AsHeapObject())->View(), acc_, next_shape_id_);
+                            std::string fallback_k;
+                            js_obj->SetNamedProperty(GetStringViewOrUtf8(static_cast<JSString*>(key_val.AsHeapObject()), fallback_k), acc_, next_shape_id_);
                         } else if (key_val.IsSmi()) {
                             js_obj->SetNamedProperty(std::to_string(key_val.AsSmi()), acc_, next_shape_id_);
                         } else {
@@ -5033,7 +5053,8 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 }
                 TaggedValue prop_name_val = bytecode.Constants()[name_idx];
                 assert(prop_name_val.IsHeapObject() && prop_name_val.AsHeapObject()->IsString());
-                std::string_view prop_key = static_cast<JSString*>(prop_name_val.AsHeapObject())->View();
+                std::string fallback_prop_str;
+                std::string_view prop_key = GetStringViewOrUtf8(static_cast<JSString*>(prop_name_val.AsHeapObject()), fallback_prop_str);
 
                 bool success = DeleteProperty(obj_val, prop_key);
                 if (has_pending_exception_) {
@@ -5090,7 +5111,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                 if (key_val.IsSymbol()) {
                     key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                 } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                    key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                    key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                 } else if (key_val.IsSmi()) {
                     key_str = std::to_string(key_val.AsSmi());
                 } else {
@@ -5136,7 +5157,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     JSObject* obj = static_cast<JSObject*>(obj_val.AsHeapObject());
                     TaggedValue name_val = bytecode.Constants()[name_idx];
                     assert(name_val.IsHeapObject() && name_val.AsHeapObject()->IsString());
-                    std::string key_str(static_cast<JSString*>(name_val.AsHeapObject())->View());
+                    std::string key_str = static_cast<JSString*>(name_val.AsHeapObject())->Value();
                     const auto* existing = obj->GetAccessor(key_str);
                     TaggedValue setter = existing ? existing->setter : TaggedValue::Undefined();
                     obj->SetAccessor(key_str, acc_, setter, PropertyAttributes::Enumerable | PropertyAttributes::Configurable);
@@ -5152,7 +5173,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     JSObject* obj = static_cast<JSObject*>(obj_val.AsHeapObject());
                     TaggedValue name_val = bytecode.Constants()[name_idx];
                     assert(name_val.IsHeapObject() && name_val.AsHeapObject()->IsString());
-                    std::string key_str(static_cast<JSString*>(name_val.AsHeapObject())->View());
+                    std::string key_str = static_cast<JSString*>(name_val.AsHeapObject())->Value();
                     const auto* existing = obj->GetAccessor(key_str);
                     TaggedValue getter = existing ? existing->getter : TaggedValue::Undefined();
                     obj->SetAccessor(key_str, getter, acc_, PropertyAttributes::Enumerable | PropertyAttributes::Configurable);
@@ -5170,7 +5191,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (key_val.IsSymbol()) {
                         key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                     } else if (key_val.IsSmi()) {
                         key_str = std::to_string(key_val.AsSmi());
                     } else {
@@ -5193,7 +5214,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     if (key_val.IsSymbol()) {
                         key_str = static_cast<JSSymbol*>(key_val.AsHeapObject())->Key();
                     } else if (key_val.IsHeapObject() && key_val.AsHeapObject()->IsString()) {
-                        key_str = std::string(static_cast<JSString*>(key_val.AsHeapObject())->View());
+                        key_str = static_cast<JSString*>(key_val.AsHeapObject())->Value();
                     } else if (key_val.IsSmi()) {
                         key_str = std::to_string(key_val.AsSmi());
                     } else {

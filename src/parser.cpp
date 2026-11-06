@@ -10,15 +10,29 @@ struct FunctionContextGuard {
     Parser& parser;
     bool prev_gen;
     bool prev_async;
+    uint32_t prev_loop_depth;
+    uint32_t prev_switch_depth;
+    std::vector<Parser::LabelInfo> prev_labels;
     FunctionContextGuard(Parser& p, bool is_gen, bool is_async)
-        : parser(p), prev_gen(p.in_generator_), prev_async(p.in_async_) {
+        : parser(p),
+          prev_gen(p.in_generator_),
+          prev_async(p.in_async_),
+          prev_loop_depth(p.loop_depth_),
+          prev_switch_depth(p.switch_depth_),
+          prev_labels(std::move(p.active_labels_)) {
         parser.in_generator_ = is_gen;
         parser.in_async_ = is_async;
+        parser.loop_depth_ = 0;
+        parser.switch_depth_ = 0;
+        parser.active_labels_.clear();
         parser.function_depth_++;
     }
     ~FunctionContextGuard() {
         parser.in_generator_ = prev_gen;
         parser.in_async_ = prev_async;
+        parser.loop_depth_ = prev_loop_depth;
+        parser.switch_depth_ = prev_switch_depth;
+        parser.active_labels_ = std::move(prev_labels);
         parser.function_depth_--;
     }
 };
@@ -237,6 +251,19 @@ Token Parser::Consume(TokenKind kind, std::string_view error_message) {
                              " (found '" + current_token_.text + "')");
 }
 
+Token Parser::ConsumeIdentifierName(std::string_view error_message) {
+    if (!current_token_.text.empty()) {
+        unsigned char first = static_cast<unsigned char>(current_token_.text[0]);
+        if (std::isalpha(first) || first == '_' || first == '$' || first >= 0x80) {
+            return Advance();
+        }
+    }
+    throw std::runtime_error(std::string("SyntaxError: ") + std::string(error_message) + 
+                             " at line " + std::to_string(current_token_.location.line) + 
+                             ", col " + std::to_string(current_token_.location.column) + 
+                             " (found '" + current_token_.text + "')");
+}
+
 void Parser::ConsumeSemicolon() {
     if (Match(TokenKind::Semicolon)) {
         return;
@@ -348,6 +375,96 @@ static bool IsOptionalChain(const Expr* expr) {
            dynamic_cast<const OptionalCallExpr*>(expr) != nullptr;
 }
 
+void Parser::CheckLexicalRedeclarations(const std::vector<const Stmt*>& stmts, const std::vector<std::string>& extra_lex_names, bool is_block_or_switch) {
+    std::unordered_set<std::string> lex_names;
+    for (const auto& name : extra_lex_names) {
+        if (!name.empty() && name[0] != '$') {
+            lex_names.insert(name);
+        }
+    }
+    for (const auto* stmt : stmts) {
+        std::function<void(const Stmt*)> collect_lex = [&](const Stmt* s) {
+            if (!s) return;
+            if (auto* v = dynamic_cast<const VarDeclStmt*>(s)) {
+                if (v->IsLexical() && !v->Name().empty() && v->Name()[0] != '$') {
+                    if (lex_names.count(v->Name())) {
+                        throw std::runtime_error("SyntaxError: Identifier '" + v->Name() + "' has already been declared");
+                    }
+                    lex_names.insert(v->Name());
+                }
+            } else if (auto* b = dynamic_cast<const BlockStmt*>(s)) {
+                if (!b->IsLexicalScope()) {
+                    for (const auto& child : b->Statements()) collect_lex(child.get());
+                }
+            } else if (auto* f = dynamic_cast<const FunctionDeclStmt*>(s)) {
+                if (is_block_or_switch) {
+                    if (lex_names.count(f->Name())) {
+                        throw std::runtime_error("SyntaxError: Identifier '" + f->Name() + "' has already been declared");
+                    }
+                    lex_names.insert(f->Name());
+                }
+            } else if (auto* cl = dynamic_cast<const ClassDeclStmt*>(s)) {
+                if (lex_names.count(cl->Name())) {
+                    throw std::runtime_error("SyntaxError: Identifier '" + cl->Name() + "' has already been declared");
+                }
+                lex_names.insert(cl->Name());
+            } else if (auto* exp = dynamic_cast<const ExportDeclStmt*>(s)) {
+                if (exp->Declaration()) collect_lex(exp->Declaration());
+            }
+        };
+        collect_lex(stmt);
+    }
+
+    for (const auto* stmt : stmts) {
+        std::function<void(const Stmt*)> check_vars = [&](const Stmt* s) {
+            if (!s) return;
+            if (auto* v = dynamic_cast<const VarDeclStmt*>(s)) {
+                if (!v->IsLexical() && !v->Name().empty() && v->Name()[0] != '$') {
+                    if (lex_names.count(v->Name())) {
+                        throw std::runtime_error("SyntaxError: Identifier '" + v->Name() + "' has already been declared");
+                    }
+                }
+            } else if (auto* f = dynamic_cast<const FunctionDeclStmt*>(s)) {
+                if (!is_block_or_switch) {
+                    if (lex_names.count(f->Name())) {
+                        throw std::runtime_error("SyntaxError: Identifier '" + f->Name() + "' has already been declared");
+                    }
+                }
+            } else if (auto* b = dynamic_cast<const BlockStmt*>(s)) {
+                for (const auto& child : b->Statements()) check_vars(child.get());
+            } else if (auto* ifs = dynamic_cast<const IfStmt*>(s)) {
+                check_vars(ifs->ThenBranch());
+                check_vars(ifs->ElseBranch());
+            } else if (auto* wh = dynamic_cast<const WhileStmt*>(s)) {
+                check_vars(wh->Body());
+            } else if (auto* dw = dynamic_cast<const DoWhileStmt*>(s)) {
+                check_vars(dw->Body());
+            } else if (auto* for_s = dynamic_cast<const ForStmt*>(s)) {
+                check_vars(for_s->Init());
+                check_vars(for_s->Body());
+            } else if (auto* sw = dynamic_cast<const SwitchStmt*>(s)) {
+                for (const auto& sc : sw->Cases()) {
+                    for (const auto& child : sc.statements) check_vars(child.get());
+                }
+            } else if (auto* tc = dynamic_cast<const TryCatchStmt*>(s)) {
+                check_vars(tc->TryBlock());
+                check_vars(tc->CatchBlock());
+                check_vars(tc->FinallyBlock());
+            } else if (auto* lbl = dynamic_cast<const LabeledStmt*>(s)) {
+                check_vars(lbl->Body());
+            }
+        };
+        check_vars(stmt);
+    }
+}
+
+void Parser::CheckLexicalRedeclarations(const std::vector<std::unique_ptr<Stmt>>& stmts, const std::vector<std::string>& extra_lex_names, bool is_block_or_switch) {
+    std::vector<const Stmt*> raw;
+    raw.reserve(stmts.size());
+    for (const auto& s : stmts) raw.push_back(s.get());
+    CheckLexicalRedeclarations(raw, extra_lex_names, is_block_or_switch);
+}
+
 std::unique_ptr<Program> Parser::ParseProgram() {
     NoGCScope compilation;
     auto prog = std::make_unique<Program>();
@@ -366,6 +483,7 @@ std::unique_ptr<Program> Parser::ParseProgram() {
         prog->AddStatement(std::move(statement));
     }
     prog->SetStrict(strict_mode_);
+    CheckLexicalRedeclarations(prog->Statements());
     return prog;
 }
 
@@ -379,7 +497,32 @@ std::unique_ptr<Stmt> Parser::ParseStatement() {
         Token id_tok = Advance();
         if (Check(TokenKind::Colon)) {
             Advance(); // consume ':'
+            for (const auto& l : active_labels_) {
+                if (l.name == id_tok.text) {
+                    throw std::runtime_error("SyntaxError: Label '" + id_tok.text + "' has already been declared");
+                }
+            }
+            bool is_iter = false;
+            Lexer look_lexer = lexer_;
+            Token look_tok = current_token_;
+            while (true) {
+                if (look_tok.kind == TokenKind::For || look_tok.kind == TokenKind::While || look_tok.kind == TokenKind::Do) {
+                    is_iter = true;
+                    break;
+                }
+                if (look_tok.kind == TokenKind::Identifier || look_tok.kind == TokenKind::Async ||
+                    look_tok.kind == TokenKind::Yield || look_tok.kind == TokenKind::Await) {
+                    Token next_colon = look_lexer.NextToken();
+                    if (next_colon.kind == TokenKind::Colon) {
+                        look_tok = look_lexer.NextToken();
+                        continue;
+                    }
+                }
+                break;
+            }
+            active_labels_.push_back({id_tok.text, is_iter});
             auto body = ParseStatement();
+            active_labels_.pop_back();
             return std::make_unique<LabeledStmt>(id_tok.text, std::move(body));
         }
         lexer_ = saved_lexer;
@@ -508,6 +651,11 @@ std::unique_ptr<Stmt> Parser::ParseVarDecl(bool is_const, VarDeclStmt::Kind kind
             init = ParseExpression();
             if (dynamic_cast<SpreadExpr*>(init.get())) {
                 throw std::runtime_error("SyntaxError: Unexpected token '...'");
+            }
+            if (auto* fe = dynamic_cast<FunctionExpr*>(init.get())) {
+                if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(name_tok.text);
+            } else if (auto* ce = dynamic_cast<ClassExpr*>(init.get())) {
+                if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(name_tok.text);
             }
         }
         stmts.push_back(std::make_unique<VarDeclStmt>(name_tok.text, std::move(init), is_const, kind));
@@ -690,6 +838,8 @@ void Parser::ParsePatternDestructuring(
                     auto def_expr = ParseExpression();
                     if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                         if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(el_tok.text);
+                    } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                        if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(el_tok.text);
                     }
                     auto cond = std::make_unique<BinaryExpr>(
                         BinaryOp::StrictEqual,
@@ -940,6 +1090,8 @@ void Parser::ParsePatternDestructuring(
                         auto def_expr = ParseExpression();
                         if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                             if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(local_name);
+                        } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                            if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(local_name);
                         }
                         auto cond = std::make_unique<BinaryExpr>(
                             BinaryOp::StrictEqual,
@@ -1001,6 +1153,8 @@ void Parser::ParsePatternDestructuring(
                     auto def_expr = ParseExpression();
                     if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                         if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(local_name);
+                    } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                        if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(local_name);
                     }
                     auto cond = std::make_unique<BinaryExpr>(
                         BinaryOp::StrictEqual,
@@ -1061,15 +1215,21 @@ Parser::ParsedParams Parser::ParseParameterList(bool is_async, bool is_generator
     auto parse_one_param = [&](bool is_rest) -> std::string {
         (void)is_rest;
         if (Check(TokenKind::OpenBracket) || Check(TokenKind::OpenBrace)) {
+            result.is_simple = false;
             std::string synth_name = "$p_dstr_" + std::to_string(++s_destruct_counter);
-            ParsePatternDestructuring(synth_name, result.destructuring_stmts, nullptr);
+            ParsePatternDestructuring(synth_name, result.destructuring_stmts, [&](const std::string& n) {
+                result.bound_names.push_back(n);
+            });
             return synth_name;
         }
-        return parse_param_token().text;
+        std::string name = parse_param_token().text;
+        result.bound_names.push_back(name);
+        return name;
     };
 
     if (!Check(TokenKind::CloseParen)) {
         if (Match(TokenKind::DotDotDot)) {
+            result.is_simple = false;
             std::string r = parse_one_param(true);
             if (Check(TokenKind::Equal)) throw std::runtime_error("SyntaxError: Rest parameter may not have a default initializer");
             if (Check(TokenKind::Comma)) throw std::runtime_error("SyntaxError: Rest parameter may not have a trailing comma");
@@ -1078,6 +1238,7 @@ Parser::ParsedParams Parser::ParseParameterList(bool is_async, bool is_generator
             std::string param = parse_one_param(false);
             std::unique_ptr<Expr> def = nullptr;
             if (Match(TokenKind::Equal)) {
+                result.is_simple = false;
                 def = ParseExpression();
             }
             result.params.push_back(param);
@@ -1085,6 +1246,7 @@ Parser::ParsedParams Parser::ParseParameterList(bool is_async, bool is_generator
             while (Match(TokenKind::Comma)) {
                 if (Check(TokenKind::CloseParen)) break;
                 if (Match(TokenKind::DotDotDot)) {
+                    result.is_simple = false;
                     std::string r = parse_one_param(true);
                     if (Check(TokenKind::Equal)) throw std::runtime_error("SyntaxError: Rest parameter may not have a default initializer");
                     if (Check(TokenKind::Comma)) throw std::runtime_error("SyntaxError: Rest parameter may not have a trailing comma");
@@ -1094,6 +1256,7 @@ Parser::ParsedParams Parser::ParseParameterList(bool is_async, bool is_generator
                 std::string next_param = parse_one_param(false);
                 std::unique_ptr<Expr> next_def = nullptr;
                 if (Match(TokenKind::Equal)) {
+                    result.is_simple = false;
                     next_def = ParseExpression();
                 }
                 result.params.push_back(next_param);
@@ -1102,6 +1265,17 @@ Parser::ParsedParams Parser::ParseParameterList(bool is_async, bool is_generator
         }
     }
     Consume(TokenKind::CloseParen, "Expected ')' after parameter list");
+    if (strict_mode_ || !result.is_simple) {
+        std::unordered_set<std::string> seen;
+        for (const auto& name : result.bound_names) {
+            if (!name.empty() && name[0] != '$') {
+                if (seen.count(name)) {
+                    throw std::runtime_error("SyntaxError: Duplicate parameter name not allowed in this context");
+                }
+                seen.insert(name);
+            }
+        }
+    }
     return result;
 }
 
@@ -1125,6 +1299,35 @@ std::unique_ptr<Stmt> Parser::ParseFunctionDecl(bool is_async) {
     {
         FunctionContextGuard guard(*this, is_generator, is_async);
         body = ParseBlock();
+    }
+    bool body_is_strict = false;
+    if (body && !body->Statements().empty()) {
+        if (auto* expr_stmt = dynamic_cast<ExprStmt*>(body->Statements()[0].get())) {
+            if (auto* lit = dynamic_cast<LiteralExpr*>(expr_stmt->GetExpr())) {
+                if (lit->Value().IsHeapObject() && lit->Value().AsHeapObject()->IsString()) {
+                    if (static_cast<JSString*>(lit->Value().AsHeapObject())->Value() == "use strict") {
+                        body_is_strict = true;
+                    }
+                }
+            }
+        }
+    }
+    if (body_is_strict && !parsed.is_simple) {
+        throw std::runtime_error("SyntaxError: Illegal 'use strict' directive in function with non-simple parameter list");
+    }
+    if (body_is_strict && !strict_mode_) {
+        std::unordered_set<std::string> seen;
+        for (const auto& name : parsed.bound_names) {
+            if (!name.empty() && name[0] != '$') {
+                if (seen.count(name)) {
+                    throw std::runtime_error("SyntaxError: Duplicate parameter name not allowed in this context");
+                }
+                seen.insert(name);
+            }
+        }
+    }
+    if (body) {
+        CheckLexicalRedeclarations(body->Statements(), parsed.bound_names);
     }
     if (!parsed.destructuring_stmts.empty() && body) {
         body->Statements().insert(body->Statements().begin(),
@@ -1192,13 +1395,17 @@ std::unique_ptr<Stmt> Parser::ParseWhile() {
     auto cond = ParseExpression();
     Consume(TokenKind::CloseParen, "Expected ')' after while condition");
 
+    loop_depth_++;
     auto body = ParseStatement();
+    loop_depth_--;
     ValidateSubstatement(body.get(), /*is_if=*/false);
     return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
 }
 
 std::unique_ptr<Stmt> Parser::ParseDoWhile() {
+    loop_depth_++;
     auto body = ParseStatement();
+    loop_depth_--;
     ValidateSubstatement(body.get(), /*is_if=*/false);
     Consume(TokenKind::While, "Expected 'while' after do-while body");
     Consume(TokenKind::OpenParen, "Expected '(' after 'while'");
@@ -1210,19 +1417,56 @@ std::unique_ptr<Stmt> Parser::ParseDoWhile() {
 
 std::unique_ptr<Stmt> Parser::ParseBreak() {
     std::string label = "";
-    if (Check(TokenKind::Identifier)) {
+    if (!current_token_.has_leading_newline && Check(TokenKind::Identifier)) {
         label = Advance().text;
     }
     Match(TokenKind::Semicolon);
+    if (label.empty()) {
+        if (loop_depth_ == 0 && switch_depth_ == 0) {
+            throw std::runtime_error("SyntaxError: Illegal break statement");
+        }
+    } else {
+        bool found = false;
+        for (const auto& l : active_labels_) {
+            if (l.name == label) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw std::runtime_error("SyntaxError: Undefined label '" + label + "'");
+        }
+    }
     return std::make_unique<BreakStmt>(label);
 }
 
 std::unique_ptr<Stmt> Parser::ParseContinue() {
     std::string label = "";
-    if (Check(TokenKind::Identifier)) {
+    if (!current_token_.has_leading_newline && Check(TokenKind::Identifier)) {
         label = Advance().text;
     }
     Match(TokenKind::Semicolon);
+    if (label.empty()) {
+        if (loop_depth_ == 0) {
+            throw std::runtime_error("SyntaxError: Illegal continue statement: no surrounding iteration statement");
+        }
+    } else {
+        bool found = false;
+        bool is_iter = false;
+        for (const auto& l : active_labels_) {
+            if (l.name == label) {
+                found = true;
+                is_iter = l.is_iteration;
+                break;
+            }
+        }
+        if (!found) {
+            throw std::runtime_error("SyntaxError: Undefined label '" + label + "'");
+        }
+        if (!is_iter) {
+            throw std::runtime_error("SyntaxError: Illegal continue statement: '" + label + "' does not denote an iteration statement");
+        }
+    }
     return std::make_unique<ContinueStmt>(label);
 }
 
@@ -1232,6 +1476,7 @@ std::unique_ptr<Stmt> Parser::ParseSwitch() {
     Consume(TokenKind::CloseParen, "Expected ')' after switch discriminant");
     Consume(TokenKind::OpenBrace, "Expected '{' before switch cases");
 
+    switch_depth_++;
     std::vector<SwitchCase> cases;
     while (!Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
         SwitchCase sc;
@@ -1242,6 +1487,7 @@ std::unique_ptr<Stmt> Parser::ParseSwitch() {
             Consume(TokenKind::Colon, "Expected ':' after default");
             sc.test = nullptr;
         } else {
+            switch_depth_--;
             throw std::runtime_error("SyntaxError: Expected 'case' or 'default' in switch statement");
         }
 
@@ -1251,6 +1497,16 @@ std::unique_ptr<Stmt> Parser::ParseSwitch() {
         cases.push_back(std::move(sc));
     }
     Consume(TokenKind::CloseBrace, "Expected '}' after switch cases");
+    switch_depth_--;
+
+    std::vector<const Stmt*> all_switch_stmts;
+    for (const auto& c : cases) {
+        for (const auto& stmt : c.statements) {
+            all_switch_stmts.push_back(stmt.get());
+        }
+    }
+    CheckLexicalRedeclarations(all_switch_stmts, {}, /*is_block_or_switch=*/true);
+
     return std::make_unique<SwitchStmt>(std::move(discriminant), std::move(cases));
 }
 
@@ -1352,7 +1608,9 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
             iterable = ParseExpression();
         }
         Consume(TokenKind::CloseParen, "Expected ')' after for header");
+        loop_depth_++;
         auto body = ParseStatement();
+        loop_depth_--;
         ValidateSubstatement(body.get(), /*is_if=*/false);
 
         static uint32_t s_for_of_id = 0;
@@ -1538,7 +1796,9 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
     }
     Consume(TokenKind::CloseParen, "Expected ')' after for loop update");
 
+    loop_depth_++;
     auto body = ParseStatement();
+    loop_depth_--;
     ValidateSubstatement(body.get(), /*is_if=*/false);
 
     if (is_let_loop && !let_loop_name.empty() && body) {
@@ -1563,7 +1823,7 @@ std::unique_ptr<Stmt> Parser::ParseFor(bool is_for_await) {
 
 std::unique_ptr<Stmt> Parser::ParseReturn() {
     std::unique_ptr<Expr> val = nullptr;
-    if (!Check(TokenKind::Semicolon) && !Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
+    if (!current_token_.has_leading_newline && !Check(TokenKind::Semicolon) && !Check(TokenKind::CloseBrace) && !Check(TokenKind::EndOfFile)) {
         val = ParseExpression(Precedence::Comma);
     }
     Match(TokenKind::Semicolon);
@@ -1683,7 +1943,7 @@ Parser::ParsedClassBody Parser::ParseClassElements(std::string_view super_name) 
         std::string method_name_text;
         Token first = Advance();
         if (first.kind == TokenKind::Hash) {
-            Token private_name = Consume(TokenKind::Identifier, "Expected private name after '#'");
+            Token private_name = ConsumeIdentifierName("Expected private name after '#'");
             method_name_text = "#" + private_name.text;
         } else {
             method_name_text = first.text;
@@ -1749,8 +2009,12 @@ std::unique_ptr<Stmt> Parser::ParseClassDecl() {
     Token name_tok = Consume(TokenKind::Identifier, "Expected class name");
     std::string super_name = "";
     if (Match(TokenKind::Extends)) {
-        Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
-        super_name = super_tok.text;
+        if (Match(TokenKind::Null)) {
+            super_name = "null";
+        } else {
+            Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
+            super_name = super_tok.text;
+        }
     }
     auto body = ParseClassElements(super_name);
     auto class_node = std::make_unique<ClassDeclStmt>(name_tok.text, super_name, std::move(body.methods));
@@ -1776,6 +2040,7 @@ std::unique_ptr<BlockStmt> Parser::ParseBlock() {
         block->AddStatement(ParseStatement());
     }
     Consume(TokenKind::CloseBrace, "Expected '}'");
+    CheckLexicalRedeclarations(block->Statements(), {}, /*is_block_or_switch=*/strict_mode_);
     return block;
 }
 
@@ -2080,25 +2345,20 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
 
                 Advance(); // Consume '=>'
                 std::vector<std::string> params = {tok.text};
-                bool prev_gen = in_generator_;
-                bool prev_async = in_async_;
-                in_generator_ = false;
-                in_async_ = false;
-
                 std::unique_ptr<BlockStmt> body;
-                if (Check(TokenKind::OpenBrace)) {
-                    body = ParseBlock();
-                } else {
-                    bool saved_allow_in = allow_in_;
-                    allow_in_ = true;
-                    auto arrow_expr = ParseExpression();
-                    allow_in_ = saved_allow_in;
-                    body = std::make_unique<BlockStmt>();
-                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                {
+                    FunctionContextGuard guard(*this, false, false);
+                    if (Check(TokenKind::OpenBrace)) {
+                        body = ParseBlock();
+                    } else {
+                        bool saved_allow_in = allow_in_;
+                        allow_in_ = true;
+                        auto arrow_expr = ParseExpression();
+                        allow_in_ = saved_allow_in;
+                        body = std::make_unique<BlockStmt>();
+                        body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                    }
                 }
-
-                in_generator_ = prev_gen;
-                in_async_ = prev_async;
 
                 bool body_is_strict = strict_mode_ || is_module_;
                 if (!body_is_strict && body && !body->Statements().empty()) {
@@ -2344,6 +2604,8 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                                     if (yac.found_await) throw std::runtime_error("SyntaxError: Await expression not allowed in parameter defaults");
                                     if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                                         if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(el_tok.text);
+                                    } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                                        if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(el_tok.text);
                                     }
                                     auto cond = std::make_unique<BinaryExpr>(
                                         BinaryOp::StrictEqual,
@@ -2606,6 +2868,8 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                                         if (yac.found_await) throw std::runtime_error("SyntaxError: Await expression not allowed in parameter defaults");
                                         if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                                             if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(local_name);
+                                        } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                                            if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(local_name);
                                         }
                                         auto cond = std::make_unique<BinaryExpr>(
                                             BinaryOp::StrictEqual,
@@ -2679,6 +2943,8 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                                     if (yac.found_await) throw std::runtime_error("SyntaxError: Await expression not allowed in parameter defaults");
                                     if (auto* fe = dynamic_cast<FunctionExpr*>(def_expr.get())) {
                                         if (fe->Name().empty() && !fe->HasStaticName()) fe->SetName(local_name);
+                                    } else if (auto* ce = dynamic_cast<ClassExpr*>(def_expr.get())) {
+                                        if (ce->Name().empty() && !ce->HasStaticName()) ce->SetName(local_name);
                                     }
                                     auto cond = std::make_unique<BinaryExpr>(
                                         BinaryOp::StrictEqual,
@@ -2806,25 +3072,20 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                 Consume(TokenKind::CloseParen, "Expected ')' after arrow parameters");
                 Consume(TokenKind::Arrow, "Expected '=>' after arrow parameters");
 
-                bool prev_gen = in_generator_;
-                bool prev_async = in_async_;
-                in_generator_ = false;
-                in_async_ = false;
-
                 std::unique_ptr<BlockStmt> body;
-                if (Check(TokenKind::OpenBrace)) {
-                    body = ParseBlock();
-                } else {
-                    bool saved_allow_in = allow_in_;
-                    allow_in_ = true;
-                    auto arrow_expr = ParseExpression();
-                    allow_in_ = saved_allow_in;
-                    body = std::make_unique<BlockStmt>();
-                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                {
+                    FunctionContextGuard guard(*this, false, false);
+                    if (Check(TokenKind::OpenBrace)) {
+                        body = ParseBlock();
+                    } else {
+                        bool saved_allow_in = allow_in_;
+                        allow_in_ = true;
+                        auto arrow_expr = ParseExpression();
+                        allow_in_ = saved_allow_in;
+                        body = std::make_unique<BlockStmt>();
+                        body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                    }
                 }
-
-                in_generator_ = prev_gen;
-                in_async_ = prev_async;
 
                 bool body_is_strict = strict_mode_ || is_module_;
                 if (!body_is_strict && body && !body->Statements().empty()) {
@@ -2889,13 +3150,11 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
             std::vector<ObjectLiteralExpr::Property> props;
             auto parse_obj_method = [this](std::string_view name, std::unique_ptr<Expr> computed_key, bool is_gen, bool is_as, bool is_get = false, bool is_set = false) -> ObjectLiteralExpr::Property {
                 auto parsed = ParseParameterList(is_as, is_gen);
-                bool prev_gen = in_generator_;
-                bool prev_as = in_async_;
-                if (is_gen) in_generator_ = true;
-                if (is_as) in_async_ = true;
-                auto body = ParseBlock();
-                in_generator_ = prev_gen;
-                in_async_ = prev_as;
+                std::unique_ptr<BlockStmt> body;
+                {
+                    FunctionContextGuard guard(*this, is_gen, is_as);
+                    body = ParseBlock();
+                }
                 if (!parsed.destructuring_stmts.empty() && body) {
                     body->Statements().insert(body->Statements().begin(),
                         std::make_move_iterator(parsed.destructuring_stmts.begin()),
@@ -3050,6 +3309,13 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
             return std::make_unique<UnaryExpr>(UnaryOp::TypeOf, ParseExpression(Precedence::Unary));
         case TokenKind::Delete: {
             auto operand = ParseExpression(Precedence::Unary);
+            if (ContainsOptionalChain(operand.get())) {
+                throw std::runtime_error("SyntaxError: Cannot delete optional chain");
+            }
+            if (dynamic_cast<PrivateAccessExpr*>(operand.get()) ||
+                dynamic_cast<PrivateIdentifierExpr*>(operand.get())) {
+                throw std::runtime_error("SyntaxError: Cannot delete private fields or methods");
+            }
             if (strict_mode_) {
                 if (dynamic_cast<IdentifierExpr*>(operand.get())) {
                     throw std::runtime_error("SyntaxError: Delete of an unqualified identifier in strict mode");
@@ -3099,7 +3365,7 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
             if (declared_private_names_stack_.empty()) {
                 throw std::runtime_error("SyntaxError: Unexpected private identifier outside class");
             }
-            Token name_tok = Consume(TokenKind::Identifier, "Expected identifier after '#'");
+            Token name_tok = ConsumeIdentifierName("Expected identifier after '#'");
             std::string field_name = name_tok.text;
 
             bool declared = false;
@@ -3127,8 +3393,12 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
             }
             std::string super_name = "";
             if (Match(TokenKind::Extends)) {
-                Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
-                super_name = super_tok.text;
+                if (Match(TokenKind::Null)) {
+                    super_name = "null";
+                } else {
+                    Token super_tok = Consume(TokenKind::Identifier, "Expected super class name after 'extends'");
+                    super_name = super_tok.text;
+                }
             }
             auto body = ParseClassElements(super_name);
             auto class_expr = std::make_unique<ClassExpr>(name, super_name, std::move(body.methods));
@@ -3195,25 +3465,20 @@ std::unique_ptr<Expr> Parser::ParsePrefix(Precedence precedence) {
                 }
                 Advance(); // Consume '=>'
                 std::vector<std::string> params = {"yield"};
-                bool prev_gen = in_generator_;
-                bool prev_async = in_async_;
-                in_generator_ = false;
-                in_async_ = false;
-
                 std::unique_ptr<BlockStmt> body;
-                if (Check(TokenKind::OpenBrace)) {
-                    body = ParseBlock();
-                } else {
-                    bool saved_allow_in = allow_in_;
-                    allow_in_ = true;
-                    auto arrow_expr = ParseExpression();
-                    allow_in_ = saved_allow_in;
-                    body = std::make_unique<BlockStmt>();
-                    body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                {
+                    FunctionContextGuard guard(*this, false, false);
+                    if (Check(TokenKind::OpenBrace)) {
+                        body = ParseBlock();
+                    } else {
+                        bool saved_allow_in = allow_in_;
+                        allow_in_ = true;
+                        auto arrow_expr = ParseExpression();
+                        allow_in_ = saved_allow_in;
+                        body = std::make_unique<BlockStmt>();
+                        body->AddStatement(std::make_unique<ReturnStmt>(std::move(arrow_expr)));
+                    }
                 }
-
-                in_generator_ = prev_gen;
-                in_async_ = prev_async;
 
                 bool body_is_strict = strict_mode_ || is_module_;
                 if (!body_is_strict && body && !body->Statements().empty()) {
@@ -3444,6 +3709,11 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
 
         if (op_token.kind == TokenKind::Equal) {
             if (auto* id = dynamic_cast<IdentifierExpr*>(lhs.get())) {
+                if (auto* fn = dynamic_cast<FunctionExpr*>(rhs.get()); fn && fn->Name().empty() && !fn->HasStaticName()) {
+                    fn->SetName(id->Name());
+                } else if (auto* ce = dynamic_cast<ClassExpr*>(rhs.get()); ce && ce->Name().empty() && !ce->HasStaticName()) {
+                    ce->SetName(id->Name());
+                }
                 return std::make_unique<AssignExpr>(id->Name(), std::move(rhs));
             }
             if (auto* prop = dynamic_cast<PropertyAccessExpr*>(lhs.get())) {
@@ -3497,6 +3767,8 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
                 // NamedEvaluation for an anonymous function assigned through
                 // a logical assignment uses the LHS binding name.
                 fn->SetName(id->Name());
+            } else if (auto* ce = dynamic_cast<ClassExpr*>(rhs.get()); ce && ce->Name().empty() && !ce->HasStaticName()) {
+                ce->SetName(id->Name());
             }
             return std::make_unique<CompoundAssignExpr>(bin_op, id->Name(), std::move(rhs));
         }
@@ -3538,22 +3810,16 @@ std::unique_ptr<Expr> Parser::ParseInfix(std::unique_ptr<Expr> lhs, Token op_tok
             Consume(TokenKind::CloseParen, "Expected ')' after argument list in optional call");
             return std::make_unique<OptionalCallExpr>(std::move(lhs), std::move(args), true);
         }
-        if (current_token_.text.empty() || (!std::isalpha(static_cast<unsigned char>(current_token_.text[0])) && current_token_.text[0] != '_' && current_token_.text[0] != '$')) {
-            throw std::runtime_error("SyntaxError: Expected property identifier after '?.'");
-        }
-        Token prop_tok = Advance();
+        Token prop_tok = ConsumeIdentifierName("Expected property identifier after '?.'");
         return std::make_unique<OptionalPropertyAccessExpr>(std::move(lhs), prop_tok.text);
     }
 
     if (op_token.kind == TokenKind::Dot) {
         if (Match(TokenKind::Hash)) {
-            Token private_name = Consume(TokenKind::Identifier, "Expected private name after '.'");
+            Token private_name = ConsumeIdentifierName("Expected private name after '.'");
             return std::make_unique<PrivateAccessExpr>(std::move(lhs), private_name.text);
         }
-        if (current_token_.text.empty() || (!std::isalpha(static_cast<unsigned char>(current_token_.text[0])) && current_token_.text[0] != '_' && current_token_.text[0] != '$')) {
-            throw std::runtime_error("SyntaxError: Expected property identifier after '.'");
-        }
-        Token prop_tok = Advance();
+        Token prop_tok = ConsumeIdentifierName("Expected property identifier after '.'");
         if (IsOptionalChain(lhs.get())) {
             return std::make_unique<OptionalPropertyAccessExpr>(std::move(lhs), prop_tok.text);
         }

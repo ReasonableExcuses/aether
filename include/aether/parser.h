@@ -65,6 +65,7 @@ private:
     bool Check(TokenKind kind);
     bool Match(TokenKind kind);
     Token Consume(TokenKind kind, std::string_view error_message);
+    Token ConsumeIdentifierName(std::string_view error_message);
 
     Precedence GetPrecedence(TokenKind kind);
 
@@ -104,6 +105,8 @@ private:
         std::vector<std::unique_ptr<Expr>> param_defaults;
         std::string rest_param;
         std::vector<std::unique_ptr<Stmt>> destructuring_stmts;
+        std::vector<std::string> bound_names;
+        bool is_simple{true};
     };
     ParsedParams ParseParameterList(bool is_async = false, bool is_generator = false);
     void ParsePatternDestructuring(
@@ -129,6 +132,15 @@ private:
     bool in_async_{false};
     bool is_module_{false};
     uint32_t function_depth_{0};
+    struct LabelInfo {
+        std::string name;
+        bool is_iteration{false};
+    };
+    uint32_t loop_depth_{0};
+    uint32_t switch_depth_{0};
+    std::vector<LabelInfo> active_labels_;
+    void CheckLexicalRedeclarations(const std::vector<const Stmt*>& stmts, const std::vector<std::string>& extra_lex_names = {}, bool is_block_or_switch = false);
+    void CheckLexicalRedeclarations(const std::vector<std::unique_ptr<Stmt>>& stmts, const std::vector<std::string>& extra_lex_names = {}, bool is_block_or_switch = false);
     std::vector<std::unordered_set<std::string>> declared_private_names_stack_;
 };
 

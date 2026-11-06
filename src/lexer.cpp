@@ -385,7 +385,7 @@ Token Lexer::ScanToken() {
     }
 
     // Identifiers and keywords
-    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$' || (c == '\\' && PeekNext() == 'u')) {
+    if (std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$' || (c == '\\' && PeekNext() == 'u') || static_cast<unsigned char>(c) >= 0x80) {
         return ScanIdentifierOrKeyword();
     }
 
@@ -532,7 +532,23 @@ Token Lexer::ScanIdentifierOrKeyword() {
     bool has_escape = false;
     while (!IsAtEnd()) {
         char c = Peek();
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$') {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc == 0xE2 && cursor_ + 2 < source_.size() &&
+            static_cast<unsigned char>(source_[cursor_ + 1]) == 0x80 &&
+            (static_cast<unsigned char>(source_[cursor_ + 2]) == 0xA8 ||
+             static_cast<unsigned char>(source_[cursor_ + 2]) == 0xA9)) {
+            break;
+        }
+        if (uc == 0xC2 && cursor_ + 1 < source_.size() &&
+            static_cast<unsigned char>(source_[cursor_ + 1]) == 0xA0) {
+            break;
+        }
+        if (uc == 0xEF && cursor_ + 2 < source_.size() &&
+            static_cast<unsigned char>(source_[cursor_ + 1]) == 0xBB &&
+            static_cast<unsigned char>(source_[cursor_ + 2]) == 0xBF) {
+            break;
+        }
+        if (std::isalnum(uc) || c == '_' || c == '$' || uc >= 0x80) {
             text.push_back(Advance());
         } else if (c == '\\' && PeekNext() == 'u') {
             has_escape = true;

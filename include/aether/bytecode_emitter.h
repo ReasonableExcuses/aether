@@ -162,11 +162,17 @@ private:
 
     BytecodeEmitter* parent_emitter_{nullptr};
     JSObject* super_proto_{nullptr};
+    TaggedValue super_ctor_val_{TaggedValue::Undefined()};
     std::unordered_map<std::string, JSFunction*> functions_;
     JSObject* LookupSuperProto() const {
         if (super_proto_) return super_proto_;
         if (parent_emitter_) return parent_emitter_->LookupSuperProto();
         return nullptr;
+    }
+    TaggedValue LookupSuperCtor() const {
+        if (!super_ctor_val_.IsUndefined()) return super_ctor_val_;
+        if (parent_emitter_) return parent_emitter_->LookupSuperCtor();
+        return TaggedValue::Undefined();
     }
     JSString* InternString(std::string_view name);
 

@@ -889,6 +889,16 @@ public:
         : name_(name), super_name_(super_name), methods_(std::move(methods)) {}
 
     const std::string& Name() const noexcept { return name_; }
+    void SetName(std::string_view name) { name_ = name; }
+    bool HasStaticName() const noexcept {
+        for (const auto& m : methods_) {
+            if (m && (m->Name() == "__static__name" || m->Name() == "__static__get__name")) return true;
+        }
+        for (const auto& f : fields_) {
+            if (f.name == "__static__name") return true;
+        }
+        return false;
+    }
     const std::string& SuperName() const noexcept { return super_name_; }
     const std::vector<std::unique_ptr<FunctionDeclStmt>>& Methods() const noexcept { return methods_; }
     void AddMethod(std::unique_ptr<FunctionDeclStmt> method) { methods_.push_back(std::move(method)); }

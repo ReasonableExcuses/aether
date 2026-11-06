@@ -746,6 +746,15 @@ inline std::string_view JSString::View() const noexcept {
     return std::string_view("");
 }
 
+inline std::string_view GetStringViewOrUtf8(const JSString* s, std::string& fallback) {
+    if (AETHER_LIKELY(s != nullptr && s->IsOneByte())) {
+        return s->View();
+    }
+    if (s == nullptr) return std::string_view("");
+    fallback = s->ToUtf8();
+    return fallback;
+}
+
 using PropertyArray = FixedArray;
 using ElementsArray = FixedArray;
 
