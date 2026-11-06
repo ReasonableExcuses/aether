@@ -830,6 +830,8 @@ void IsolateHeap::MajorGC() {
         return obj && obj->IsMarked();
     });
 
+    PruneDeadMetadata(live);
+
     // In Major GC, any live young object promotes to old
     for (auto* obj : young_objects_) {
         if (obj && obj->IsMarked()) {
@@ -888,6 +890,69 @@ void IsolateHeap::MajorGC() {
 void IsolateHeap::Shrink() {
     old_gen_.EnsureAllSwept();
     old_gen_.Shrink();
+}
+
+void IsolateHeap::PruneDeadMetadata(const std::vector<HeapObject*>& live) {
+    std::unordered_set<Shape*> live_shapes;
+    if (Realm* realm = Realm::Current()) {
+        if (Shape* root = realm->GetRootShape()) {
+            live_shapes.insert(root);
+        }
+    }
+    if (Interpreter* interp = Interpreter::Current()) {
+        if (Shape* root = interp->GetRootShape()) {
+            live_shapes.insert(root);
+        }
+    }
+    for (HeapObject* obj : live) {
+        if (!obj) continue;
+        if (obj->IsForwarded()) obj = obj->GetForwardedAddress();
+        Shape* s = obj->GetShape();
+        while (s && live_shapes.insert(s).second) {
+            s = s->Parent();
+        }
+    }
+
+    if (Realm* realm = Realm::Current()) {
+        if (Shape* root = realm->GetRootShape()) {
+            root->PruneDeadTransitions(live_shapes);
+        }
+    }
+    if (Interpreter* interp = Interpreter::Current()) {
+        if (Shape* root = interp->GetRootShape()) {
+            root->PruneDeadTransitions(live_shapes);
+        }
+    }
+
+    std::unordered_set<const BytecodeArray*> active_bytecodes;
+    if (Interpreter* interp = Interpreter::Current()) {
+        interp->GetFeedbackVector().PruneDeadShapes(live_shapes);
+        for (ExecutionFrame* f = interp->GetCurrentFrame(); f; f = f->GetPrevFrame()) {
+            active_bytecodes.insert(&f->GetBytecode());
+            const_cast<BytecodeArray&>(f->GetBytecode()).GetFeedbackVector().PruneDeadShapes(live_shapes);
+        }
+    }
+
+    for (HeapObject* obj : live) {
+        if (!obj) continue;
+        if (obj->IsForwarded()) obj = obj->GetForwardedAddress();
+        if (obj->IsUserFunction()) {
+            auto* fn = static_cast<JSFunction*>(obj);
+            if (const BytecodeArray* bc = fn->GetBytecode()) {
+                const_cast<BytecodeArray*>(bc)->GetFeedbackVector().PruneDeadShapes(live_shapes);
+
+                if (active_bytecodes.find(bc) == active_bytecodes.end()) {
+                    if (bc->GetTier1Code() || bc->GetTier2Code()) {
+                        if (bc->InvocationCount() == 0) {
+                            bc->FlushJITCode();
+                        } else {
+                            const_cast<BytecodeArray*>(bc)->ResetInvocationCount();
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 bool IsolateHeap::CollectAtSafepoint() {

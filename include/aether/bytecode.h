@@ -214,6 +214,14 @@ struct FeedbackSlot {
     bool IsMonomorphicSmi() const noexcept {
         return observed_type == static_cast<uint8_t>(ObservedType::Smi);
     }
+
+    void Reset() noexcept {
+        state = State::Uninitialized;
+        observed_type = static_cast<uint8_t>(ObservedType::None);
+        cached_shape = nullptr;
+        cached_slot = 0;
+        cached_in_object = true;
+    }
 };
 
 /**
@@ -274,6 +282,28 @@ public:
     size_t Size() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return slots_.size();
+    }
+
+    void PruneDeadShapes(const std::unordered_set<Shape*>& live_shapes) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& slot : slots_) {
+            if (slot.cached_shape && live_shapes.find(slot.cached_shape) == live_shapes.end()) {
+                slot.state = FeedbackSlot::State::Uninitialized;
+                slot.cached_shape = nullptr;
+                slot.cached_slot = 0;
+                slot.cached_in_object = true;
+            }
+        }
+    }
+
+    void ClearICs() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& slot : slots_) {
+            slot.state = FeedbackSlot::State::Uninitialized;
+            slot.cached_shape = nullptr;
+            slot.cached_slot = 0;
+            slot.cached_in_object = true;
+        }
     }
 
 private:
@@ -443,6 +473,12 @@ public:
     }
     bool IsCompilingTier2() const noexcept {
         return is_compiling_tier2_.load(std::memory_order_acquire);
+    }
+
+    void FlushJITCode() const noexcept {
+        std::lock_guard<std::mutex> lock(tier_mutex_);
+        tier1_code_.reset();
+        tier2_code_.reset();
     }
 
     TypeFeedbackVector& GetFeedbackVector() const noexcept { return feedback_; }

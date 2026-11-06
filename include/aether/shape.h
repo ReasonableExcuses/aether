@@ -4,8 +4,11 @@
 #include "aether/common.h"
 #include "aether/value.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <string_view>
+#include <memory>
+#include <functional>
 
 namespace aether {
 
@@ -88,6 +91,45 @@ public:
         Shape* raw_ptr = child.get();
         transitions_[k] = std::move(child);
         return raw_ptr;
+    }
+
+    size_t TransitionCount() const noexcept {
+        return transitions_.size();
+    }
+
+    size_t TotalTreeShapeCount() const noexcept {
+        size_t count = 1;
+        for (const auto& pair : transitions_) {
+            if (pair.second) count += pair.second->TotalTreeShapeCount();
+        }
+        return count;
+    }
+
+    void PruneDeadTransitions(const std::unordered_set<Shape*>& live_shapes) {
+        for (auto it = transitions_.begin(); it != transitions_.end(); ) {
+            Shape* child = it->second.get();
+            if (live_shapes.find(child) == live_shapes.end()) {
+                it = transitions_.erase(it);
+            } else {
+                child->PruneDeadTransitions(live_shapes);
+                ++it;
+            }
+        }
+    }
+
+    void UpdatePointers(const std::function<HeapObject*(HeapObject*)>& relocator) {
+        if (prototype_.IsHeapObject()) {
+            HeapObject* p = prototype_.AsHeapObject();
+            if (p) {
+                HeapObject* new_p = relocator(p);
+                if (new_p != p) {
+                    prototype_ = TaggedValue::FromHeapObject(new_p);
+                }
+            }
+        }
+        for (auto& pair : transitions_) {
+            if (pair.second) pair.second->UpdatePointers(relocator);
+        }
     }
 
     static constexpr uint32_t kDefaultInObjectProperties = 2;

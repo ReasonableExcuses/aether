@@ -285,6 +285,8 @@ public:
     // Mark-only STW entry used by the compatibility ConcurrentMarker facade.
     size_t MarkFromRoots(const std::vector<HeapObject*>& roots, bool process_weak = false);
 
+    void PruneDeadMetadata(const std::vector<HeapObject*>& live);
+
     bool Contains(const void* ptr) const noexcept;
     bool IsValidObjectStart(const void* ptr) const noexcept;
     void ScanStack(const std::function<void(HeapObject*)>& on_root);

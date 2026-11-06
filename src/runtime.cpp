@@ -7748,6 +7748,7 @@ void Realm::UpdatePointers(const std::function<HeapObject*(HeapObject*)>& resolv
     };
     fix_val(symbol_iterator_); fix_val(symbol_asyncIterator_); fix_val(symbol_toStringTag_);
     fix_val(symbol_hasInstance_); fix_val(symbol_toPrimitive_); fix_val(symbol_unscopables_);
+    if (root_shape_) root_shape_->UpdatePointers(resolve);
 }
 
 } // namespace aether

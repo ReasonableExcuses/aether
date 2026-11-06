@@ -244,7 +244,7 @@ Goal: trivially relocatable objects, no per-object destructors, real evacuation.
 - Honor `--max-heap`; throw a catchable `RangeError`-style OOM (or terminate) deterministically.
 - **Acceptance:** RSS returns to < 2× idle after a large workload is released.
 
-### T2.5 Dead metadata collection
+### [x] T2.5 Dead metadata collection
 - Weak shape transitions, IC cache clearing on GC (`FeedbackSlot::cached_shape` is a raw `Shape*`), code and bytecode flushing for cold functions, wasm registries (existing hooks: `WasmRegistryPruneDead`, `WasmRegistryRelocate`).
 - **Acceptance:** a test that creates/discards 1M distinct shapes does not grow RSS unboundedly.
 
