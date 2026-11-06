@@ -711,11 +711,16 @@ void JSObject::PrepareFastSlot(uint32_t slot_index, bool in_object) {
 }
 
 TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
+    return GetNamedPropertyWithReceiver(key, TaggedValue::FromHeapObject(const_cast<JSObject*>(this)));
+}
+
+TaggedValue JSObject::GetNamedPropertyWithReceiver(std::string_view key, TaggedValue receiver) const {
+    if (receiver.IsEmpty()) receiver = TaggedValue::FromHeapObject(const_cast<JSObject*>(this));
     if (property_lookup_depth > kMaxPrototypeChainDepth) return TaggedValue::Undefined();
     PropertyLookupScope lookup_scope;
     if (IsDeletedProperty(key)) {
         if (prototype_ != nullptr) {
-            return prototype_->GetNamedProperty(key);
+            return prototype_->GetNamedPropertyWithReceiver(key, receiver);
         }
         return TaggedValue::Undefined();
     }
@@ -760,7 +765,7 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
 
     if (const AccessorDescriptor* acc = GetAccessor(key)) {
         if (acc->getter.IsHeapObject() && acc->getter.AsHeapObject()->IsFunction()) {
-            return CallFunction(acc->getter, TaggedValue::FromHeapObject(const_cast<JSObject*>(this)), {});
+            return CallFunction(acc->getter, receiver, {});
         }
         return TaggedValue::Undefined();
     }
@@ -812,7 +817,7 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
 
         // Check instance prototype if explicitly assigned
         if (prototype_ != nullptr) {
-            TaggedValue val = prototype_->GetNamedProperty(key);
+            TaggedValue val = prototype_->GetNamedPropertyWithReceiver(key, receiver);
             if (!val.IsUndefined()) {
                 return val;
             }
@@ -827,7 +832,7 @@ TaggedValue JSObject::GetNamedProperty(std::string_view key) const {
                 JSObject* js_proto = static_cast<JSObject*>(p_obj);
                 if (const AccessorDescriptor* p_acc = js_proto->GetAccessor(key)) {
                     if (p_acc->getter.IsHeapObject() && p_acc->getter.AsHeapObject()->IsFunction()) {
-                        return CallFunction(p_acc->getter, TaggedValue::FromHeapObject(const_cast<JSObject*>(this)), {});
+                        return CallFunction(p_acc->getter, receiver, {});
                     }
                     return TaggedValue::Undefined();
                 }

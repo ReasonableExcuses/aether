@@ -568,8 +568,9 @@ static_assert(sizeof(JSString) == 56, "sizeof(JSString) must be 56 bytes");
  */
 class JSSymbol : public HeapObject {
 public:
-    explicit JSSymbol(std::string_view description, uint32_t id, Shape* shape = nullptr)
+    explicit JSSymbol(std::string_view description, uint32_t id, bool has_description = true, Shape* shape = nullptr)
         : HeapObject(HeapObjectType::Symbol, shape),
+          has_description_(has_description),
           description_(detail::ChargedString(description, description_storage_)),
           id_(id) {
         if (!description_.empty() && description_.rfind("@@", 0) == 0) {
@@ -587,6 +588,7 @@ public:
     }
     JSSymbol(JSSymbol&& other) noexcept = default;
 
+    bool HasDescription() const noexcept { return has_description_; }
     const std::string& Description() const noexcept { return description_; }
     const std::string& Key() const noexcept { return key_; }
     uint32_t Id() const noexcept { return id_; }
@@ -599,6 +601,7 @@ public:
     }
 
 private:
+    bool has_description_{true};
     MemoryCharge description_storage_;
     MemoryCharge key_storage_;
     std::string description_;
@@ -829,6 +832,7 @@ public:
     }
 
     TaggedValue GetNamedProperty(std::string_view key) const;
+    TaggedValue GetNamedPropertyWithReceiver(std::string_view key, TaggedValue receiver) const;
     void SetNamedProperty(std::string_view key, TaggedValue value, uint32_t& next_shape_id);
     bool HasNamedProperty(std::string_view key) const;
     bool HasOwnProperty(std::string_view key) const;

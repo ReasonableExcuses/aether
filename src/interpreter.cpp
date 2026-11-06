@@ -3261,11 +3261,11 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (!obj_val.IsHeapObject()) {
                     if (obj_val.IsNumber() && Realm::Current() && Realm::Current()->GetNumberPrototype()) {
-                        acc_ = Realm::Current()->GetNumberPrototype()->GetNamedProperty(prop_key);
+                        acc_ = Realm::Current()->GetNumberPrototype()->GetNamedPropertyWithReceiver(prop_key, obj_val);
                         break;
                     }
                     if (obj_val.IsBoolean() && Realm::Current() && Realm::Current()->GetBooleanPrototype()) {
-                        acc_ = Realm::Current()->GetBooleanPrototype()->GetNamedProperty(prop_key);
+                        acc_ = Realm::Current()->GetBooleanPrototype()->GetNamedPropertyWithReceiver(prop_key, obj_val);
                         break;
                     }
                     if (obj_val.IsString() && Realm::Current() && Realm::Current()->GetStringPrototype()) {
@@ -3273,7 +3273,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                             acc_ = TaggedValue::FromSmi(static_cast<int32_t>(obj_val.ToString().length()));
                             break;
                         }
-                        acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(prop_key);
+                        acc_ = Realm::Current()->GetStringPrototype()->GetNamedPropertyWithReceiver(prop_key, obj_val);
                         break;
                     }
                     if (obj_val.IsUndefined() || obj_val.IsNull()) {
@@ -3296,7 +3296,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (obj_val.AsHeapObject()->IsSymbol()) {
                     if (Realm::Current() && Realm::Current()->GetSymbolPrototype()) {
-                        acc_ = Realm::Current()->GetSymbolPrototype()->GetNamedProperty(prop_key);
+                        acc_ = Realm::Current()->GetSymbolPrototype()->GetNamedPropertyWithReceiver(prop_key, obj_val);
                         break;
                     }
                     acc_ = TaggedValue::Undefined();
@@ -3305,7 +3305,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
 
                 if (obj_val.AsHeapObject()->IsBigInt()) {
                     if (Realm::Current() && Realm::Current()->GetBigIntPrototype()) {
-                        acc_ = Realm::Current()->GetBigIntPrototype()->GetNamedProperty(prop_key);
+                        acc_ = Realm::Current()->GetBigIntPrototype()->GetNamedPropertyWithReceiver(prop_key, obj_val);
                         break;
                     }
                     acc_ = TaggedValue::Undefined();
@@ -3453,7 +3453,7 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     acc_ = js_obj->GetFastSlot(ic_slot.cached_slot, ic_slot.cached_in_object);
                 } else {
                     // IC Miss: Slow path lookup and IC transition
-                    acc_ = js_obj->GetNamedProperty(prop_key);
+                    acc_ = js_obj->GetNamedPropertyWithReceiver(prop_key, obj_val);
 
                     // Update IC to Monomorphic
                     if (obj_shape) {
@@ -4748,10 +4748,22 @@ TaggedValue Interpreter::RunExecutionLoop(ExecutionFrame& frame, const uint8_t* 
                     auto* sym = static_cast<JSSymbol*>(key_val.AsHeapObject());
                     HeapObject* ho = obj_val.AsHeapObject();
                     if (ho->IsJSObject()) {
-                        acc_ = static_cast<JSObject*>(ho)->GetNamedProperty(sym->Key());
+                        acc_ = static_cast<JSObject*>(ho)->GetNamedPropertyWithReceiver(sym->Key(), obj_val);
                     } else if (ho->IsString()) {
                         if (Realm::Current() && Realm::Current()->GetStringPrototype()) {
-                            acc_ = Realm::Current()->GetStringPrototype()->GetNamedProperty(sym->Key());
+                            acc_ = Realm::Current()->GetStringPrototype()->GetNamedPropertyWithReceiver(sym->Key(), obj_val);
+                        } else {
+                            acc_ = TaggedValue::Undefined();
+                        }
+                    } else if (ho->IsSymbol()) {
+                        if (Realm::Current() && Realm::Current()->GetSymbolPrototype()) {
+                            acc_ = Realm::Current()->GetSymbolPrototype()->GetNamedPropertyWithReceiver(sym->Key(), obj_val);
+                        } else {
+                            acc_ = TaggedValue::Undefined();
+                        }
+                    } else if (ho->IsBigInt()) {
+                        if (Realm::Current() && Realm::Current()->GetBigIntPrototype()) {
+                            acc_ = Realm::Current()->GetBigIntPrototype()->GetNamedPropertyWithReceiver(sym->Key(), obj_val);
                         } else {
                             acc_ = TaggedValue::Undefined();
                         }

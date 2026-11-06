@@ -232,6 +232,13 @@ public:
     TaggedValue GetSymbolHasInstance() const noexcept { return symbol_hasInstance_; }
     TaggedValue GetSymbolToPrimitive() const noexcept { return symbol_toPrimitive_; }
     TaggedValue GetSymbolUnscopables() const noexcept { return symbol_unscopables_; }
+    TaggedValue GetSymbolSpecies() const noexcept { return symbol_species_; }
+    TaggedValue GetSymbolMatch() const noexcept { return symbol_match_; }
+    TaggedValue GetSymbolReplace() const noexcept { return symbol_replace_; }
+    TaggedValue GetSymbolSearch() const noexcept { return symbol_search_; }
+    TaggedValue GetSymbolSplit() const noexcept { return symbol_split_; }
+    TaggedValue GetSymbolDispose() const noexcept { return symbol_dispose_; }
+    TaggedValue GetSymbolAsyncDispose() const noexcept { return symbol_asyncDispose_; }
     void UpdatePointers(const std::function<HeapObject*(HeapObject*)>& resolve);
 
 private:
@@ -272,6 +279,13 @@ private:
     TaggedValue symbol_hasInstance_{TaggedValue::Undefined()};
     TaggedValue symbol_toPrimitive_{TaggedValue::Undefined()};
     TaggedValue symbol_unscopables_{TaggedValue::Undefined()};
+    TaggedValue symbol_species_{TaggedValue::Undefined()};
+    TaggedValue symbol_match_{TaggedValue::Undefined()};
+    TaggedValue symbol_replace_{TaggedValue::Undefined()};
+    TaggedValue symbol_search_{TaggedValue::Undefined()};
+    TaggedValue symbol_split_{TaggedValue::Undefined()};
+    TaggedValue symbol_dispose_{TaggedValue::Undefined()};
+    TaggedValue symbol_asyncDispose_{TaggedValue::Undefined()};
     std::unordered_map<std::string, JSSymbol*> symbol_registry_;
 };
 
